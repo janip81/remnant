@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "claude-memory": {
+      "type": "http",
+      "url": "${CLAUDE_MEMORY_URL}/mcp",
+      "headers": {
+        "Authorization": "Bearer ${CLAUDE_MEMORY_TOKEN}"
+      }
+    }
+  }
+}

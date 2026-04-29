@@ -1,0 +1,33 @@
+{
+  "name": "claude-memory",
+  "version": "0.1.0",
+  "description": "Fully local persistent memory for Claude Code — mem0 + pgvector + Ollama, self-hosted",
+  "author": "Jani Pesonen",
+  "homepage": "https://github.com/janip81/claude-memory",
+  "license": "Apache-2.0",
+  "mcp": {
+    "servers": {
+      "claude-memory": {
+        "type": "http",
+        "url": "${CLAUDE_MEMORY_URL}/mcp",
+        "headers": {
+          "Authorization": "Bearer ${CLAUDE_MEMORY_TOKEN}"
+        }
+      }
+    }
+  },
+  "hooks": "../hooks/hooks.json",
+  "skills": [
+    "../skills/claude-memory/SKILL.md"
+  ],
+  "env": {
+    "CLAUDE_MEMORY_URL": {
+      "description": "Base URL of your claude-memory server (e.g. https://mem0-mcp.example.com)",
+      "required": true
+    },
+    "CLAUDE_MEMORY_TOKEN": {
+      "description": "Bearer token for authentication",
+      "required": true
+    }
+  }
+}
