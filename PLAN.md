@@ -113,18 +113,19 @@
 > Stack: FastAPI + HTMX (lightweight, Python, no Node build step)
 
 Features (inspired by OpenMemory UI):
-- [ ] Memory list with search + category filter
-- [ ] Add / edit / delete / archive actions per memory
+- [x] Memory list with live search (HTMX, 300ms debounce)
+- [x] Add / delete actions per memory
+- [x] Stats bar: total memories count (out-of-band HTMX update on add)
+- [x] Dark theme
 - [ ] Source app tag (which Claude session added it)
-- [ ] Stats bar: total memories, searches today
-- [ ] Install wizard tab: shows exact `claude mcp add` command for this deployment
-- [ ] Dark mode
-- [ ] Auth: internal-only (internal-shared gateway), Keycloak OIDC as later phase
+- [ ] Edit / archive actions
+- [ ] Auth: Keycloak OIDC (later phase; currently internal-only via gateway)
 
 Implementation:
-- [ ] `src/ui/` FastAPI router + Jinja2/HTMX templates
-- [ ] Separate container in Helm chart (or sidecar — decide at implementation time)
-- [ ] HTTPRoute for `/` (UI) vs `/mcp` (MCP server) — same hostname or separate
+- [x] `src/ui/` FastAPI + Jinja2/HTMX — separate pod, same image, different CMD
+- [x] Separate Deployment + Service + HTTPRoute in Helm chart 0.1.3
+- [x] UI at `mem0.prod.threshold.se` (internal-shared), MCP at `mem0-mcp.prod.threshold.se`
+- [x] gitops updated — targetRevision: 0.1.3, ui.host configured
 
 ---
 

@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claude Memory</title>
+  <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --border: #2a2d3a;
+      --accent: #7c6af7;
+      --accent-dim: #3d3580;
+      --text: #e2e4ed;
+      --text-dim: #8a8fa8;
+      --danger: #e05c5c;
+      --radius: 8px;
+      --mono: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 14px;
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    header h1 {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--accent);
+      letter-spacing: -0.3px;
+    }
+
+    .stats {
+      margin-left: auto;
+      color: var(--text-dim);
+      font-size: 13px;
+    }
+
+    .stats strong {
+      color: var(--text);
+    }
+
+    main {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 24px 16px;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+
+    input[type="search"], textarea {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 14px;
+      padding: 9px 12px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    input[type="search"]:focus, textarea:focus {
+      border-color: var(--accent);
+    }
+
+    input[type="search"] { flex: 1; }
+
+    .add-form {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px;
+      margin-bottom: 20px;
+      display: flex;
+      gap: 10px;
+      align-items: flex-end;
+    }
+
+    .add-form textarea {
+      flex: 1;
+      resize: vertical;
+      min-height: 60px;
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+
+    button {
+      background: var(--accent);
+      border: none;
+      border-radius: var(--radius);
+      color: #fff;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      padding: 9px 18px;
+      transition: opacity 0.15s;
+      white-space: nowrap;
+    }
+
+    button:hover { opacity: 0.85; }
+    button:active { opacity: 0.7; }
+
+    .memory-list { display: flex; flex-direction: column; gap: 8px; }
+
+    .memory-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: start;
+    }
+
+    .memory-text {
+      font-family: var(--mono);
+      font-size: 12.5px;
+      color: var(--text);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .memory-score {
+      font-size: 11px;
+      color: var(--accent);
+      margin-top: 6px;
+    }
+
+    .delete-btn {
+      background: transparent;
+      color: var(--text-dim);
+      padding: 4px 8px;
+      font-size: 16px;
+      line-height: 1;
+      border-radius: 4px;
+    }
+
+    .delete-btn:hover { color: var(--danger); background: transparent; }
+
+    .empty {
+      text-align: center;
+      color: var(--text-dim);
+      padding: 48px 0;
+    }
+
+    .htmx-indicator { opacity: 0; transition: opacity 0.2s; }
+    .htmx-request .htmx-indicator { opacity: 1; }
+
+    .spinner {
+      display: inline-block;
+      width: 14px; height: 14px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      vertical-align: middle;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>⬡ Claude Memory</h1>
+  <div class="stats">
+    <strong><span id="total-count">{{ total }}</span></strong> memories
+  </div>
+</header>
+
+<main>
+  <div class="add-form">
+    <form hx-post="/memories"
+          hx-target="#memory-list"
+          hx-swap="innerHTML"
+          hx-on::after-request="this.reset()"
+          style="display:contents">
+      <textarea name="content" placeholder="Add a memory…" required></textarea>
+      <button type="submit">Add</button>
+    </form>
+  </div>
+
+  <div class="toolbar">
+    <input type="search" name="q" placeholder="Search memories…"
+           hx-get="/memories"
+           hx-trigger="input changed delay:300ms, search"
+           hx-target="#memory-list"
+           hx-swap="innerHTML"
+           hx-indicator="#search-spinner">
+    <span id="search-spinner" class="htmx-indicator">
+      <span class="spinner"></span>
+    </span>
+  </div>
+
+  <div id="memory-list" class="memory-list">
+    {% include "partials/memory_rows.html" %}
+  </div>
+</main>
+
+</body>
+</html>
