@@ -20,8 +20,15 @@ Thumbs.db
 *.log
 logs/
 
-# Dependencies (uncomment as needed)
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Node (if frontend added later)
 # node_modules/
-# vendor/
-# __pycache__/
-# *.pyc
