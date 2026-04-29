@@ -92,6 +92,19 @@
 
 ---
 
+---
+
+## Phase 7 — Web UI (Future)
+> Goal: simple dashboard to browse, search, and delete memories
+> Login via Keycloak (already in cluster) — OIDC, same SSO as other internal apps
+
+- [ ] `/ui` route in existing app (no new service)
+- [ ] List all memories, search box, delete button
+- [ ] Keycloak OIDC login (protect `/ui`, separate from MCP bearer token auth)
+- [ ] No public access — internal-shared gateway only
+
+---
+
 ## Completed Phases
 
 [Move phases here when all tasks are checked off]

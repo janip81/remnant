@@ -3,12 +3,7 @@ import logging
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
-from starlette.applications import Starlette
-from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
-from starlette.routing import Mount, Route
+from mcp.server.transport_security import TransportSecuritySettings
 
 import memory as mem_store
 from config import settings
@@ -16,7 +11,14 @@ from config import settings
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("claude-memory", stateless_http=True)
+# Disable FastMCP's built-in DNS-rebinding protection — we authenticate via
+# Bearer token and run behind a gateway with TLS, so the extra host check
+# would block requests from any non-localhost hostname.
+mcp = FastMCP(
+    "claude-memory",
+    stateless_http=True,
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 
 @mcp.tool()
@@ -57,33 +59,45 @@ async def delete_memory(memory_id: str) -> str:
     return json.dumps(result)
 
 
-class BearerAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, token: str):
-        super().__init__(app)
-        self.token = token
+# Build the FastMCP Starlette app (used for lifespan / session manager init).
+_starlette_app = mcp.streamable_http_app()
+# Extract StreamableHTTPASGIApp directly to bypass Starlette's redirect_slashes
+# behaviour, which caused POST /mcp → 307 on the cached-old-image node.
+_mcp_handler = _starlette_app.router.routes[0].app
 
-    async def dispatch(self, request: Request, call_next):
-        if request.url.path in ("/health", "/health/"):
-            return await call_next(request)
-        auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer ") or auth[7:] != self.token:
-            return Response("Unauthorized", status_code=401)
-        return await call_next(request)
+HEALTH_RESPONSE = json.dumps({"status": "ok", "service": "claude-memory"}).encode()
 
 
-async def health(request: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok", "service": "claude-memory"})
+async def app(scope, receive, send):
+    if scope["type"] == "lifespan":
+        # Run the Starlette lifespan so the session manager task group is initialised.
+        await _starlette_app(scope, receive, send)
+        return
 
+    if scope["type"] != "http":
+        return
 
-app = Starlette(
-    routes=[
-        Route("/health", health),
-        Mount("/mcp/", app=mcp.streamable_http_app()),
-    ],
-    middleware=[
-        Middleware(BearerAuthMiddleware, token=settings.bearer_token),
-    ],
-)
+    path = scope.get("path", "")
+
+    # Health — no auth required
+    if path == "/health":
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [[b"content-type", b"application/json"]]})
+        await send({"type": "http.response.body", "body": HEALTH_RESPONSE})
+        return
+
+    # Auth check for all other paths
+    headers = dict(scope.get("headers", []))
+    auth = headers.get(b"authorization", b"").decode()
+    if not auth.startswith("Bearer ") or auth[7:] != settings.bearer_token:
+        await send({"type": "http.response.start", "status": 401,
+                    "headers": [[b"content-type", b"text/plain"]]})
+        await send({"type": "http.response.body", "body": b"Unauthorized"})
+        return
+
+    # Dispatch directly to StreamableHTTPASGIApp, skipping Starlette routing.
+    await _mcp_handler(scope, receive, send)
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=settings.app_port)
