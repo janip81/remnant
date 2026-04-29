@@ -1,4 +1,9 @@
 {
+  "env": {
+    "CLAUDE_MEMORY_URL": "https://mem0-mcp.your-domain.com",
+    "CLAUDE_MEMORY_TOKEN": "your-bearer-token-here",
+    "CLAUDE_MEMORY_PLUGIN_DIR": "/path/to/claude-memory/plugin"
+  },
   "hooks": {
     "UserPromptSubmit": [
       {
