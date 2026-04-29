@@ -1,6 +1,6 @@
 apiVersion: v2
-name: test-app-skeleton
-description: We test how skill works to create project
+name: claude-memory
+description: MCP memory server — mem0 + pgvector + Ollama embeddings
 type: application
 version: 0.1.0
 appVersion: "0.1.0"

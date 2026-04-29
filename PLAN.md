@@ -38,28 +38,29 @@
 
 ## Phase 2 — mem0 Integration
 > Goal: real memory storage and retrieval via mem0 + pgvector
+> Stack: Ollama (qwen2.5:7b LLM + nomic-embed-text embedder) at 192.168.81.20:11434 — no Claude API key needed
 
-- [ ] Add mem0, sentence-transformers, psycopg2-binary to requirements.txt
-- [ ] `scripts/init-db.sh`: CREATE EXTENSION pgvector; CREATE DATABASE mem0
-- [ ] `src/memory.py`: mem0 client configured with pgvector + sentence-transformers + Claude API
-- [ ] Wire memory.py into MCP tools (replace stubs)
-- [ ] Test locally: add memory → search → verify semantic match works
-- [ ] Test that memories persist across container restart
+- [x] Add mem0, psycopg2-binary, ollama to requirements.txt
+- [x] `scripts/init-db.sh`: CREATE EXTENSION pgvector
+- [x] `src/memory.py`: mem0 client with pgvector + Ollama LLM + Ollama embedder
+- [x] Wire memory.py into MCP tools (replace stubs)
+- [x] Test locally: add memory → search → verify semantic match works
+- [x] Test that memories persist across container restart
+- [ ] `scripts/import-memories.py`: import existing MEMORY.md files into mem0
 
 ---
 
 ## Phase 3 — Helm Chart + Docker Image
 > Goal: deployable Helm chart, image pushed to registry
 
-- [ ] `helm/Chart.yaml`: name claude-memory, version 0.1.0
-- [ ] `helm/values.yaml`: image, replicas, resources, ingress, cnpg config
-- [ ] `helm/templates/deployment.yaml`
-- [ ] `helm/templates/service.yaml`
-- [ ] `helm/templates/httproute.yaml` (internal-shared, mem0-mcp.prod.threshold.se)
-- [ ] `helm/templates/cnpg-cluster.yaml` (1 instance MVP, pgvector, Barman S3)
-- [ ] `helm/templates/externalsecret.yaml` (bearer token + anthropic key from Vault)
-- [ ] Build and push image to registry
-- [ ] Test `helm template` renders correctly
+- [x] `helm/Chart.yaml`: name claude-memory, version 0.1.0
+- [x] `helm/values.yaml`: image, replicas, resources, gateway, cnpg config
+- [x] `helm/templates/deployment.yaml`
+- [x] `helm/templates/service.yaml`
+- [x] `helm/templates/httproute.yaml` (gateway API, configurable parentRef)
+- [x] `helm/templates/cnpg-cluster.yaml` (instances, pgvector, Barman S3)
+- [x] Build and push image to registry (ghcr.io/janip81/claude-memory:latest)
+- [x] Test `helm template` renders correctly (4 resources: Service, Deployment, HTTPRoute, Cluster)
 
 ---
 
@@ -72,6 +73,22 @@
 - [ ] Verify pod running, CNPG healthy, WAL archiving active
 - [ ] `claude mcp add --transport http mem0-mcp https://mem0-mcp.prod.threshold.se/` from desktop
 - [ ] End-to-end test: add → search → verify from Claude Code
+
+---
+
+## Phase 5 — Import + README
+> Goal: migrate existing MEMORY.md files into mem0, write user-facing README
+
+- [ ] `scripts/import_memories.py`: parse all `*.md` files in `/opt/git/wiki/logs/`, extract body text, call `add_memory` for each — skip frontmatter, skip MEMORY.md index
+- [ ] Dry-run mode (`--dry-run`): print what would be imported without writing
+- [ ] Run import against prod mem0 after Phase 4 deployment
+- [ ] `README.md`: setup guide (Ollama prereqs, `.env` config, `make dev`, MCP add command), tool reference (`add_memory`, `search_memory`, `get_all_memories`, `delete_memory`)
+
+---
+
+## Phase 6 — Local LLM (Done — Ollama from Phase 2)
+> Ollama was adopted in Phase 2 (not deferred). ADR-0001 marked superseded.
+> RTX 2070 SUPER desktop at 192.168.81.20: qwen2.5:7b (extraction) + nomic-embed-text (embeddings)
 
 ---
 

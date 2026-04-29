@@ -1,17 +1,50 @@
 replicaCount: 1
 
 image:
-  repository: ""
+  repository: ghcr.io/janip81/claude-memory
   pullPolicy: IfNotPresent
-  tag: ""
+  tag: "latest"
 
 service:
   type: ClusterIP
-  port: 80
+  port: 8080
 
-ingress:
-  enabled: false
+gatewayApi:
+  enabled: true
+  host: mem0-mcp.prod.example.com
+  parentRefs:
+    - name: internal-shared
+      namespace: kube-system
 
-resources: {}
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
 
-env: {}
+# Secret name containing BEARER_TOKEN key (rendered by AVP or pre-created)
+auth:
+  secretName: claude-memory-auth
+
+ollama:
+  baseUrl: "http://192.168.81.20:11434"
+  model: "qwen2.5:7b"
+  embedModel: "nomic-embed-text"
+
+mem0:
+  userId: "jani"
+
+cnpg:
+  enabled: true
+  instances: 1
+  storage:
+    size: 5Gi
+    storageClass: vsphere-csi
+  backup:
+    enabled: true
+    destinationPath: s3://cnpg-prod-k8s/claude-memory
+    endpointURL: https://s3.prod.example.com
+    s3CredentialsSecret: cnpg-barman-s3-creds
+    retentionPolicy: "30d"
