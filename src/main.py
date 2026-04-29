@@ -68,6 +68,17 @@ _mcp_handler = _starlette_app.router.routes[0].app
 HEALTH_RESPONSE = json.dumps({"status": "ok", "service": "claude-memory"}).encode()
 
 
+def _json_response(data, status=200):
+    body = json.dumps(data).encode()
+    return status, [[b"content-type", b"application/json"],
+                    [b"access-control-allow-origin", b"*"]], body
+
+
+async def _send_response(send, status, headers, body):
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    await send({"type": "http.response.body", "body": body})
+
+
 async def app(scope, receive, send):
     if scope["type"] == "lifespan":
         # Run the Starlette lifespan so the session manager task group is initialised.
@@ -78,21 +89,70 @@ async def app(scope, receive, send):
         return
 
     path = scope.get("path", "")
+    method = scope.get("method", "GET")
 
     # Health — no auth required
     if path == "/health":
-        await send({"type": "http.response.start", "status": 200,
-                    "headers": [[b"content-type", b"application/json"]]})
-        await send({"type": "http.response.body", "body": HEALTH_RESPONSE})
+        await _send_response(send, *_json_response({"status": "ok", "service": "claude-memory"}))
         return
 
-    # Auth check for all other paths
+    # /api/memories — internal REST endpoint for the UI pod (bearer auth required)
+    if path == "/api/memories":
+        headers = dict(scope.get("headers", []))
+        auth = headers.get(b"authorization", b"").decode()
+        if not auth.startswith("Bearer ") or auth[7:] != settings.bearer_token:
+            await _send_response(send, 401, [[b"content-type", b"text/plain"]], b"Unauthorized")
+            return
+
+        if method == "GET":
+            q = ""
+            qs = scope.get("query_string", b"").decode()
+            for part in qs.split("&"):
+                if part.startswith("q="):
+                    import urllib.parse
+                    q = urllib.parse.unquote_plus(part[2:])
+            if q.strip():
+                results = mem_store.search(q.strip(), limit=50)
+            else:
+                results = mem_store.get_all()
+            memories = [{"id": r.get("id", ""), "memory": r.get("memory", r.get("text", ""))}
+                        for r in results]
+            await _send_response(send, *_json_response(memories))
+            return
+
+        if method == "POST":
+            body_chunks = []
+            while True:
+                msg = await receive()
+                body_chunks.append(msg.get("body", b""))
+                if not msg.get("more_body"):
+                    break
+            import urllib.parse
+            body = b"".join(body_chunks).decode()
+            params = dict(p.split("=", 1) for p in body.split("&") if "=" in p)
+            content = urllib.parse.unquote_plus(params.get("content", "")).strip()
+            if content:
+                mem_store.add(content)
+            await _send_response(send, *_json_response({"ok": True}))
+            return
+
+    # /api/memories/{id} DELETE
+    if path.startswith("/api/memories/") and method == "DELETE":
+        headers = dict(scope.get("headers", []))
+        auth = headers.get(b"authorization", b"").decode()
+        if not auth.startswith("Bearer ") or auth[7:] != settings.bearer_token:
+            await _send_response(send, 401, [[b"content-type", b"text/plain"]], b"Unauthorized")
+            return
+        memory_id = path[len("/api/memories/"):]
+        mem_store.delete(memory_id)
+        await _send_response(send, *_json_response({"ok": True}))
+        return
+
+    # Auth check for /mcp
     headers = dict(scope.get("headers", []))
     auth = headers.get(b"authorization", b"").decode()
     if not auth.startswith("Bearer ") or auth[7:] != settings.bearer_token:
-        await send({"type": "http.response.start", "status": 401,
-                    "headers": [[b"content-type", b"text/plain"]]})
-        await send({"type": "http.response.body", "body": b"Unauthorized"})
+        await _send_response(send, 401, [[b"content-type", b"text/plain"]], b"Unauthorized")
         return
 
     # Dispatch directly to StreamableHTTPASGIApp, skipping Starlette routing.
