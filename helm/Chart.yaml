@@ -1,0 +1,6 @@
+apiVersion: v2
+name: test-app-skeleton
+description: We test how skill works to create project
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
