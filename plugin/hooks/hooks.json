@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_MEMORY_PLUGIN_DIR}/hooks/search-memory.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_MEMORY_PLUGIN_DIR}/hooks/save-context.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_MEMORY_PLUGIN_DIR}/hooks/save-context.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
