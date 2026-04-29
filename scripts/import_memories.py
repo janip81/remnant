@@ -2,16 +2,17 @@
 """
 import_memories.py — migrate wiki log files into claude-memory MCP server.
 
-Reads all *.md files in the wiki logs directory, strips frontmatter, splits by
+Reads all *.md files in one or more directories, strips frontmatter, splits by
 ## sections, and calls add_memory for each chunk via the MCP HTTP endpoint.
 
 Usage:
     python3 scripts/import_memories.py [--dry-run] [--file path] [--force]
+                                       [--dir /path/to/dir ...]
 
 Environment:
     CLAUDE_MEMORY_URL    Base URL of the MCP server (required)
     CLAUDE_MEMORY_TOKEN  Bearer token (required)
-    WIKI_LOGS_DIR        Path to wiki logs directory (default: /opt/git/wiki/logs)
+    WIKI_LOGS_DIR        Default source directory (default: /opt/git/wiki/logs)
 """
 
 import argparse
@@ -37,6 +38,10 @@ def load_imported() -> set:
 
 def save_imported(imported: set):
     IMPORTED_RECORD.write_text(json.dumps({"files": sorted(imported)}, indent=2))
+
+
+def tracking_key(path: Path) -> str:
+    return str(path.resolve())
 
 
 def strip_frontmatter(text: str) -> str:
@@ -153,6 +158,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Print without writing")
     parser.add_argument("--file", help="Import a single file")
     parser.add_argument("--force", action="store_true", help="Re-import already-imported files")
+    parser.add_argument("--dir", action="append", dest="dirs", metavar="DIR",
+                        help="Source directory (repeatable; defaults to WIKI_LOGS_DIR)")
     args = parser.parse_args()
 
     url = os.environ.get("CLAUDE_MEMORY_URL", "").rstrip("/")
@@ -172,7 +179,13 @@ def main():
     if args.file:
         files = [Path(args.file)]
     else:
-        files = sorted(f for f in logs_dir.glob("*.md") if f.name != "MEMORY.md")
+        source_dirs = [Path(d) for d in args.dirs] if args.dirs else [logs_dir]
+        files = []
+        for d in source_dirs:
+            if not d.exists():
+                print(f"WARNING: directory not found, skipping: {d}", file=sys.stderr)
+                continue
+            files.extend(sorted(f for f in d.glob("*.md") if f.name != "MEMORY.md"))
 
     total_added = total_skipped = total_files = 0
 
@@ -180,7 +193,8 @@ def main():
         if not path.exists():
             print(f"SKIP: {path} not found")
             continue
-        if not args.force and path.name in imported:
+        key = tracking_key(path)
+        if not args.force and key in imported:
             print(f"SKIP: {path.name} (already imported, use --force to reimport)")
             continue
 
@@ -192,7 +206,7 @@ def main():
         total_files += 1
 
         if not args.dry_run:
-            imported.add(path.name)
+            imported.add(key)
             save_imported(imported)
 
     print(f"\nDone: {total_files} files, {total_added} chunks added, {total_skipped} skipped")
