@@ -101,10 +101,10 @@
 ## Phase 6 — Import Script
 > Goal: migrate existing MEMORY.md wiki files into mem0
 
-- [ ] `scripts/import_memories.py`: parse all `*.md` files in `/opt/git/wiki/logs/`, extract body text (skip frontmatter + MEMORY.md index), call `add_memory` for each entry
-- [ ] `--dry-run` flag: print what would be imported without writing
-- [ ] `--file` flag: import single file for testing
-- [ ] Run import against prod after Phase 4 cleanup complete
+- [x] `scripts/import_memories.py`: parse all `*.md` files in `/opt/git/wiki/logs/`, extract body text (skip frontmatter + MEMORY.md index), call `add_memory` for each entry
+- [x] `--dry-run` flag: print what would be imported without writing
+- [x] `--file` flag: import single file for testing
+- [x] Run import against prod — 92 files, 368 chunks imported (2026-04-29)
 
 ---
 
