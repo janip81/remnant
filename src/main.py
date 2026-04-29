@@ -1,3 +1,6 @@
+import json
+import logging
+
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
@@ -7,7 +10,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
+import memory as mem_store
 from config import settings
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 mcp = FastMCP("claude-memory", stateless_http=True)
 
@@ -15,25 +22,39 @@ mcp = FastMCP("claude-memory", stateless_http=True)
 @mcp.tool()
 async def add_memory(content: str) -> str:
     """Store a fact or observation in memory."""
-    return f"[stub] Would store: {content}"
+    result = mem_store.add(content)
+    return json.dumps(result)
 
 
 @mcp.tool()
 async def search_memory(query: str, limit: int = 5) -> str:
     """Search memory semantically. Returns top matching facts."""
-    return f"[stub] Would search for: {query} (limit={limit})"
+    results = mem_store.search(query, limit=limit)
+    if not results:
+        return "No memories found."
+    lines = []
+    for r in results:
+        score = r.get("score", "")
+        text = r.get("memory", r.get("text", str(r)))
+        lines.append(f"[{score:.3f}] {text}" if score else text)
+    return "\n".join(lines)
 
 
 @mcp.tool()
 async def get_all_memories() -> str:
     """List all stored memories."""
-    return "[stub] Would return all memories"
+    results = mem_store.get_all()
+    if not results:
+        return "No memories stored."
+    lines = [r.get("memory", r.get("text", str(r))) for r in results]
+    return "\n".join(f"{i+1}. {m}" for i, m in enumerate(lines))
 
 
 @mcp.tool()
 async def delete_memory(memory_id: str) -> str:
     """Delete a memory by ID."""
-    return f"[stub] Would delete memory: {memory_id}"
+    result = mem_store.delete(memory_id)
+    return json.dumps(result)
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
