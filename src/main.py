@@ -63,7 +63,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         self.token = token
 
     async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/health":
+        if request.url.path in ("/health", "/health/"):
             return await call_next(request)
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer ") or auth[7:] != self.token:
@@ -78,7 +78,7 @@ async def health(request: Request) -> JSONResponse:
 app = Starlette(
     routes=[
         Route("/health", health),
-        Mount("/mcp", app=mcp.streamable_http_app()),
+        Mount("/mcp/", app=mcp.streamable_http_app()),
     ],
     middleware=[
         Middleware(BearerAuthMiddleware, token=settings.bearer_token),
