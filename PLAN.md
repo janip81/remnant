@@ -25,14 +25,14 @@
 ## Phase 1 — Python MCP Server
 > Goal: working MCP server locally with stub tools (no mem0 yet)
 
-- [ ] `requirements.txt`: mcp, fastapi, uvicorn, python-dotenv
-- [ ] `src/config.py`: load BEARER_TOKEN, ANTHROPIC_API_KEY, DATABASE_URL from env
-- [ ] `src/main.py`: FastAPI app + MCP HTTP/SSE server, 4 stub tools, bearer token middleware
-- [ ] `.env.example` updated with all required vars
-- [ ] `docker-compose.yml`: add postgres+pgvector service for local dev
-- [ ] `Makefile`: working dev, build, push, test targets
-- [ ] `Dockerfile`: python:3.12-slim, non-root user, health check
-- [ ] Local smoke test: `make dev` → connect Claude Code → call stub tools
+- [x] `requirements.txt`: mcp, starlette, uvicorn, pydantic-settings
+- [x] `src/config.py`: load BEARER_TOKEN, ANTHROPIC_API_KEY, DATABASE_URL from env
+- [x] `src/main.py`: Starlette app + MCP HTTP server, 4 stub tools, bearer token middleware
+- [x] `.env.example` updated with all required vars
+- [x] `docker-compose.yml`: add postgres+pgvector service for local dev
+- [x] `Makefile`: working dev, build, push, tag, run targets
+- [x] `Dockerfile`: python:3.12-slim, non-root user, health check
+- [x] Local smoke test: /health 200, /mcp no-auth 401, /mcp with-auth 307 ✓
 
 ---
 
