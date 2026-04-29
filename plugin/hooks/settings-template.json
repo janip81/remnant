@@ -1,0 +1,44 @@
+{
+  "env": {
+    "CLAUDE_MEMORY_URL": "https://mem0-mcp.your-domain.com",
+    "CLAUDE_MEMORY_TOKEN": "your-bearer-token-here",
+    "CLAUDE_MEMORY_PLUGIN_DIR": "/path/to/claude-memory/plugin"
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_MEMORY_PLUGIN_DIR}/hooks/search-memory.sh",
+            "statusMessage": "Searching memory...",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_MEMORY_PLUGIN_DIR}/hooks/save-context.sh",
+            "statusMessage": "Preparing memory save...",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_MEMORY_PLUGIN_DIR}/hooks/save-context.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
