@@ -1,0 +1,22 @@
+{% if memories %}
+  {% for m in memories %}
+  <div class="memory-card" id="mem-{{ m.id }}">
+    <div>
+      <div class="memory-text">{{ m.memory if m.memory else m.get('text', '') }}</div>
+      {% if m.get('score') %}
+      <div class="memory-score">score: {{ "%.3f"|format(m.score) }}</div>
+      {% endif %}
+    </div>
+    <button class="delete-btn"
+            hx-delete="/memories/{{ m.id }}"
+            hx-target="#mem-{{ m.id }}"
+            hx-swap="outerHTML"
+            hx-confirm="Delete this memory?"
+            title="Delete">×</button>
+  </div>
+  {% endfor %}
+{% else %}
+  <div class="empty">
+    {% if query %}No memories match "{{ query }}"{% else %}No memories yet.{% endif %}
+  </div>
+{% endif %}
