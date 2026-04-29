@@ -1,0 +1,86 @@
+Third-Party Notices
+===================
+
+claude-memory incorporates the following open-source components.
+
+
+mem0ai
+------
+Copyright (c) mem0.ai
+
+Apache License 2.0
+https://github.com/mem0ai/mem0
+
+Used for semantic memory storage, pgvector-backed similarity search, and
+embedding management.
+
+
+mcp (Model Context Protocol Python SDK)
+----------------------------------------
+Copyright (c) Anthropic
+
+MIT License
+https://github.com/modelcontextprotocol/python-sdk
+
+Used for MCP server implementation and Streamable HTTP transport.
+
+
+uvicorn
+-------
+Copyright (c) Encode OSS Ltd.
+
+BSD 3-Clause License
+https://github.com/encode/uvicorn
+
+Used as the ASGI server runtime.
+
+
+Starlette
+---------
+Copyright (c) Encode OSS Ltd.
+
+BSD 3-Clause License
+https://github.com/encode/starlette
+
+Used for HTTP routing (dependency of the MCP SDK).
+
+
+Pydantic / pydantic-settings
+-----------------------------
+Copyright (c) Samuel Colvin and contributors
+
+MIT License
+https://github.com/pydantic/pydantic
+
+Used for configuration parsing and validation.
+
+
+psycopg2
+--------
+Copyright (c) Federico Di Gregorio, Daniele Varrazzo, The Psycopg Team
+
+GNU Lesser General Public License v3 (LGPL-3.0)
+https://github.com/psycopg/psycopg2
+
+Used for PostgreSQL connectivity. The application links dynamically to
+psycopg2 via Python import; users may substitute a compatible library.
+
+
+ollama-python
+-------------
+Copyright (c) Ollama contributors
+
+MIT License
+https://github.com/ollama/ollama-python
+
+Used to communicate with the Ollama server for generating text embeddings.
+
+
+python-dotenv
+-------------
+Copyright (c) Saurabh Kumar
+
+BSD 3-Clause License
+https://github.com/theskumar/python-dotenv
+
+Used for loading environment variables from .env files in development.
