@@ -47,28 +47,44 @@ def get_memory() -> Memory:
     return _mem
 
 
-def add(content: str) -> dict:
+def _agent_id(agent_id: str) -> str:
+    return agent_id if agent_id else settings.mem0_agent_id
+
+
+def add(content: str, agent_id: str = "") -> dict:
     m = get_memory()
-    # infer=False: skip LLM extraction, store content directly as-is.
-    # Our callers already provide structured facts, not raw conversations.
-    result = m.add(content, user_id=settings.mem0_user_id, infer=False)
+    result = m.add(
+        content,
+        user_id=settings.mem0_user_id,
+        agent_id=_agent_id(agent_id),
+        infer=settings.mem0_infer,
+    )
     return result
 
 
-def search(query: str, limit: int = 5) -> list[dict]:
+def search(query: str, limit: int = 5, agent_id: str = "") -> list[dict]:
     m = get_memory()
-    result = m.search(query, filters={"user_id": settings.mem0_user_id}, limit=limit)
+    filters = {"user_id": settings.mem0_user_id}
+    result = m.search(query, filters=filters, top_k=limit)
     if isinstance(result, dict) and "results" in result:
         return result["results"]
     return result if isinstance(result, list) else []
 
 
-def get_all() -> list[dict]:
+def get_all(agent_id: str = "") -> list[dict]:
     m = get_memory()
-    result = m.get_all(filters={"user_id": settings.mem0_user_id})
+    filters = {"user_id": settings.mem0_user_id}
+    if agent_id:
+        filters["agent_id"] = agent_id
+    result = m.get_all(filters=filters, top_k=10000)
     if isinstance(result, dict) and "results" in result:
         return result["results"]
     return result if isinstance(result, list) else []
+
+
+def update(memory_id: str, content: str) -> dict:
+    m = get_memory()
+    return m.update(memory_id, content)
 
 
 def delete(memory_id: str) -> dict:
