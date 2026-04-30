@@ -24,9 +24,9 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def add_memory(content: str, agent_id: str = "") -> str:
-    """Store a fact or observation in memory. Pass agent_id to tag the source (e.g. 'claude-starbase', 'cursor')."""
-    result = mem_store.add(content, agent_id=agent_id)
+async def add_memory(content: str, agent_id: str = "", infer: bool = True) -> str:
+    """Store a fact or observation in memory. Pass agent_id to tag the source. Set infer=False to store as-is without LLM extraction."""
+    result = mem_store.add(content, agent_id=agent_id, infer=infer)
     return json.dumps(result)
 
 

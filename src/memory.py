@@ -51,13 +51,13 @@ def _agent_id(agent_id: str) -> str:
     return agent_id if agent_id else settings.mem0_agent_id
 
 
-def add(content: str, agent_id: str = "") -> dict:
+def add(content: str, agent_id: str = "", infer: Optional[bool] = None) -> dict:
     m = get_memory()
     result = m.add(
         content,
         user_id=settings.mem0_user_id,
         agent_id=_agent_id(agent_id),
-        infer=settings.mem0_infer,
+        infer=settings.mem0_infer if infer is None else infer,
     )
     return result
 
