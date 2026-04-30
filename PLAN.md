@@ -110,7 +110,8 @@
 
 ## Phase 7 — Web UI
 > Goal: browse, search, and manage memories in a browser; separate container in same Helm chart
-> Stack: FastAPI + HTMX (lightweight, Python, no Node build step)
+> Stack: **NEEDS REWORK** — UI must be rewritten to match worklog tech stack: React + Vite + TypeScript, Material UI, same theme as worklog. Current FastAPI + HTMX implementation is a placeholder and should be replaced.
+> Images: **⚠ URGENT — SPLIT INTO TWO IMAGES BEFORE UI REWRITE** — MCP server and UI must be separate Docker images with separate build/push pipelines. Currently they share one image with different CMD, which is wrong. MCP image = Python/FastMCP only. UI image = React/Node build. Do this before the React rewrite grows the complexity.
 
 Features (inspired by OpenMemory UI):
 - [x] Memory list with live search (HTMX, 300ms debounce)
@@ -130,19 +131,88 @@ Implementation:
 ---
 
 ## Phase 8 — Blog Series
-> Goal: document the full build as a 10–12 part series on blog.threshold.se
+> Goal: document the full build as a 10–15 part series on blog.threshold.se
 > Angle: "Building a fully local persistent memory for Claude Code"
+> Point-of-view/author: Claude (User gave claude free hands to research and build its own memory. User has been only deciding what claude finds) (ask if unsure)
+> INstructions: I want the blog for this projects to be written as a joint project between me(user) and claude who has done the research, coding, troubleshooting etc (ask if unsure)
+
+> Ask user about point of view and instruction of unsure update this part when clear picture
+> wiki/logs can have some longer md files about what we have done that can be good for the posts but only look relevant md files for this project
 
 - [x] Part 1: Architecture decisions — why local, MCP protocol, mem0 vs scratch, Ollama embeddings, pgvector on CNPG (committed: `016-claude-memory-part1-architecture.md`)
-- [ ] Part 2: MCP server — FastMCP, stateless HTTP, bearer token auth, the 307 routing bug
-- [ ] Part 3: mem0 integration — infer=False, pgvector, Ollama LLM + embedder, memory schema
-- [ ] Part 4: Helm chart — CNPG cluster, Barman S3, Gateway API HTTPRoute, naming pitfalls
-- [ ] Part 5: gitops deployment — ArgoCD, AVP secrets, DNS, end-to-end test
-- [ ] Part 6: Claude Code plugin — hooks, skills, SKILL.md design philosophy
-- [ ] Part 7: Import script — migrating MEMORY.md files, chunking strategy
-- [ ] Part 8: Web UI — FastAPI + HTMX, memory management, install wizard
+- [x] Part 2: MCP server — FastMCP, stateless HTTP, bearer token auth, the 307 routing bug (committed: `017-claude-memory-part2-mcp-server.md`)
+> NOTE: Every part must have the "About this series" blockquote box immediately after the H1 title (see Part 1 for exact wording).
+- [x] Part 3: mem0 integration — infer=False, pgvector, Ollama LLM + embedder, memory schema
+- [x] Part 4: Helm chart — CNPG cluster, Barman S3, Gateway API HTTPRoute, naming pitfalls (committed: `019-claude-memory-part4-helm-chart.md`)
+- [x] Part 5: gitops deployment — ArgoCD, AVP secrets, DNS, end-to-end test (committed: `020-claude-memory-part5-gitops-deployment.md`) (used old memory system to figure out how to deploy and ask user what vault keys to create?)
+- [x] Part 6: Claude Code plugin — hooks, skills, SKILL.md design philosophy (committed: `021-claude-memory-part6-plugin.md`) (here user gave a lot of input that all hooks needed to work?)
+- [x] Part 7: Import script — migrating MEMORY.md files, chunking strategy (committed: `022-claude-memory-part7-import-script.md`)
+- [x] Part 8: Web UI — FastAPI + HTMX, memory management, install wizard (committed: `023-claude-memory-part8-web-ui.md`)
 - [ ] Part 9: Lessons learned — what worked, what didn't, mem0 quirks
-- [ ] Part 10: What's next — per-project namespacing, multi-user, Keycloak SSO
+- [ ] Part 10: Benchmarking, findings, fixes, deleting bad memories.
+- [ ] Part 11: What's next — per-project namespacing, multi-user, Keycloak SSO
+
+---
+
+## Phase 9 — Rename (name TBD)
+> Goal: stop using "mem0" as our service name — mem0 is a product (mem0.ai); our thing is something else
+> Blocked on: Jani picks a name
+
+When the name is decided, update everything:
+
+**Infrastructure:**
+- [ ] Vault secret path stays `kubernetes/data/prod-k8s/claude-memory` (no change needed there)
+- [ ] CNPG cluster: rename PostgreSQL database from `mem0` → `<name>` (requires pg_dump + restore or ALTER DATABASE — plan carefully, CNPG cluster will need recreation or manual rename)
+- [ ] Helm values: `cnpg.database: mem0` → `<name>`
+- [ ] gitops: UI HTTPRoute host `mem0.prod.threshold.se` → `<name>.prod.threshold.se`
+- [ ] gitops: MCP HTTPRoute host `mem0-mcp.prod.threshold.se` → `<name>-mcp.prod.threshold.se`
+- [ ] Update `CLAUDE_MEMORY_URL` in `~/.claude/settings.json` (env var for hooks)
+- [ ] Re-run `claude mcp add` with new URL
+
+**Blog posts** — update URL references in:
+- [ ] Part 1 (`016-claude-memory-part1-architecture.md`)
+- [ ] Part 2 (`017-claude-memory-part2-mcp-server.md`)
+- [ ] Part 5 (`020-claude-memory-part5-gitops-deployment.md`)
+- [ ] Part 6 (`021-claude-memory-part6-plugin.md`)
+- [ ] Part 8 (`023-claude-memory-part8-web-ui.md`)
+- [ ] Re-publish all updated posts to Ghost with `--update`
+
+**Note:** References to `mem0ai` (the Python library) stay as-is — that IS its name.
+
+---
+
+## Phase 10 — Gap Analysis vs mem0.ai
+> Goal: understand how far we are from what mem0 sells as a product, and decide what's worth closing
+> This is research + planning, not implementation
+> Do this by reading mem0.ai docs, pricing page, and changelog — then map against what we have
+
+**What we have:**
+- Self-hosted, fully local (intentional — our differentiator)
+- MCP server with `add_memory`, `search_memory`, `get_all_memories`, `delete_memory`
+- Semantic search via pgvector + nomic-embed-text embeddings (Ollama)
+- `infer=False` — Claude decides what to save, no LLM extraction layer at write time
+- Auto-inject on every prompt (UserPromptSubmit hook)
+- Save reminder at session end (Stop + PreCompact hooks)
+- SKILL.md teaching Claude when/what/how to save
+- Import script for migrating existing docs
+- Basic Web UI (HTMX, search + add + delete)
+- CNPG-backed with WAL archiving and S3 backups
+
+**Research tasks:**
+- [ ] Read mem0.ai product page, docs, and pricing — what are their paid tiers?
+- [ ] What memory categories do they support that we don't? (e.g. episodic, semantic, procedural, user-level vs session-level)
+- [ ] Do they have memory relationships / a memory graph?
+- [ ] Do they have source app tagging (which agent/session added a memory)?
+- [ ] What does their infer pipeline actually produce vs our manual approach?
+- [ ] Multi-user / org support — do they support teams?
+- [ ] SDK vs API — how do they expect apps to integrate?
+- [ ] What's their retention / expiry model?
+
+**Gap assessment output:**
+- [ ] Write up: features in mem0 we deliberately skipped (infer, cloud) and why
+- [ ] Write up: features in mem0 we want and don't have yet
+- [ ] Decide: which gaps are worth closing for our use case
+- [ ] Feed findings into Part 11 blog post ("What's next")
 
 ---
 
