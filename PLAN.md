@@ -111,7 +111,7 @@
 ## Phase 7 — Web UI
 > Goal: browse, search, and manage memories in a browser; separate container in same Helm chart
 > Stack: **NEEDS REWORK** — UI must be rewritten to match worklog tech stack: React + Vite + TypeScript, Material UI, same theme as worklog. Current FastAPI + HTMX implementation is a placeholder and should be replaced.
-> Images: **⚠ URGENT — SPLIT INTO TWO IMAGES BEFORE UI REWRITE** — MCP server and UI must be separate Docker images with separate build/push pipelines. Currently they share one image with different CMD, which is wrong. MCP image = Python/FastMCP only. UI image = React/Node build. Do this before the React rewrite grows the complexity.
+> Images: ✓ Split done (2026-04-30) — MCP: `ghcr.io/janip81/claude-memory` (Dockerfile.mcp), UI: `ghcr.io/janip81/claude-memory-ui` (Dockerfile.ui). Chart 0.1.7.
 
 Features (inspired by OpenMemory UI):
 - [x] Memory list with live search (HTMX, 300ms debounce)
