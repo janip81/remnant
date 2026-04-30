@@ -14,7 +14,9 @@ services:
       - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
 
   app:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
     ports:
       - "8080:8080"
     env_file:
