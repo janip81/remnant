@@ -5,7 +5,6 @@ import Box from '@mui/material/Box'
 import CssBaseline from '@mui/material/CssBaseline'
 import InitColorSchemeScript from '@mui/material/InitColorSchemeScript'
 import Toolbar from '@mui/material/Toolbar'
-import Typography from '@mui/material/Typography'
 import { colorSchemes, typography, shadows, shape, gray, brand } from './theme/primitives'
 import Memories from './pages/Memories'
 
@@ -100,10 +99,8 @@ export default function App() {
         <CssBaseline enableColorScheme />
         <QueryClientProvider client={queryClient}>
           <AppBar position="sticky" elevation={0}>
-            <Toolbar variant="dense" sx={{ gap: 1 }}>
-              <Typography variant="subtitle2" sx={{ fontWeight: 700, color: `hsl(210, 98%, 55%)` }}>
-                ⬡ Claude Memory
-              </Typography>
+            <Toolbar variant="dense" sx={{ gap: 1.5, alignItems: 'center' }}>
+              <Box component="img" src="/logo-dark.png" alt="Remnant" sx={{ height: 32, width: 'auto' }} />
             </Toolbar>
           </AppBar>
           <Box component="main">
