@@ -30,5 +30,5 @@ venv/
 dist/
 build/
 
-# Node (if frontend added later)
-# node_modules/
+# Node
+node_modules/

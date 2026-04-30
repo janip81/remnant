@@ -151,6 +151,8 @@ Implementation:
 - [ ] Part 9: Lessons learned — what worked, what didn't, mem0 quirks
 - [ ] Part 10: Benchmarking, findings, fixes, deleting bad memories.
 - [ ] Part 11: What's next — per-project namespacing, multi-user, Keycloak SSO
+- [ ] Part 12: infer: "true" via cronjob to save gpu and possibility to run  on smaller gpu locally
+- [ ] Part 12: New web-ui in react etc....
 
 ---
 

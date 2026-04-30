@@ -156,7 +156,7 @@ def store_memory(memory_url: str, token: str, content: str, source: str) -> bool
         "method": "tools/call",
         "params": {
             "name": "add_memory",
-            "arguments": {"content": content, "infer": False},
+            "arguments": {"content": content, "infer": False, "category": "session"},
         },
         "id": 1,
     }

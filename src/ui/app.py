@@ -1,42 +1,24 @@
 """
-Web UI for claude-memory.
-Calls /api/memories on the MCP server internally — no mem0/DB dependency in this pod.
+UI backend — static file server + transparent proxy to MCP /api/*.
+No mem0 or DB dependency; only httpx for the proxy.
 """
-import json
 import os
 from pathlib import Path
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
+from fastapi import FastAPI, Request
+from fastapi.responses import Response, FileResponse
+from fastapi.staticfiles import StaticFiles
 
 MCP_URL = os.environ.get("MCP_INTERNAL_URL", "http://claude-memory:8080")
 BEARER_TOKEN = os.environ.get("BEARER_TOKEN", "")
 UI_PORT = int(os.environ.get("UI_PORT", "8081"))
+DIST = Path(__file__).parent / "dist"
 
-app = FastAPI(title="Claude Memory UI")
-templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+app = FastAPI(title="claude-memory-ui")
 
 _HEADERS = {"Authorization": f"Bearer {BEARER_TOKEN}"}
-
-
-def _get(q: str = "") -> list[dict]:
-    params = {"q": q} if q else {}
-    r = httpx.get(f"{MCP_URL}/api/memories", headers=_HEADERS, params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()
-
-
-def _add(content: str) -> None:
-    httpx.post(f"{MCP_URL}/api/memories", headers=_HEADERS,
-               content=f"content={httpx.URL('', params={'content': content}).params}",
-               timeout=30)
-
-
-def _delete(memory_id: str) -> None:
-    httpx.delete(f"{MCP_URL}/api/memories/{memory_id}", headers=_HEADERS, timeout=10)
 
 
 @app.get("/health")
@@ -44,44 +26,40 @@ async def health():
     return {"status": "ok", "service": "claude-memory-ui"}
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    memories = _get()
-    return templates.TemplateResponse(
-        "index.html",
-        {"request": request, "memories": memories, "total": len(memories)},
+@app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy(path: str, request: Request) -> Response:
+    url = f"{MCP_URL}/api/{path}"
+    qs = request.url.query
+    if qs:
+        url = f"{url}?{qs}"
+    body = await request.body()
+    content_type = request.headers.get("content-type", "")
+    proxy_headers = dict(_HEADERS)
+    if content_type:
+        proxy_headers["content-type"] = content_type
+    async with httpx.AsyncClient() as client:
+        resp = await client.request(
+            method=request.method,
+            url=url,
+            headers=proxy_headers,
+            content=body,
+            timeout=30,
+        )
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers={"content-type": resp.headers.get("content-type", "application/json"),
+                 "content-disposition": resp.headers.get("content-disposition", "")},
     )
 
 
-@app.get("/memories", response_class=HTMLResponse)
-async def list_memories(request: Request, q: str = ""):
-    memories = _get(q.strip())
-    return templates.TemplateResponse(
-        "partials/memory_rows.html",
-        {"request": request, "memories": memories, "query": q},
-    )
-
-
-@app.post("/memories", response_class=HTMLResponse)
-async def add_memory_route(request: Request, content: str = Form(...)):
-    content = content.strip()
-    if content:
-        httpx.post(f"{MCP_URL}/api/memories", headers=_HEADERS,
-                   data={"content": content}, timeout=30)
-    memories = _get()
-    total = len(memories)
-    rows_html = templates.TemplateResponse(
-        "partials/memory_rows.html",
-        {"request": request, "memories": memories, "query": ""},
-    ).body.decode()
-    oob = f'<span id="total-count" hx-swap-oob="true">{total}</span>'
-    return HTMLResponse(rows_html + oob)
-
-
-@app.delete("/memories/{memory_id}", response_class=HTMLResponse)
-async def delete_memory_route(memory_id: str):
-    httpx.delete(f"{MCP_URL}/api/memories/{memory_id}", headers=_HEADERS, timeout=10)
-    return HTMLResponse("")
+# Serve React SPA — must come after API routes
+if DIST.exists():
+    app.mount("/", StaticFiles(directory=str(DIST), html=True), name="static")
+else:
+    @app.get("/{full_path:path}")
+    async def spa_fallback():
+        return {"error": "UI build not found — run: cd ui && npm run build"}
 
 
 if __name__ == "__main__":
