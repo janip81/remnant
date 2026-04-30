@@ -20,3 +20,25 @@
     {% if query %}No memories match "{{ query }}"{% else %}No memories yet.{% endif %}
   </div>
 {% endif %}
+
+{% if not query and pages > 1 %}
+<div class="pagination">
+  {% if page > 1 %}
+  <button hx-get="/memories?page={{ page - 1 }}"
+          hx-target="#memory-list"
+          hx-swap="innerHTML">← Prev</button>
+  {% else %}
+  <button disabled>← Prev</button>
+  {% endif %}
+
+  <span class="page-info">Page {{ page }} of {{ pages }}</span>
+
+  {% if page < pages %}
+  <button hx-get="/memories?page={{ page + 1 }}"
+          hx-target="#memory-list"
+          hx-swap="innerHTML">Next →</button>
+  {% else %}
+  <button disabled>Next →</button>
+  {% endif %}
+</div>
+{% endif %}
