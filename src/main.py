@@ -114,6 +114,58 @@ async def _read_body(receive) -> bytes:
     return b"".join(chunks)
 
 
+def _make_receive(body: bytes):
+    """One-shot ASGI receive that replays a pre-read body."""
+    done = False
+
+    async def _receive():
+        nonlocal done
+        if not done:
+            done = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    return _receive
+
+
+async def _mcp_handler_strip_output_schema(scope, receive, send):
+    """Call the MCP handler and strip outputSchema from tools/list responses.
+
+    outputSchema was added in MCP spec 2025-03-26. Claude Code 2.x uses
+    2024-11-05 and silently drops all tools if outputSchema is present.
+    """
+    status_out = None
+    headers_out = []
+    body_parts = []
+
+    async def _capture(event):
+        nonlocal status_out, headers_out
+        if event["type"] == "http.response.start":
+            status_out = event["status"]
+            headers_out = event.get("headers", [])
+        elif event["type"] == "http.response.body":
+            body_parts.append(event.get("body", b""))
+
+    await _mcp_handler(scope, receive, _capture)
+
+    raw = b"".join(body_parts).decode("utf-8", errors="replace")
+    out = []
+    for line in raw.splitlines():
+        if line.startswith("data:"):
+            try:
+                obj = json.loads(line[5:].strip())
+                for t in obj.get("result", {}).get("tools", []):
+                    t.pop("outputSchema", None)
+                line = "data: " + json.dumps(obj)
+            except Exception:
+                pass
+        out.append(line)
+    new_body = "\n".join(out).encode("utf-8")
+
+    await send({"type": "http.response.start", "status": status_out or 200, "headers": headers_out})
+    await send({"type": "http.response.body", "body": new_body})
+
+
 def _memory_dict(r: dict) -> dict:
     """Normalize a mem0 result to a consistent API shape."""
     metadata = r.get("metadata") or {}
@@ -282,7 +334,16 @@ async def app(scope, receive, send):
         await _send_response(send, 401, [[b"content-type", b"text/plain"]], b"Unauthorized")
         return
 
-    await _mcp_handler(scope, receive, send)
+    # Read body once so we can inspect method and replay it to the handler
+    raw = await _read_body(receive)
+    try:
+        payload = json.loads(raw)
+        if payload.get("method") == "tools/list":
+            await _mcp_handler_strip_output_schema(scope, _make_receive(raw), send)
+            return
+    except Exception:
+        pass
+    await _mcp_handler(scope, _make_receive(raw), send)
 
 
 if __name__ == "__main__":
