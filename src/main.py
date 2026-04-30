@@ -24,9 +24,11 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def add_memory(content: str, agent_id: str = "", infer: bool = True) -> str:
-    """Store a fact or observation in memory. Pass agent_id to tag the source. Set infer=False to store as-is without LLM extraction."""
-    result = mem_store.add(content, agent_id=agent_id, infer=infer)
+async def add_memory(content: str, agent_id: str = "", infer: bool = True, category: str = "") -> str:
+    """Store a fact or observation in memory. category: project|feedback|reference|user|session|incident. Set infer=False to store as-is."""
+    if category and category not in mem_store.VALID_CATEGORIES:
+        return f"Invalid category '{category}'. Valid: {', '.join(sorted(mem_store.VALID_CATEGORIES) - {''})}"
+    result = mem_store.add(content, agent_id=agent_id, infer=infer, category=category)
     return json.dumps(result)
 
 
@@ -114,10 +116,12 @@ async def _read_body(receive) -> bytes:
 
 def _memory_dict(r: dict) -> dict:
     """Normalize a mem0 result to a consistent API shape."""
+    metadata = r.get("metadata") or {}
     return {
         "id": r.get("id", ""),
         "memory": r.get("memory", r.get("text", "")),
         "agent_id": r.get("agent_id", ""),
+        "category": metadata.get("category", ""),
         "created_at": r.get("created_at", ""),
         "updated_at": r.get("updated_at", ""),
         "score": r.get("score"),
@@ -160,15 +164,19 @@ async def app(scope, receive, send):
             total = len(all_memories)
             dates = [r.get("created_at", "") for r in all_memories if r.get("created_at")]
             dates_sorted = sorted(dates)
-            agents = {}
+            agents: dict = {}
+            categories: dict = {}
             for r in all_memories:
                 a = r.get("agent_id") or "unknown"
                 agents[a] = agents.get(a, 0) + 1
+                c = (r.get("metadata") or {}).get("category", "") or "uncategorized"
+                categories[c] = categories.get(c, 0) + 1
             await _send_response(send, *_json_response({
                 "total": total,
                 "first_added": dates_sorted[0] if dates_sorted else None,
                 "last_added": dates_sorted[-1] if dates_sorted else None,
                 "by_agent": agents,
+                "by_category": categories,
             }))
             return
 
@@ -207,10 +215,10 @@ async def app(scope, receive, send):
             q = qs.get("q", "").strip()
             sort = qs.get("sort", "newest")  # newest | oldest | relevance
             filter_agent = qs.get("agent_id", "").strip()
+            filter_category = qs.get("category", "").strip()
 
             if q:
                 results = mem_store.search(q, limit=200)
-                # search already orders by relevance; optionally re-sort by date
                 if sort in ("newest", "oldest"):
                     reverse = sort == "newest"
                     results.sort(key=lambda r: r.get("created_at", ""), reverse=reverse)
@@ -218,6 +226,9 @@ async def app(scope, receive, send):
                 results = mem_store.get_all(agent_id=filter_agent)
                 reverse = sort != "oldest"
                 results.sort(key=lambda r: r.get("created_at", ""), reverse=reverse)
+
+            if filter_category:
+                results = [r for r in results if (r.get("metadata") or {}).get("category", "") == filter_category]
 
             await _send_response(send, *_json_response([_memory_dict(r) for r in results]))
             return

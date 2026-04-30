@@ -51,13 +51,17 @@ def _agent_id(agent_id: str) -> str:
     return agent_id if agent_id else settings.mem0_agent_id
 
 
-def add(content: str, agent_id: str = "", infer: Optional[bool] = None) -> dict:
+VALID_CATEGORIES = {"project", "feedback", "reference", "user", "session", "incident", ""}
+
+def add(content: str, agent_id: str = "", infer: Optional[bool] = None, category: str = "") -> dict:
     m = get_memory()
+    metadata = {"category": category} if category else {}
     result = m.add(
         content,
         user_id=settings.mem0_user_id,
         agent_id=_agent_id(agent_id),
         infer=settings.mem0_infer if infer is None else infer,
+        metadata=metadata if metadata else None,
     )
     return result
 
