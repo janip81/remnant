@@ -123,7 +123,7 @@ def _make_receive(body: bytes):
         if not done:
             done = True
             return {"type": "http.request", "body": body, "more_body": False}
-        return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.disconnect"}
 
     return _receive
 
