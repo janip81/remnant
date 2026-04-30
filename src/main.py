@@ -114,8 +114,13 @@ async def _read_body(receive) -> bytes:
     return b"".join(chunks)
 
 
-def _make_receive(body: bytes):
-    """One-shot ASGI receive that replays a pre-read body."""
+def _make_receive(body: bytes, original_receive=None):
+    """One-shot ASGI receive that replays a pre-read body.
+
+    After the body is replayed, delegates to original_receive so that SSE
+    EventSourceResponse can wait for actual client disconnect rather than
+    getting an immediate http.disconnect signal.
+    """
     done = False
 
     async def _receive():
@@ -123,6 +128,8 @@ def _make_receive(body: bytes):
         if not done:
             done = True
             return {"type": "http.request", "body": body, "more_body": False}
+        if original_receive is not None:
+            return await original_receive()
         return {"type": "http.disconnect"}
 
     return _receive
@@ -338,12 +345,40 @@ async def app(scope, receive, send):
     raw = await _read_body(receive)
     try:
         payload = json.loads(raw)
-        if payload.get("method") == "tools/list":
-            await _mcp_handler_strip_output_schema(scope, _make_receive(raw), send)
+        method = payload.get("method")
+
+        if method == "initialize":
+            # In stateless_http=True mode, ServerSession starts as Initialized and
+            # ClientRequest validation rejects "initialize" (INVALID_PARAMS).
+            # Handle it here directly and return a valid capabilities response.
+            init_opts = mcp._mcp_server.create_initialization_options()
+            protocol_version = (payload.get("params") or {}).get(
+                "protocolVersion", "2024-11-05"
+            )
+            result = {
+                "protocolVersion": protocol_version,
+                "capabilities": init_opts.capabilities.model_dump(exclude_none=True),
+                "serverInfo": {
+                    "name": init_opts.server_name,
+                    "version": init_opts.server_version or "0.1.0",
+                },
+            }
+            if init_opts.instructions:
+                result["instructions"] = init_opts.instructions
+            sse_event = f"data: {json.dumps({'jsonrpc':'2.0','id':payload.get('id'),'result':result})}\n\n"
+            await send({"type": "http.response.start", "status": 200, "headers": [
+                [b"content-type", b"text/event-stream"],
+                [b"cache-control", b"no-cache, no-transform"],
+            ]})
+            await send({"type": "http.response.body", "body": sse_event.encode("utf-8")})
+            return
+
+        if method == "tools/list":
+            await _mcp_handler_strip_output_schema(scope, _make_receive(raw, receive), send)
             return
     except Exception:
         pass
-    await _mcp_handler(scope, _make_receive(raw), send)
+    await _mcp_handler(scope, _make_receive(raw, receive), send)
 
 
 if __name__ == "__main__":
