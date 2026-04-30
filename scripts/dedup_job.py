@@ -235,15 +235,15 @@ def ollama_merge(texts: list[str]) -> Optional[str]:
         return None
 
 
-def store_memory_direct(content: str) -> Optional[str]:
+def store_memory_direct(content: str, category: str = "") -> Optional[str]:
     """Store a merged memory via the MCP HTTP endpoint with infer=False."""
+    args: dict = {"content": content, "infer": False}
+    if category:
+        args["category"] = category
     payload = {
         "jsonrpc": "2.0",
         "method": "tools/call",
-        "params": {
-            "name": "add_memory",
-            "arguments": {"content": content, "infer": False},
-        },
+        "params": {"name": "add_memory", "arguments": args},
         "id": 1,
     }
     try:
@@ -291,19 +291,31 @@ def phase2_semantic_dedup(conn, threshold: float, dry_run: bool) -> int:
         clusters = find_semantic_clusters(cur, threshold)
 
         for cluster_ids in clusters:
-            # Fetch texts for this cluster
+            # Fetch texts and categories for this cluster
             cur.execute(
                 f"SELECT id, payload FROM {MEM_TABLE} WHERE id = ANY(%s)",
                 (cluster_ids,),
             )
             rows = cur.fetchall()
+
+            # Only merge within the same category — skip cross-category clusters
+            categories = [
+                ((r["payload"].get("metadata") or {}).get("category") or "")
+                for r in rows
+            ]
+            unique_cats = set(categories)
+            if len(unique_cats) > 1:
+                log.info("Skipping cross-category cluster: %s", unique_cats)
+                continue
+
+            cluster_category = categories[0] if categories else ""
             texts = [r["payload"].get("data", "") for r in rows]
             texts = [t for t in texts if t.strip()]
 
             if len(texts) < MIN_CLUSTER_SIZE:
                 continue
 
-            log.info("Merging cluster of %d memories", len(texts))
+            log.info("Merging cluster of %d memories (category=%r)", len(texts), cluster_category)
             for t in texts:
                 log.info("  - %s", t[:120])
 
@@ -318,8 +330,8 @@ def phase2_semantic_dedup(conn, threshold: float, dry_run: bool) -> int:
 
             log.info("  → merged: %s", merged_text[:120])
 
-            # Store merged memory first, get its new ID
-            new_id_str = store_memory_direct(merged_text)
+            # Store merged memory preserving the original category
+            new_id_str = store_memory_direct(merged_text, category=cluster_category)
 
             # Archive originals (pointing to merged entry if we have its ID)
             merged_into = uuid.UUID(new_id_str) if new_id_str and new_id_str != "stored" else None
