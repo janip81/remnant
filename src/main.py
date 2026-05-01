@@ -337,7 +337,7 @@ async def app(scope, receive, send):
                 results.sort(key=lambda r: r.get("created_at", ""), reverse=reverse)
 
             if filter_category:
-                results = [r for r in results if (r.get("metadata") or {}).get("category", "") == filter_category]
+                results = [r for r in results if _extract_meta(r).get("category", "") == filter_category]
 
             await _send_response(send, *_json_response([_memory_dict(r) for r in results]))
             return
@@ -375,6 +375,22 @@ async def app(scope, receive, send):
                 if content:
                     mem_store.update(memory_id, content)
                 await _send_response(send, *_json_response({"ok": True}))
+                return
+
+            # PATCH /api/memories/{id}/tags — update tags only
+            if method == "PATCH" and memory_id.endswith("/tags"):
+                real_id = memory_id[: -len("/tags")]
+                raw = await _read_body(receive)
+                try:
+                    tags = json.loads(raw).get("tags", [])
+                    if not isinstance(tags, list):
+                        raise ValueError
+                    tags = [str(t).strip() for t in tags if str(t).strip()]
+                except Exception:
+                    await _send_response(send, 400, [[b"content-type", b"text/plain"]], b"Bad Request")
+                    return
+                ok = mem_store.update_tags(real_id, tags)
+                await _send_response(send, *_json_response({"ok": ok}))
                 return
 
             # DELETE /api/memories/{id}

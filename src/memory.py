@@ -1,5 +1,6 @@
 import json
 from typing import Optional
+import psycopg2
 from mem0 import Memory
 from mem0.configs.base import MemoryConfig, EmbedderConfig, LlmConfig, VectorStoreConfig
 
@@ -98,3 +99,30 @@ def update(memory_id: str, content: str) -> dict:
 def delete(memory_id: str) -> dict:
     m = get_memory()
     return m.delete(memory_id)
+
+
+def update_tags(memory_id: str, tags: list) -> bool:
+    """Directly patch the tags field in the DB payload, preserving all other metadata."""
+    conn = psycopg2.connect(settings.database_url)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT payload FROM mem0 WHERE id = %s", (memory_id,))
+                row = cur.fetchone()
+                if not row:
+                    return False
+                payload = row[0]
+                meta = payload.get("metadata") or {}
+                # Handle both nesting forms
+                if isinstance(meta.get("metadata"), dict):
+                    meta["metadata"]["tags"] = tags
+                else:
+                    meta["tags"] = tags
+                payload["metadata"] = meta
+                cur.execute(
+                    "UPDATE mem0 SET payload = %s WHERE id = %s",
+                    (json.dumps(payload), memory_id),
+                )
+        return True
+    finally:
+        conn.close()
