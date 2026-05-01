@@ -108,25 +108,38 @@
 
 ---
 
-## Phase 7 — Web UI
+## Phase 7 — Web UI ✓
 > Goal: browse, search, and manage memories in a browser; separate container in same Helm chart
-> Stack: **NEEDS REWORK** — UI must be rewritten to match worklog tech stack: React + Vite + TypeScript, Material UI, same theme as worklog. Current FastAPI + HTMX implementation is a placeholder and should be replaced.
-> Images: ✓ Split done (2026-04-30) — MCP: `ghcr.io/janip81/claude-memory` (Dockerfile.mcp), UI: `ghcr.io/janip81/claude-memory-ui` (Dockerfile.ui). Chart 0.1.7.
+> Stack: React + Vite + TypeScript + MUI v6, dark mode, brand blue hsl(210,98%,55%), Inter font. HTMX placeholder replaced 2026-04-30.
+> Images: Split done — MCP: `ghcr.io/janip81/claude-memory` (Dockerfile.mcp), UI: `ghcr.io/janip81/claude-memory-ui` (Dockerfile.ui). Chart 0.1.9.
 
 Features (inspired by OpenMemory UI):
-- [x] Memory list with live search (HTMX, 300ms debounce)
+- [x] Memory list with live search (300ms debounce)
 - [x] Add / delete actions per memory
-- [x] Stats bar: total memories count (out-of-band HTMX update on add)
+- [x] Stats bar: total/first/last/by_agent/by_category breakdown
 - [x] Dark theme
-- [ ] Source app tag (which Claude session added it)
+- [x] Source app tag — agent_id chip + category chip on each card
+- [x] Category + agent filter dropdowns, sort, pagination, export
 - [ ] Edit / archive actions
 - [ ] Auth: Keycloak OIDC (later phase; currently internal-only via gateway)
 
 Implementation:
-- [x] `src/ui/` FastAPI + Jinja2/HTMX — separate pod, same image, different CMD
-- [x] Separate Deployment + Service + HTTPRoute in Helm chart 0.1.3
+- [x] React + Vite + MUI v6 SPA — full rewrite from HTMX/FastAPI (2026-04-30)
+- [x] Dockerfile.ui: multi-stage (node:20 builder → python:3.12-slim proxy)
+- [x] Separate Deployment + Service + HTTPRoute in Helm chart
 - [x] UI at `mem0.prod.threshold.se` (internal-shared), MCP at `mem0-mcp.prod.threshold.se`
-- [x] gitops updated — targetRevision: 0.1.3, ui.host configured
+- [x] gitops targetRevision: 0.1.9 — pushed to main
+
+Dedup + cold storage (added chart 0.1.9, 2026-04-30):
+- [x] `scripts/dedup_job.py`: Phase 1 hash dedup + Phase 2 semantic (pgvector cosine similarity)
+- [x] `mem0_archive` cold storage table — append-only, dedup never deletes from here
+- [x] Helm `cronjob-dedup.yaml` — runs at 03:30 daily
+- [x] Memory categorization backfill: 750 memories tagged with agent_id + category (project/incident/feedback/session/reference/user)
+
+Pending / known issues:
+- [ ] **CNPG bootstrap fix** — `CREATE EXTENSION vector` must be added to `initdb.postInitApplicationSQL` in CNPG cluster; currently requires manual `psql` after cluster creation
+- [ ] **ArgoCD sync** — chart 0.1.9 pushed; ArgoCD will auto-sync and create the CronJob
+- [ ] **DNS bug** — `k8s-prod.k8s.threshold.se` resolves to `192.168.102.31` (dev-k8s node), should be `192.168.101.11` (prod-k8s VIP); fix in OPNsense Unbound
 
 ---
 
@@ -156,11 +169,13 @@ Implementation:
 
 ---
 
-## Phase 9 — Rename (name TBD)
-> Goal: stop using "mem0" as our service name — mem0 is a product (mem0.ai); our thing is something else
-> Blocked on: Jani picks a name
+## Phase 9 — Rename to Remnant
+> Goal: stop using "mem0" as our service name — mem0 is a product (mem0.ai); our thing is Remnant.
+> Name: **Remnant** | Tagline: A shared local memory layer for stateless AI agents.
+> Logo source: `/opt/git/app-development/remnant/Remnant-logo-x3` — one PNG with 3 images: top=dark mode, bottom-left=logotype only, bottom-right=light mode. Cut into 3 and place in correct folders. Use as favicon + helm chart icon.
+> App-development folder: renamed from `claude-memory` → `remnant` (2026-04-30)
 
-When the name is decided, update everything:
+Update everything:
 
 **Infrastructure:**
 - [ ] Vault secret path stays `kubernetes/data/prod-k8s/claude-memory` (no change needed there)
@@ -180,6 +195,48 @@ When the name is decided, update everything:
 - [ ] Re-publish all updated posts to Ghost with `--update`
 
 **Note:** References to `mem0ai` (the Python library) stay as-is — that IS its name.
+
+---
+
+## Phase 11 — Intelligent Tagging + Admin UI
+> Goal: replace hardcoded tag rules with DB-backed config, add nightly LLM tagging, expose everything via UI
+> Blog angle: "From dumb keyword matching to an evolving, human-curated + AI-assisted tagging system"
+
+**Tag rules — DB-backed, no redeploy to change:**
+- [x] `tag_rules` table in PostgreSQL (tag, keyword, source: seed|manual|llm-discovered)
+- [x] `job_runs` table for nightly job audit log (phase, status, scanned, changed, rules_added, duration, error)
+- [x] `_ensure_schema()` in memory.py — idempotent, seeds from hardcoded defaults on first deploy
+- [x] In-memory cache in MCP server with 5-min TTL; invalidated on add/delete
+- [x] Fallback to seed dict if DB unreachable at startup
+
+**API (MCP server):**
+- [x] `GET  /api/tag-rules` — list all rules grouped by tag
+- [x] `POST /api/tag-rules` — add `{tag, keyword}`
+- [x] `DELETE /api/tag-rules/{tag}/{keyword}` — remove a rule
+- [x] `GET  /api/jobs` — last 50 nightly job runs
+- [x] `GET  /api/jobs/{id}` — single run detail
+- [x] `GET  /api/stats` — now includes `by_tag` breakdown
+
+**Nightly job (dedup_job.py):**
+- [x] Phase 0: LLM tagging — finds memories with no tags, asks Ollama to classify from tag list, writes back
+- [x] Phase 0 skipped when `TAGGING_MODE=keyword`; active for `llm` or `hybrid`
+- [x] All phases log to `job_runs` table (start time, finish time, scanned/changed counts, duration, errors)
+- [x] `--tagging-only` flag for running Phase 0 standalone
+
+**Helm chart (0.2.3):**
+- [x] `configmap-settings.yaml` — exposes `TAGGING_MODE`, `TAGGING_LLM_MODEL` as env vars
+- [x] `tagging:` section in values.yaml (mode: keyword|llm|hybrid)
+- [x] Both MCP Deployment and dedup CronJob get settings via `envFrom`
+- [ ] Update gitops tagging.mode to `hybrid` when ready for nightly LLM pass
+
+**UI — 4 pages via tab nav in AppBar:**
+- [x] **Memories** — existing list/search/edit/delete (unchanged)
+- [x] **Stats** — native React stats page: summary bar, category/agent/tag horizontal bar charts (no charting lib), first/last dates, tagged vs untagged counts
+- [x] **Tag Rules** — view all tags grouped with their keywords, add keyword to existing or new tag, delete keyword, filter, source badges (seed/manual/llm-discovered)
+- [x] **Jobs** — nightly job history table: phase, status, scanned/changed/rules+, duration, error; summary totals at top
+
+**Blog post (Part 12+):**
+- [ ] Part 12: "Tags, rules, and a nightly brain" — keyword matching vs LLM tagging, the DB-backed rules system, the job audit log, why we built a Config-editable tagging pipeline instead of hardcoding
 
 ---
 
