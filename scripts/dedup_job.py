@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Memory deduplication and consolidation job.
+Memory deduplication, LLM tagging, and consolidation job.
 
 Designed to run as a Kubernetes CronJob during off-peak hours.
 All originals are archived to mem0_archive before any modification —
 the archive is append-only and never touched by this script after writing.
+
+Phase 0 — LLM tagging (requires Ollama):
+  Find memories with no tags. Ask Ollama to assign tags from the tag_rules dictionary.
+  Skip if TAGGING_MODE=keyword (keyword-only, handled at write time).
 
 Phase 1 — Hash dedup (fast, exact):
   Find rows sharing the same payload->>'hash'. Keep the oldest, archive the rest.
@@ -15,6 +19,7 @@ Phase 2 — Semantic dedup (slow, Ollama):
 
 Usage:
   python dedup_job.py [--dry-run] [--phase1-only] [--phase2-only] [--threshold 0.92]
+  TAGGING_MODE=llm python dedup_job.py   # run LLM tagging phase
 """
 from __future__ import annotations
 
@@ -23,6 +28,7 @@ import json
 import logging
 import os
 import sys
+import time
 import uuid
 from typing import Optional
 
@@ -38,14 +44,16 @@ OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
 MEMORY_URL = os.environ.get("CLAUDE_MEMORY_URL", "http://claude-memory:8080")
 MEMORY_TOKEN = os.environ.get("CLAUDE_MEMORY_TOKEN", "")
+TAGGING_MODE = os.environ.get("TAGGING_MODE", "keyword")  # keyword | llm | hybrid
 
 ARCHIVE_TABLE = "mem0_archive"
 MEM_TABLE = "mem0"
 
-# Memories closer than this (cosine distance) are considered near-duplicates
 DEFAULT_SEMANTIC_THRESHOLD = 0.92
-# Only merge clusters of at least this many members (2 = any pair)
 MIN_CLUSTER_SIZE = 2
+
+# Batch size for LLM tagging — smaller = fewer tokens per request
+LLM_TAG_BATCH = 20
 
 
 # ---------------------------------------------------------------------------
@@ -76,13 +84,65 @@ def ensure_archive_table(cur: psycopg2.extensions.cursor) -> None:
     """)
 
 
+def ensure_job_runs_table(cur: psycopg2.extensions.cursor) -> None:
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS job_runs (
+            id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            started_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+            finished_at      TIMESTAMPTZ,
+            phase            TEXT NOT NULL,
+            status           TEXT NOT NULL DEFAULT 'running',
+            memories_scanned INT DEFAULT 0,
+            memories_changed INT DEFAULT 0,
+            rules_added      INT DEFAULT 0,
+            duration_seconds FLOAT,
+            error            TEXT
+        )
+    """)
+
+
+def start_job_phase(conn, phase: str) -> str:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO job_runs (phase, status) VALUES (%s, 'running') RETURNING id",
+            (phase,),
+        )
+        run_id = str(cur.fetchone()[0])
+    conn.commit()
+    return run_id
+
+
+def finish_job_phase(
+    conn,
+    run_id: str,
+    status: str,
+    scanned: int = 0,
+    changed: int = 0,
+    rules_added: int = 0,
+    error: Optional[str] = None,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE job_runs SET
+               finished_at      = now(),
+               status           = %s,
+               memories_scanned = %s,
+               memories_changed = %s,
+               rules_added      = %s,
+               duration_seconds = EXTRACT(EPOCH FROM (now() - started_at)),
+               error            = %s
+               WHERE id = %s""",
+            (status, scanned, changed, rules_added, error, run_id),
+        )
+    conn.commit()
+
+
 def archive_rows(
     cur: psycopg2.extensions.cursor,
     row_ids: list[uuid.UUID],
     reason: str,
     merged_into_id: Optional[uuid.UUID] = None,
 ) -> None:
-    """Copy rows from mem0 → mem0_archive before deletion."""
     for rid in row_ids:
         cur.execute(
             f"""
@@ -103,44 +163,177 @@ def delete_rows(cur: psycopg2.extensions.cursor, row_ids: list[uuid.UUID]) -> No
 
 
 # ---------------------------------------------------------------------------
+# Metadata helpers (mirrors _extract_meta in main.py)
+# ---------------------------------------------------------------------------
+
+def _extract_meta(payload: dict) -> dict:
+    meta = payload.get("metadata") or {}
+    inner = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else None
+    return inner if inner is not None else meta
+
+
+def _set_tags_in_payload(payload: dict, tags: list[str]) -> dict:
+    meta = payload.get("metadata") or {}
+    if isinstance(meta.get("metadata"), dict):
+        meta["metadata"]["tags"] = tags
+    else:
+        meta["tags"] = tags
+    payload["metadata"] = meta
+    return payload
+
+
+def load_tag_list(cur) -> list[str]:
+    """Load all tag names from tag_rules table."""
+    try:
+        cur.execute("SELECT DISTINCT tag FROM tag_rules ORDER BY tag")
+        return [row[0] for row in cur.fetchall()]
+    except Exception as e:
+        log.warning("Could not load tag_rules: %s — using empty list", e)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 — LLM tagging
+# ---------------------------------------------------------------------------
+
+def ollama_assign_tags(text: str, available_tags: list[str]) -> list[str]:
+    """Ask Ollama which tags apply to a memory. Returns list of tag names."""
+    tag_list = ", ".join(available_tags)
+    prompt = (
+        f"You are a memory tagging system. Given a memory entry, select which tags apply.\n"
+        f"Available tags: {tag_list}\n\n"
+        f"Memory: \"{text}\"\n\n"
+        f"Reply with ONLY a JSON array of matching tag names, or [] if none apply.\n"
+        f"Example: [\"prod-k8s\", \"cnpg\"]\n"
+        f"Array:"
+    )
+    try:
+        resp = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        raw = resp.json().get("response", "").strip()
+        # Extract JSON array from response
+        start = raw.find("[")
+        end = raw.rfind("]")
+        if start == -1 or end == -1:
+            return []
+        candidates = json.loads(raw[start:end + 1])
+        valid = set(available_tags)
+        return [t for t in candidates if isinstance(t, str) and t in valid]
+    except Exception as e:
+        log.warning("ollama_assign_tags failed: %s", e)
+        return []
+
+
+def phase0_llm_tagging(conn, dry_run: bool) -> int:
+    if TAGGING_MODE == "keyword":
+        log.info("Phase 0: skipped (TAGGING_MODE=keyword)")
+        return 0
+
+    log.info("Phase 0: LLM tagging of untagged memories (TAGGING_MODE=%s)", TAGGING_MODE)
+    run_id = start_job_phase(conn, "llm-tagging")
+    scanned = 0
+    changed = 0
+
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            ensure_job_runs_table(cur)
+            available_tags = load_tag_list(cur)
+            if not available_tags:
+                log.warning("No tags in tag_rules table — skipping LLM tagging")
+                finish_job_phase(conn, run_id, "completed", 0, 0)
+                return 0
+
+            cur.execute(f"SELECT id, payload FROM {MEM_TABLE}")
+            rows = cur.fetchall()
+
+        untagged = []
+        for row in rows:
+            payload = dict(row["payload"]) if isinstance(row["payload"], dict) else json.loads(row["payload"])
+            meta = _extract_meta(payload)
+            tags = meta.get("tags")
+            if not tags:
+                text = payload.get("data", "").strip()
+                if text:
+                    untagged.append({"id": str(row["id"]), "payload": payload, "text": text})
+
+        log.info("Found %d untagged memories", len(untagged))
+        scanned = len(untagged)
+
+        for item in untagged:
+            tags = ollama_assign_tags(item["text"], available_tags)
+            if not tags:
+                continue
+            log.info("  %s → %s", item["text"][:80], tags)
+            if not dry_run:
+                updated_payload = _set_tags_in_payload(item["payload"], tags)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"UPDATE {MEM_TABLE} SET payload = %s WHERE id = %s",
+                        (json.dumps(updated_payload), item["id"]),
+                    )
+                conn.commit()
+            changed += 1
+
+        finish_job_phase(conn, run_id, "completed", scanned, changed)
+    except Exception as e:
+        finish_job_phase(conn, run_id, "failed", scanned, changed, error=str(e))
+        log.error("Phase 0 failed: %s", e)
+
+    log.info(
+        "Phase 0 done: scanned=%d tagged=%d%s",
+        scanned, changed, " (dry run)" if dry_run else "",
+    )
+    return changed
+
+
+# ---------------------------------------------------------------------------
 # Phase 1 — Hash-based exact dedup
 # ---------------------------------------------------------------------------
 
 def phase1_hash_dedup(conn, dry_run: bool) -> int:
     log.info("Phase 1: hash-based exact dedup")
+    run_id = start_job_phase(conn, "hash-dedup")
     removed = 0
 
-    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-        ensure_archive_table(cur)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            ensure_archive_table(cur)
+            ensure_job_runs_table(cur)
 
-        # Find hashes with more than one row, ordered so we keep the oldest
-        cur.execute(f"""
-            SELECT payload->>'hash' AS hash,
-                   array_agg(id ORDER BY (payload->>'created_at') ASC) AS ids
-            FROM {MEM_TABLE}
-            WHERE payload->>'hash' IS NOT NULL
-              AND payload->>'hash' != ''
-            GROUP BY payload->>'hash'
-            HAVING COUNT(*) > 1
-        """)
-        clusters = cur.fetchall()
+            cur.execute(f"""
+                SELECT payload->>'hash' AS hash,
+                       array_agg(id ORDER BY (payload->>'created_at') ASC) AS ids
+                FROM {MEM_TABLE}
+                WHERE payload->>'hash' IS NOT NULL
+                  AND payload->>'hash' != ''
+                GROUP BY payload->>'hash'
+                HAVING COUNT(*) > 1
+            """)
+            clusters = cur.fetchall()
+            log.info("Found %d hash clusters with duplicates", len(clusters))
 
-        log.info("Found %d hash clusters with duplicates", len(clusters))
-
-        for row in clusters:
-            keep_id = row["ids"][0]
-            drop_ids = [uuid.UUID(str(i)) for i in row["ids"][1:]]
-            log.info("Hash dedup: keeping %s, dropping %d duplicates", keep_id, len(drop_ids))
+            for row in clusters:
+                keep_id = row["ids"][0]
+                drop_ids = [uuid.UUID(str(i)) for i in row["ids"][1:]]
+                log.info("Hash dedup: keeping %s, dropping %d", keep_id, len(drop_ids))
+                if not dry_run:
+                    archive_rows(cur, drop_ids, "hash-dedup")
+                    delete_rows(cur, drop_ids)
+                removed += len(drop_ids)
 
             if not dry_run:
-                archive_rows(cur, drop_ids, "hash-dedup")
-                delete_rows(cur, drop_ids)
-            removed += len(drop_ids)
+                conn.commit()
 
-        if not dry_run:
-            conn.commit()
+        finish_job_phase(conn, run_id, "completed", scanned=removed + 1 if removed else 0, changed=removed)
+    except Exception as e:
+        finish_job_phase(conn, run_id, "failed", error=str(e))
+        log.error("Phase 1 failed: %s", e)
 
-    log.info("Phase 1 done: removed %d exact duplicates%s", removed, " (dry run)" if dry_run else "")
+    log.info("Phase 1 done: removed %d%s", removed, " (dry run)" if dry_run else "")
     return removed
 
 
@@ -151,14 +344,8 @@ def phase1_hash_dedup(conn, dry_run: bool) -> int:
 def find_semantic_clusters(
     cur: psycopg2.extensions.cursor, threshold: float
 ) -> list[list[uuid.UUID]]:
-    """
-    Find clusters of memories whose cosine similarity exceeds threshold.
-    Uses a greedy union-find approach: each row checks its nearest neighbours.
-    Returns list of clusters (each cluster is a list of UUIDs, len >= MIN_CLUSTER_SIZE).
-    """
     cosine_distance = 1.0 - threshold
 
-    # Find all pairs within the threshold — pgvector <=> is cosine distance
     cur.execute(
         f"""
         SELECT a.id AS id_a, b.id AS id_b,
@@ -176,7 +363,6 @@ def find_semantic_clusters(
     if not pairs:
         return []
 
-    # Union-Find to cluster transitively connected pairs
     parent: dict[str, str] = {}
 
     def find(x: str) -> str:
@@ -193,7 +379,6 @@ def find_semantic_clusters(
     for row in pairs:
         union(str(row[0]), str(row[1]))
 
-    # Group by root
     groups: dict[str, list[str]] = {}
     all_ids: set[str] = set()
     for row in pairs:
@@ -213,7 +398,6 @@ def find_semantic_clusters(
 
 
 def ollama_merge(texts: list[str]) -> Optional[str]:
-    """Ask Ollama to merge a list of similar memories into one canonical entry."""
     numbered = "\n\n".join(f"Memory {i+1}:\n{t}" for i, t in enumerate(texts))
     prompt = (
         f"You have {len(texts)} similar memory entries. "
@@ -236,7 +420,6 @@ def ollama_merge(texts: list[str]) -> Optional[str]:
 
 
 def store_memory_direct(content: str, category: str = "") -> Optional[str]:
-    """Store a merged memory via the MCP HTTP endpoint with infer=False."""
     args: dict = {"content": content, "infer": False}
     if category:
         args["category"] = category
@@ -267,7 +450,6 @@ def store_memory_direct(content: str, category: str = "") -> Optional[str]:
                 if result.get("isError"):
                     log.warning("store error: %s", result)
                     return None
-                # Extract new memory ID from result if available
                 text = (result.get("content") or [{}])[0].get("text", "")
                 try:
                     data = json.loads(text)
@@ -284,66 +466,63 @@ def store_memory_direct(content: str, category: str = "") -> Optional[str]:
 
 def phase2_semantic_dedup(conn, threshold: float, dry_run: bool) -> int:
     log.info("Phase 2: semantic dedup (threshold=%.2f)", threshold)
+    run_id = start_job_phase(conn, "semantic-dedup")
     merged = 0
 
-    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-        ensure_archive_table(cur)
-        clusters = find_semantic_clusters(cur, threshold)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            ensure_archive_table(cur)
+            clusters = find_semantic_clusters(cur, threshold)
 
-        for cluster_ids in clusters:
-            # Fetch texts and categories for this cluster
-            cur.execute(
-                f"SELECT id, payload FROM {MEM_TABLE} WHERE id = ANY(%s)",
-                (cluster_ids,),
-            )
-            rows = cur.fetchall()
+            for cluster_ids in clusters:
+                cur.execute(
+                    f"SELECT id, payload FROM {MEM_TABLE} WHERE id = ANY(%s)",
+                    (cluster_ids,),
+                )
+                rows = cur.fetchall()
 
-            # Only merge within the same category — skip cross-category clusters
-            categories = [
-                ((r["payload"].get("metadata") or {}).get("category") or "")
-                for r in rows
-            ]
-            unique_cats = set(categories)
-            if len(unique_cats) > 1:
-                log.info("Skipping cross-category cluster: %s", unique_cats)
-                continue
+                categories = [
+                    (_extract_meta(r["payload"]).get("category") or "")
+                    for r in rows
+                ]
+                if len(set(categories)) > 1:
+                    log.info("Skipping cross-category cluster: %s", set(categories))
+                    continue
 
-            cluster_category = categories[0] if categories else ""
-            texts = [r["payload"].get("data", "") for r in rows]
-            texts = [t for t in texts if t.strip()]
+                cluster_category = categories[0] if categories else ""
+                texts = [r["payload"].get("data", "") for r in rows]
+                texts = [t for t in texts if t.strip()]
 
-            if len(texts) < MIN_CLUSTER_SIZE:
-                continue
+                if len(texts) < MIN_CLUSTER_SIZE:
+                    continue
 
-            log.info("Merging cluster of %d memories (category=%r)", len(texts), cluster_category)
-            for t in texts:
-                log.info("  - %s", t[:120])
+                log.info("Merging cluster of %d (category=%r)", len(texts), cluster_category)
 
-            if dry_run:
+                if dry_run:
+                    merged += len(cluster_ids)
+                    continue
+
+                merged_text = ollama_merge(texts)
+                if not merged_text:
+                    log.warning("Merge failed for cluster — skipping")
+                    continue
+
+                log.info("  → merged: %s", merged_text[:120])
+                new_id_str = store_memory_direct(merged_text, category=cluster_category)
+                merged_into = uuid.UUID(new_id_str) if new_id_str and new_id_str != "stored" else None
+                archive_rows(cur, cluster_ids, "semantic-dedup", merged_into_id=merged_into)
+                delete_rows(cur, cluster_ids)
+                conn.commit()
                 merged += len(cluster_ids)
-                continue
 
-            merged_text = ollama_merge(texts)
-            if not merged_text:
-                log.warning("Merge failed for cluster — skipping")
-                continue
-
-            log.info("  → merged: %s", merged_text[:120])
-
-            # Store merged memory preserving the original category
-            new_id_str = store_memory_direct(merged_text, category=cluster_category)
-
-            # Archive originals (pointing to merged entry if we have its ID)
-            merged_into = uuid.UUID(new_id_str) if new_id_str and new_id_str != "stored" else None
-            archive_rows(cur, cluster_ids, "semantic-dedup", merged_into_id=merged_into)
-            delete_rows(cur, cluster_ids)
-            conn.commit()
-            merged += len(cluster_ids)
+        finish_job_phase(conn, run_id, "completed", scanned=merged, changed=merged)
+    except Exception as e:
+        finish_job_phase(conn, run_id, "failed", error=str(e))
+        log.error("Phase 2 failed: %s", e)
 
     log.info(
-        "Phase 2 done: processed %d memories into merged entries%s",
-        merged,
-        " (dry run)" if dry_run else "",
+        "Phase 2 done: processed %d%s",
+        merged, " (dry run)" if dry_run else "",
     )
     return merged
 
@@ -354,34 +533,44 @@ def phase2_semantic_dedup(conn, threshold: float, dry_run: bool) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Memory deduplication job")
-    parser.add_argument("--dry-run", action="store_true", help="Report without making changes")
-    parser.add_argument("--phase1-only", action="store_true", help="Only run hash dedup")
-    parser.add_argument("--phase2-only", action="store_true", help="Only run semantic dedup")
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=DEFAULT_SEMANTIC_THRESHOLD,
-        help=f"Cosine similarity threshold for semantic dedup (default: {DEFAULT_SEMANTIC_THRESHOLD})",
-    )
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--phase1-only", action="store_true")
+    parser.add_argument("--phase2-only", action="store_true")
+    parser.add_argument("--tagging-only", action="store_true", help="Only run LLM tagging phase")
+    parser.add_argument("--threshold", type=float, default=DEFAULT_SEMANTIC_THRESHOLD)
     args = parser.parse_args()
 
     if not DATABASE_URL:
         log.error("DATABASE_URL not set")
         sys.exit(1)
 
-    log.info("Starting dedup job (dry_run=%s, threshold=%.2f)", args.dry_run, args.threshold)
+    log.info(
+        "Starting job (dry_run=%s, threshold=%.2f, tagging_mode=%s)",
+        args.dry_run, args.threshold, TAGGING_MODE,
+    )
 
     conn = connect()
     try:
-        total_removed = 0
+        # Ensure tables exist (idempotent)
+        with conn.cursor() as cur:
+            ensure_archive_table(cur)
+            ensure_job_runs_table(cur)
+        conn.commit()
+
+        if args.tagging_only:
+            phase0_llm_tagging(conn, args.dry_run)
+            return
+
+        if not args.phase1_only and not args.phase2_only:
+            phase0_llm_tagging(conn, args.dry_run)
 
         if not args.phase2_only:
-            total_removed += phase1_hash_dedup(conn, args.dry_run)
+            phase1_hash_dedup(conn, args.dry_run)
 
         if not args.phase1_only:
-            total_removed += phase2_semantic_dedup(conn, args.threshold, args.dry_run)
+            phase2_semantic_dedup(conn, args.threshold, args.dry_run)
 
-        log.info("Dedup complete. Total processed: %d", total_removed)
+        log.info("Job complete")
     finally:
         conn.close()
 

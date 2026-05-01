@@ -5,6 +5,7 @@ export interface Memory {
   memory: string
   agent_id: string
   category: MemoryCategory
+  tags: string[]
   created_at: string
   updated_at: string
   score: number | null
@@ -16,6 +17,7 @@ export interface Stats {
   last_added: string | null
   by_agent: Record<string, number>
   by_category: Record<string, number>
+  by_tag: Record<string, number>
 }
 
 export interface FetchParams {
@@ -56,6 +58,13 @@ export const api = {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ memory: content }),
+    }),
+
+  updateTags: (id: string, tags: string[]): Promise<{ ok: boolean }> =>
+    request(`/api/memories/${id}/tags`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tags }),
     }),
 
   delete: (id: string): Promise<{ ok: boolean }> =>

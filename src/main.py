@@ -275,18 +275,80 @@ async def app(scope, receive, send):
             dates_sorted = sorted(dates)
             agents: dict = {}
             categories: dict = {}
+            tags_count: dict = {}
             for r in all_memories:
                 a = r.get("agent_id") or "unknown"
                 agents[a] = agents.get(a, 0) + 1
-                c = (r.get("metadata") or {}).get("category", "") or "uncategorized"
+                meta = _extract_meta(r)
+                c = meta.get("category", "") or "uncategorized"
                 categories[c] = categories.get(c, 0) + 1
+                for tag in (meta.get("tags") or []):
+                    tags_count[tag] = tags_count.get(tag, 0) + 1
             await _send_response(send, *_json_response({
                 "total": total,
                 "first_added": dates_sorted[0] if dates_sorted else None,
                 "last_added": dates_sorted[-1] if dates_sorted else None,
                 "by_agent": agents,
                 "by_category": categories,
+                "by_tag": tags_count,
             }))
+            return
+
+        # GET /api/tag-rules
+        if path == "/api/tag-rules" and method == "GET":
+            rules = mem_store.list_tag_rules()
+            grouped: dict = {}
+            for r in rules:
+                tag = r["tag"]
+                if tag not in grouped:
+                    grouped[tag] = {"tag": tag, "keywords": [], "source": r["source"]}
+                grouped[tag]["keywords"].append(r["keyword"])
+            await _send_response(send, *_json_response(list(grouped.values())))
+            return
+
+        # POST /api/tag-rules
+        if path == "/api/tag-rules" and method == "POST":
+            raw = await _read_body(receive)
+            try:
+                body_data = json.loads(raw)
+                tag = body_data.get("tag", "").strip()
+                keyword = body_data.get("keyword", "").strip()
+            except Exception:
+                await _send_response(send, 400, [[b"content-type", b"text/plain"]], b"Bad Request")
+                return
+            if not tag or not keyword:
+                await _send_response(send, 400, [[b"content-type", b"text/plain"]], b"tag and keyword required")
+                return
+            ok = mem_store.add_tag_rule(tag, keyword)
+            await _send_response(send, *_json_response({"ok": ok}))
+            return
+
+        # DELETE /api/tag-rules/{tag}/{keyword}
+        if path.startswith("/api/tag-rules/") and method == "DELETE":
+            rest = path[len("/api/tag-rules/"):]
+            if "/" in rest:
+                tag_part, kw_part = rest.split("/", 1)
+                ok = mem_store.delete_tag_rule(
+                    urllib.parse.unquote(tag_part),
+                    urllib.parse.unquote(kw_part),
+                )
+                await _send_response(send, *_json_response({"ok": ok}))
+                return
+
+        # GET /api/jobs
+        if path == "/api/jobs" and method == "GET":
+            jobs = mem_store.list_job_runs()
+            await _send_response(send, *_json_response(jobs))
+            return
+
+        # GET /api/jobs/{id}
+        if path.startswith("/api/jobs/") and method == "GET":
+            run_id = path[len("/api/jobs/"):]
+            job = mem_store.get_job_run(run_id)
+            if job is None:
+                await _send_response(send, 404, [[b"content-type", b"text/plain"]], b"Not Found")
+                return
+            await _send_response(send, *_json_response(job))
             return
 
         # GET /api/memories/export — download all memories as JSON

@@ -71,6 +71,11 @@ export default function Memories() {
     onSuccess: invalidate,
   })
 
+  const updateTagsMutation = useMutation({
+    mutationFn: ({ id, tags }: { id: string; tags: string[] }) => api.updateTags(id, tags),
+    onSuccess: invalidate,
+  })
+
   const deleteMutation = useMutation({
     mutationFn: (id: string) => api.delete(id),
     onSuccess: invalidate,
@@ -196,6 +201,7 @@ export default function Memories() {
               memory={m}
               onDelete={(id) => deleteMutation.mutate(id)}
               onUpdate={(id, content) => updateMutation.mutate({ id, content })}
+              onUpdateTags={(id, tags) => updateTagsMutation.mutate({ id, tags })}
             />
           ))}
           {memories.length === 0 && (
