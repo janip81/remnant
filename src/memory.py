@@ -53,9 +53,13 @@ def _agent_id(agent_id: str) -> str:
 
 VALID_CATEGORIES = {"project", "feedback", "reference", "user", "session", "incident", ""}
 
-def add(content: str, agent_id: str = "", infer: Optional[bool] = None, category: str = "") -> dict:
+def add(content: str, agent_id: str = "", infer: Optional[bool] = None, category: str = "", tags: Optional[list] = None) -> dict:
     m = get_memory()
-    metadata = {"category": category} if category else {}
+    metadata: dict = {}
+    if category:
+        metadata["category"] = category
+    if tags:
+        metadata["tags"] = [t for t in tags if isinstance(t, str) and t.strip()]
     result = m.add(
         content,
         user_id=settings.mem0_user_id,

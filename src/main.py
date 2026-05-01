@@ -24,11 +24,14 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def add_memory(content: str, agent_id: str = "", infer: bool = True, category: str = "") -> str:
-    """Store a fact or observation in memory. category: project|feedback|reference|user|session|incident. Set infer=False to store as-is."""
+async def add_memory(content: str, agent_id: str = "", infer: bool = True, category: str = "", tags: list[str] = []) -> str:
+    """Store a fact or observation in memory.
+    category: project|feedback|reference|user|session|incident
+    tags: free-form list, e.g. ["prod-k8s", "remnant", "cnpg"] — use app names, cluster names, topics.
+    Set infer=False to store as-is."""
     if category and category not in mem_store.VALID_CATEGORIES:
         return f"Invalid category '{category}'. Valid: {', '.join(sorted(mem_store.VALID_CATEGORIES) - {''})}"
-    result = mem_store.add(content, agent_id=agent_id, infer=infer, category=category)
+    result = mem_store.add(content, agent_id=agent_id, infer=infer, category=category, tags=tags)
     return json.dumps(result)
 
 
@@ -173,14 +176,23 @@ async def _mcp_handler_strip_output_schema(scope, receive, send):
     await send({"type": "http.response.body", "body": new_body})
 
 
+def _extract_meta(r: dict) -> dict:
+    """mem0 double-wraps metadata as {metadata: {category: ...}} — unwrap both forms."""
+    raw = r.get("metadata") or {}
+    # mem0 pgvector provider wraps: payload.metadata = {"metadata": {"category": "..."}}
+    inner = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else None
+    return inner if inner is not None else raw
+
+
 def _memory_dict(r: dict) -> dict:
     """Normalize a mem0 result to a consistent API shape."""
-    metadata = r.get("metadata") or {}
+    meta = _extract_meta(r)
     return {
         "id": r.get("id", ""),
         "memory": r.get("memory", r.get("text", "")),
         "agent_id": r.get("agent_id", ""),
-        "category": metadata.get("category", ""),
+        "category": meta.get("category", ""),
+        "tags": meta.get("tags") or [],
         "created_at": r.get("created_at", ""),
         "updated_at": r.get("updated_at", ""),
         "score": r.get("score"),
@@ -206,6 +218,44 @@ async def app(scope, receive, send):
     # Health — no auth
     if path == "/health":
         await _send_response(send, *_json_response({"status": "ok", "service": "claude-memory"}))
+        return
+
+    # Prometheus metrics — no auth
+    if path == "/metrics" and method == "GET":
+        all_memories = mem_store.get_all()
+        categories: dict = {}
+        agents: dict = {}
+        tags: dict = {}
+        for r in all_memories:
+            meta = _extract_meta(r)
+            cat = meta.get("category", "") or "uncategorized"
+            categories[cat] = categories.get(cat, 0) + 1
+            agent = r.get("agent_id") or "unknown"
+            agents[agent] = agents.get(agent, 0) + 1
+            for tag in (meta.get("tags") or []):
+                tags[tag] = tags.get(tag, 0) + 1
+        lines = [
+            "# HELP remnant_memories_total Total number of memories stored",
+            "# TYPE remnant_memories_total gauge",
+        ]
+        for cat, count in sorted(categories.items()):
+            lines.append(f'remnant_memories_total{{category="{cat}"}} {count}')
+        lines += [
+            "# HELP remnant_memories_by_agent Total memories per agent",
+            "# TYPE remnant_memories_by_agent gauge",
+        ]
+        for agent, count in sorted(agents.items()):
+            lines.append(f'remnant_memories_by_agent{{agent_id="{agent}"}} {count}')
+        if tags:
+            lines += [
+                "# HELP remnant_memories_by_tag Total memories per tag",
+                "# TYPE remnant_memories_by_tag gauge",
+            ]
+            for tag, count in sorted(tags.items()):
+                lines.append(f'remnant_memories_by_tag{{tag="{tag}"}} {count}')
+        lines.append("")
+        body = "\n".join(lines).encode()
+        await _send_response(send, 200, [[b"content-type", b"text/plain; version=0.0.4"]], body)
         return
 
     # All /api/* routes require bearer auth
