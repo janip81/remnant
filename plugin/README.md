@@ -1,72 +1,60 @@
-# claude-memory plugin
+# remnant plugin
 
-Claude Code plugin for the claude-memory server — hooks, skills, and MCP config.
+Claude Code hooks for the remnant memory server — automatic memory injection on every prompt, session saving on stop and compact.
 
 ## Requirements
 
-- A running claude-memory server (see main README)
+- A running remnant server (see main [README](../README.md))
 - Claude Code with MCP support
 - `requests` Python package (`pip install requests`)
 
-## Quick install
+## Setup
+
+Set these environment variables (add to your shell profile or Claude Code settings):
 
 ```bash
-export CLAUDE_MEMORY_URL="https://mem0-mcp.your-domain.com"
+export CLAUDE_MEMORY_URL="https://remnant-mcp.your-domain.com"
 export CLAUDE_MEMORY_TOKEN="your-bearer-token"
+export CLAUDE_MEMORY_PLUGIN_DIR="/path/to/remnant/plugin"
 ```
 
-Add to Claude Code (user scope, available in all projects):
+## Add MCP server
 
 ```bash
-claude mcp add --transport http --scope user claude-memory \
+claude mcp add --transport http --scope user remnant \
   "${CLAUDE_MEMORY_URL}/mcp" \
   --header "Authorization: Bearer ${CLAUDE_MEMORY_TOKEN}"
 ```
 
-## Hooks
+## Configure hooks
 
-Copy `hooks/hooks.json` into your Claude Code settings, or reference it from
-`.claude/settings.json` in a project. Set `CLAUDE_MEMORY_PLUGIN_DIR` to the
-absolute path of this `plugin/` directory.
+Add to `~/.claude/settings.json`:
 
 ```json
 {
   "env": {
-    "CLAUDE_MEMORY_URL": "https://mem0-mcp.your-domain.com",
+    "CLAUDE_MEMORY_URL": "https://remnant-mcp.your-domain.com",
     "CLAUDE_MEMORY_TOKEN": "your-bearer-token",
-    "CLAUDE_MEMORY_PLUGIN_DIR": "/path/to/claude-memory/plugin"
+    "CLAUDE_MEMORY_PLUGIN_DIR": "/path/to/remnant/plugin"
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {"matcher": "", "hooks": [{"type": "command", "command": "$CLAUDE_MEMORY_PLUGIN_DIR/hooks/on_user_prompt.sh"}]}
+    ],
+    "PreCompact": [
+      {"matcher": "", "hooks": [{"type": "command", "command": "$CLAUDE_MEMORY_PLUGIN_DIR/hooks/on_pre_compact.sh"}]}
+    ],
+    "Stop": [
+      {"matcher": "", "hooks": [{"type": "command", "command": "$CLAUDE_MEMORY_PLUGIN_DIR/hooks/on_stop.sh"}]}
+    ]
   }
 }
 ```
 
-### What the hooks do
+## What the hooks do
 
 | Hook | Trigger | Action |
 |------|---------|--------|
 | `UserPromptSubmit` | Every prompt | Searches memory for relevant context, injects as `<memory>` block before Claude responds |
-| `PreCompact` | Before context compression | Reminds Claude to save important facts before they're lost |
-| `Stop` | Session end | Reminds Claude to save anything worth keeping |
-
-## Skill
-
-The skill (`skills/claude-memory/SKILL.md`) teaches Claude when to search,
-what to save, and how to write good memories. Install it by adding the path
-to your Claude Code skills configuration.
-
-## Manual MCP config (without plugin marketplace)
-
-Add to `~/.claude/mcp.json` or `.mcp.json` in your project:
-
-```json
-{
-  "mcpServers": {
-    "claude-memory": {
-      "type": "http",
-      "url": "https://mem0-mcp.your-domain.com/mcp",
-      "headers": {
-        "Authorization": "Bearer your-bearer-token"
-      }
-    }
-  }
-}
-```
+| `PreCompact` | Before context compression | Saves session state to memory so nothing is lost during compaction |
+| `Stop` | Session end | Saves session summary and key decisions to memory |
