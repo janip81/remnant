@@ -32,3 +32,6 @@ build/
 
 # Node
 node_modules/
+
+# Scripts — runtime output, not source
+scripts/imported.json
