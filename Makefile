@@ -2,8 +2,8 @@ ORG      := janip81
 REGISTRY := ghcr.io
 TAG      ?= latest
 
-IMAGE_MCP := $(REGISTRY)/$(ORG)/claude-memory
-IMAGE_UI  := $(REGISTRY)/$(ORG)/claude-memory-ui
+IMAGE_MCP := $(REGISTRY)/$(ORG)/remnant
+IMAGE_UI  := $(REGISTRY)/$(ORG)/remnant-ui
 
 .PHONY: dev build build-mcp build-ui push push-mcp push-ui tag-mcp tag-ui run test lint clean
 
