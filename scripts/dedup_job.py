@@ -182,6 +182,22 @@ def _set_tags_in_payload(payload: dict, tags: list[str]) -> dict:
     return payload
 
 
+def _merge_tags_and_mark_reviewed(payload: dict, new_tags: list[str]) -> dict:
+    """Merge new_tags with any existing tags and set llm_reviewed=True."""
+    meta = payload.get("metadata") or {}
+    if isinstance(meta.get("metadata"), dict):
+        inner = meta["metadata"]
+        existing = inner.get("tags") or []
+        inner["tags"] = sorted(set(existing) | set(new_tags))
+        inner["llm_reviewed"] = True
+    else:
+        existing = meta.get("tags") or []
+        meta["tags"] = sorted(set(existing) | set(new_tags))
+        meta["llm_reviewed"] = True
+    payload["metadata"] = meta
+    return payload
+
+
 def load_tag_list(cur) -> list[str]:
     """Load all tag names from tag_rules table."""
     try:
@@ -233,7 +249,7 @@ def phase0_llm_tagging(conn, dry_run: bool) -> int:
         log.info("Phase 0: skipped (TAGGING_MODE=keyword)")
         return 0
 
-    log.info("Phase 0: LLM tagging of untagged memories (TAGGING_MODE=%s)", TAGGING_MODE)
+    log.info("Phase 0: LLM tagging (TAGGING_MODE=%s) — reviews all memories not yet llm_reviewed", TAGGING_MODE)
     run_id = start_job_phase(conn, "llm-tagging")
     scanned = 0
     changed = 0
@@ -250,33 +266,35 @@ def phase0_llm_tagging(conn, dry_run: bool) -> int:
             cur.execute(f"SELECT id, payload FROM {MEM_TABLE}")
             rows = cur.fetchall()
 
-        untagged = []
+        # Process any memory not yet reviewed by LLM — includes keyword-tagged ones
+        pending = []
         for row in rows:
             payload = dict(row["payload"]) if isinstance(row["payload"], dict) else json.loads(row["payload"])
             meta = _extract_meta(payload)
-            tags = meta.get("tags")
-            if not tags:
+            if not meta.get("llm_reviewed"):
                 text = payload.get("data", "").strip()
                 if text:
-                    untagged.append({"id": str(row["id"]), "payload": payload, "text": text})
+                    pending.append({"id": str(row["id"]), "payload": payload, "text": text})
 
-        log.info("Found %d untagged memories", len(untagged))
-        scanned = len(untagged)
+        log.info("Found %d memories not yet llm_reviewed", len(pending))
+        scanned = len(pending)
 
-        for item in untagged:
-            tags = ollama_assign_tags(item["text"], available_tags)
-            if not tags:
-                continue
-            log.info("  %s → %s", item["text"][:80], tags)
+        for item in pending:
+            llm_tags = ollama_assign_tags(item["text"], available_tags)
+            existing = _extract_meta(item["payload"]).get("tags") or []
+            merged = sorted(set(existing) | set(llm_tags))
+            added = sorted(set(llm_tags) - set(existing))
+            log.info("  %s → existing=%s llm=%s added=%s", item["text"][:60], existing, llm_tags, added)
             if not dry_run:
-                updated_payload = _set_tags_in_payload(item["payload"], tags)
+                updated_payload = _merge_tags_and_mark_reviewed(item["payload"], llm_tags)
                 with conn.cursor() as cur:
                     cur.execute(
                         f"UPDATE {MEM_TABLE} SET payload = %s WHERE id = %s",
                         (json.dumps(updated_payload), item["id"]),
                     )
                 conn.commit()
-            changed += 1
+            if added:
+                changed += 1
 
         finish_job_phase(conn, run_id, "completed", scanned, changed)
     except Exception as e:
@@ -284,7 +302,7 @@ def phase0_llm_tagging(conn, dry_run: bool) -> int:
         log.error("Phase 0 failed: %s", e)
 
     log.info(
-        "Phase 0 done: scanned=%d tagged=%d%s",
+        "Phase 0 done: scanned=%d new_tags_added_to=%d%s",
         scanned, changed, " (dry run)" if dry_run else "",
     )
     return changed
