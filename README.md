@@ -58,14 +58,58 @@ Browser  ────────────────►  remnant-ui (memory
 
 ---
 
-## Quick start — local development
+## Quick start — Docker Compose
+
+The fastest way to run remnant locally. Requires Ollama running on the host (see Prerequisites above).
 
 ```bash
 git clone https://github.com/janip81/remnant
 cd remnant
 cp .env.example .env
-# Edit .env: set BEARER_TOKEN, OLLAMA_BASE_URL
-make dev          # starts postgres+pgvector + MCP server
+```
+
+Edit `.env` — minimum required changes:
+
+```bash
+BEARER_TOKEN=your-secret-token        # pick anything
+OLLAMA_BASE_URL=http://host.docker.internal:11434  # or your Ollama host
+```
+
+Start everything:
+
+```bash
+docker compose up -d
+```
+
+Services:
+
+| Service | URL | Description |
+|---------|-----|-------------|
+| MCP server | `http://localhost:8080` | MCP endpoint + REST API |
+| UI | `http://localhost:8081` | Memory browser |
+| PostgreSQL | `localhost:5432` | pgvector DB (internal) |
+
+Register with Claude Code:
+
+```bash
+claude mcp add --transport http --scope user remnant \
+  "http://localhost:8080/mcp" \
+  --header "Authorization: Bearer your-secret-token"
+```
+
+Stop and clean up:
+
+```bash
+docker compose down          # keep data
+docker compose down -v       # also remove postgres volume
+```
+
+---
+
+## Quick start — make (local dev with hot reload)
+
+```bash
+make dev          # starts postgres+pgvector + MCP server (with live reload)
 ```
 
 MCP server: `http://localhost:8080`
