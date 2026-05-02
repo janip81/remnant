@@ -49,3 +49,4 @@ Bearer token auth, exposed at `remnant-mcp.prod.threshold.se` via internal-share
 - [ ] GPU embeddings (when burst nodes are live)
 - [ ] Multi-user / per-project memory scoping
 - [ ] Blog series (Parts 2–10)
+- [ ] Memory quality benchmarks — run mem0ai/memory-benchmarks (LoCoMo, LongMemEval) against remnant endpoint to get retrieval precision/recall scores comparable to mem0 cloud numbers
