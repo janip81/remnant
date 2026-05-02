@@ -116,6 +116,34 @@ MCP server: `http://localhost:8080`
 
 ---
 
+## Kubernetes — plain manifests (no Helm)
+
+A single self-contained manifest is provided in `deploy/manifest.yaml`. It includes PostgreSQL + pgvector, the MCP server, the UI, and the nightly dedup CronJob.
+
+```bash
+# 1. Edit the two values marked with ← in the file:
+#    - BEARER_TOKEN in the remnant-auth Secret
+#    - OLLAMA_BASE_URL in the remnant-settings ConfigMap
+#    - storageClassName if "standard" doesn't exist in your cluster
+
+# 2. Apply
+kubectl apply -f deploy/manifest.yaml
+
+# 3. Verify
+kubectl get pods -n remnant
+kubectl logs -n remnant -l app=remnant,component=mcp
+
+# 4. Register with Claude Code
+kubectl port-forward -n remnant svc/remnant 8080:8080
+claude mcp add --transport http --scope user remnant \
+  "http://localhost:8080/mcp" \
+  --header "Authorization: Bearer your-token"
+```
+
+For external access add an Ingress — a commented-out template is included at the bottom of `deploy/manifest.yaml`.
+
+---
+
 ## Kubernetes (Helm)
 
 ### Auth secret

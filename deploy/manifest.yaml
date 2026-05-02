@@ -1,0 +1,330 @@
+# remnant — plain Kubernetes manifests
+#
+# Prerequisites:
+#   - Ollama running and reachable from the cluster
+#   - kubectl access to your cluster
+#
+# Quick deploy:
+#   kubectl apply -f manifest.yaml
+#
+# Before applying, update:
+#   - BEARER_TOKEN in the Secret
+#   - OLLAMA_BASE_URL in the ConfigMap (and optionally OLLAMA_MODEL / OLLAMA_EMBED_MODEL)
+#   - StorageClass name if not "standard"
+#
+# Exposes:
+#   MCP server:  http://<cluster-ip>:8080  (ClusterIP — add Ingress below if needed)
+#   UI:          http://<cluster-ip>:8081
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: remnant
+
+---
+# ── Auth secret ────────────────────────────────────────────────────────────────
+# Replace the BEARER_TOKEN value before applying.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: remnant-auth
+  namespace: remnant
+type: Opaque
+stringData:
+  BEARER_TOKEN: "change-me"
+
+---
+# ── Settings ConfigMap ─────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: remnant-settings
+  namespace: remnant
+data:
+  OLLAMA_BASE_URL: "http://ollama:11434"       # ← update to your Ollama URL
+  OLLAMA_MODEL: "qwen2.5:7b"
+  OLLAMA_EMBED_MODEL: "nomic-embed-text"
+  TAGGING_MODE: "hybrid"                        # keyword | llm | hybrid
+  REMNANT_USER_ID: "default"
+
+---
+# ── PostgreSQL + pgvector ──────────────────────────────────────────────────────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: remnant-pg-credentials
+  namespace: remnant
+type: Opaque
+stringData:
+  POSTGRES_USER: remnant
+  POSTGRES_PASSWORD: remnant
+  POSTGRES_DB: remnant
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: remnant-pg-init
+  namespace: remnant
+data:
+  init.sql: |
+    CREATE EXTENSION IF NOT EXISTS vector;
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: remnant-postgres
+  namespace: remnant
+spec:
+  serviceName: remnant-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: remnant-postgres
+  template:
+    metadata:
+      labels:
+        app: remnant-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg16
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: remnant-pg-credentials
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "remnant", "-d", "remnant"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: init
+          configMap:
+            name: remnant-pg-init
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard              # ← update to your StorageClass
+        resources:
+          requests:
+            storage: 5Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: remnant-postgres
+  namespace: remnant
+spec:
+  clusterIP: None
+  selector:
+    app: remnant-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+
+---
+# ── MCP server ─────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: remnant
+  namespace: remnant
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: remnant
+      component: mcp
+  template:
+    metadata:
+      labels:
+        app: remnant
+        component: mcp
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: remnant
+          image: ghcr.io/janip81/remnant:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: remnant-settings
+          env:
+            - name: APP_PORT
+              value: "8080"
+            - name: BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: remnant-auth
+                  key: BEARER_TOKEN
+            - name: DATABASE_URL
+              value: "postgresql://remnant:remnant@remnant-postgres:5432/remnant"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: remnant
+  namespace: remnant
+spec:
+  type: ClusterIP
+  selector:
+    app: remnant
+    component: mcp
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+
+---
+# ── UI ─────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: remnant-ui
+  namespace: remnant
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: remnant
+      component: ui
+  template:
+    metadata:
+      labels:
+        app: remnant
+        component: ui
+    spec:
+      containers:
+        - name: remnant-ui
+          image: ghcr.io/janip81/remnant-ui:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8081
+          env:
+            - name: MCP_BASE_URL
+              value: "http://remnant:8080"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: remnant-ui
+  namespace: remnant
+spec:
+  type: ClusterIP
+  selector:
+    app: remnant
+    component: ui
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081
+
+---
+# ── Nightly dedup CronJob ──────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: remnant-dedup
+  namespace: remnant
+spec:
+  schedule: "30 3 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: dedup
+              image: ghcr.io/janip81/remnant:latest
+              imagePullPolicy: Always
+              command: ["python", "src/scripts/dedup_job.py"]
+              envFrom:
+                - configMapRef:
+                    name: remnant-settings
+              env:
+                - name: DATABASE_URL
+                  value: "postgresql://remnant:remnant@remnant-postgres:5432/remnant"
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+
+---
+# ── Ingress (optional — uncomment and adapt to your ingress controller) ─────────
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: remnant
+#   namespace: remnant
+#   annotations:
+#     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+# spec:
+#   rules:
+#     - host: remnant-mcp.example.com
+#       http:
+#         paths:
+#           - path: /
+#             pathType: Prefix
+#             backend:
+#               service:
+#                 name: remnant
+#                 port:
+#                   number: 8080
+#     - host: remnant.example.com
+#       http:
+#         paths:
+#           - path: /
+#             pathType: Prefix
+#             backend:
+#               service:
+#                 name: remnant-ui
+#                 port:
+#                   number: 8081
