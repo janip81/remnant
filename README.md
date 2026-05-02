@@ -140,9 +140,9 @@ Available MCP tools:
 The `plugin/` directory contains hooks that wire remnant into every Claude Code session automatically.
 
 ```bash
-export CLAUDE_MEMORY_URL="https://remnant-mcp.your-domain.com"
-export CLAUDE_MEMORY_TOKEN="your-bearer-token"
-export CLAUDE_MEMORY_PLUGIN_DIR="/path/to/remnant/plugin"
+export REMNANT_URL="https://remnant-mcp.your-domain.com"
+export REMNANT_TOKEN="your-bearer-token"
+export REMNANT_PLUGIN_DIR="/path/to/remnant/plugin"
 ```
 
 | Hook | Trigger | Action |
@@ -162,12 +162,12 @@ All config via environment variables (see `.env.example`):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BEARER_TOKEN` | `change-me` | Auth token for MCP endpoint |
-| `DATABASE_URL` | `postgresql://mem0:mem0@localhost:5432/mem0` | PostgreSQL connection |
+| `DATABASE_URL` | `postgresql://remnant:remnant@localhost:5432/remnant` | PostgreSQL connection |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `qwen2.5:7b` | Chat model for tagging and dedup merging |
 | `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Embedding model |
 | `TAGGING_MODE` | `keyword` | `keyword` / `llm` / `hybrid` |
-| `MEM0_USER_ID` | `jani` | User ID namespace |
+| `REMNANT_USER_ID` | `default` | User ID namespace for stored memories |
 | `APP_PORT` | `8080` | Listen port |
 
 ---
