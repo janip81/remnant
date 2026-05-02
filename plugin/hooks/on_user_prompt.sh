@@ -50,7 +50,7 @@ else
 fi
 
 PAYLOAD=$(jq -cn --arg q "$QUERY" \
-  '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search_memory","arguments":{"query":$q,"limit":5}},"id":1}')
+  '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search_memory","arguments":{"query":$q,"limit":3}},"id":1}')
 
 RESPONSE=$(curl -sf --max-time 8 \
   -X POST "${MEMORY_URL}/mcp" \
