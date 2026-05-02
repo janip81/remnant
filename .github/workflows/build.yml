@@ -41,6 +41,7 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
+          # TODO: switch to secrets.GITHUB_TOKEN once repo is made public
           password: ${{ secrets.CR_PAT }}
 
       - name: Determine tags (MCP)
@@ -80,6 +81,7 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
+          # TODO: switch to secrets.GITHUB_TOKEN once repo is made public
           password: ${{ secrets.CR_PAT }}
 
       - name: Determine tags (UI)
