@@ -1,19 +1,20 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "claude-memory.fullname" . }}
+  name: {{ include "remnant.fullname" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "claude-memory.labels" . | nindent 4 }}
+    {{- include "remnant.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
-      {{- include "claude-memory.selectorLabels" . | nindent 6 }}
+      {{- include "remnant.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "claude-memory.labels" . | nindent 8 }}
+        {{- include "remnant.labels" . | nindent 8 }}
+        app.kubernetes.io/component: mcp
     spec:
       securityContext:
         runAsNonRoot: true
@@ -23,13 +24,16 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
-        - name: claude-memory
+        - name: remnant
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
               containerPort: 8080
               protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "remnant.fullname" . }}-settings
           env:
             - name: APP_PORT
               value: "8080"
@@ -38,13 +42,13 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.auth.secretName }}
                   key: BEARER_TOKEN
-            - name: DATABASE_URL
-              value: "postgresql://mem0:$(DB_PASSWORD)@{{ include "claude-memory.fullname" . }}-pg-rw:5432/mem0"
             - name: DB_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "claude-memory.fullname" . }}-pg-app
+                  name: {{ include "remnant.fullname" . }}-pg-app
                   key: password
+            - name: DATABASE_URL
+              value: "postgresql://{{ .Values.cnpg.owner | default "remnant" }}:$(DB_PASSWORD)@{{ include "remnant.fullname" . }}-pg-rw:5432/{{ .Values.cnpg.database | default "remnant" }}"
             - name: OLLAMA_BASE_URL
               value: {{ .Values.ollama.baseUrl | quote }}
             - name: OLLAMA_MODEL
@@ -53,6 +57,10 @@ spec:
               value: {{ .Values.ollama.embedModel | quote }}
             - name: MEM0_USER_ID
               value: {{ .Values.mem0.userId | quote }}
+            - name: MEM0_AGENT_ID
+              value: {{ .Values.mem0.agentId | quote }}
+            - name: MEM0_INFER
+              value: {{ .Values.mem0.infer | quote }}
           livenessProbe:
             httpGet:
               path: /health

@@ -2,10 +2,10 @@
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
-  name: {{ include "claude-memory.fullname" . }}-pg
+  name: {{ include "remnant.fullname" . }}-pg
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "claude-memory.labels" . | nindent 4 }}
+    {{- include "remnant.labels" . | nindent 4 }}
 spec:
   instances: {{ .Values.cnpg.instances }}
   imageName: ghcr.io/cloudnative-pg/postgresql:16
@@ -20,8 +20,8 @@ spec:
 
   bootstrap:
     initdb:
-      database: mem0
-      owner: mem0
+      database: {{ .Values.cnpg.database | default "remnant" }}
+      owner: {{ .Values.cnpg.owner | default "remnant" }}
       postInitSQL:
         - "CREATE EXTENSION IF NOT EXISTS vector;"
 

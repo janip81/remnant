@@ -1,8 +1,8 @@
-{{- define "claude-memory.name" -}}
+{{- define "remnant.name" -}}
 {{- .Chart.Name }}
 {{- end }}
 
-{{- define "claude-memory.fullname" -}}
+{{- define "remnant.fullname" -}}
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
@@ -15,15 +15,15 @@
 {{- end }}
 {{- end }}
 
-{{- define "claude-memory.labels" -}}
+{{- define "remnant.labels" -}}
 helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
-app.kubernetes.io/name: {{ include "claude-memory.name" . }}
+app.kubernetes.io/name: {{ include "remnant.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
-{{- define "claude-memory.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "claude-memory.name" . }}
+{{- define "remnant.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "remnant.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
