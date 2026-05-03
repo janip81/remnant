@@ -14,8 +14,8 @@ import sys
 
 
 def main():
-    url = os.environ.get("CLAUDE_MEMORY_URL", "")
-    token = os.environ.get("CLAUDE_MEMORY_TOKEN", "")
+    url = os.environ.get("REMNANT_URL", "")
+    token = os.environ.get("REMNANT_TOKEN", "")
 
     if not url or not token:
         sys.exit(0)

@@ -6,6 +6,10 @@ Self-hosted MCP memory server for Claude Code. Stores facts in PostgreSQL + pgve
 
 ```
 Claude Code  ──HTTP/MCP──►  remnant (MCP server)  ──►  pgvector (CNPG)
+                                    │         │
+                                    │         └──►  Redis queue (optional)
+                                    │                      │
+                                    │              background worker
                                     │
                                     ├──►  Ollama (nomic-embed-text embeddings)
                                     └──►  Ollama (qwen2.5:7b — tagging/dedup)
@@ -58,17 +62,89 @@ Browser  ────────────────►  remnant-ui (memory
 
 ---
 
-## Quick start — local development
+## Quick start — Docker Compose
+
+The fastest way to run remnant locally. Requires Ollama running on the host (see Prerequisites above).
 
 ```bash
 git clone https://github.com/janip81/remnant
 cd remnant
 cp .env.example .env
-# Edit .env: set BEARER_TOKEN, OLLAMA_BASE_URL
-make dev          # starts postgres+pgvector + MCP server
+```
+
+Edit `.env` — minimum required changes:
+
+```bash
+BEARER_TOKEN=your-secret-token        # pick anything
+OLLAMA_BASE_URL=http://host.docker.internal:11434  # or your Ollama host
+```
+
+Start everything:
+
+```bash
+docker compose up -d
+```
+
+Services:
+
+| Service | URL | Description |
+|---------|-----|-------------|
+| MCP server | `http://localhost:8080` | MCP endpoint + REST API |
+| UI | `http://localhost:8081` | Memory browser |
+| PostgreSQL | `localhost:5432` | pgvector DB (internal) |
+
+Register with Claude Code:
+
+```bash
+claude mcp add --transport http --scope user remnant \
+  "http://localhost:8080/mcp" \
+  --header "Authorization: Bearer your-secret-token"
+```
+
+Stop and clean up:
+
+```bash
+docker compose down          # keep data
+docker compose down -v       # also remove postgres volume
+```
+
+---
+
+## Quick start — make (local dev with hot reload)
+
+```bash
+make dev          # starts postgres+pgvector + MCP server (with live reload)
 ```
 
 MCP server: `http://localhost:8080`
+
+---
+
+## Kubernetes — plain manifests (no Helm)
+
+A single self-contained manifest is provided in `deploy/manifest.yaml`. It includes PostgreSQL + pgvector, the MCP server, the UI, and the nightly dedup CronJob.
+
+```bash
+# 1. Edit the two values marked with ← in the file:
+#    - BEARER_TOKEN in the remnant-auth Secret
+#    - OLLAMA_BASE_URL in the remnant-settings ConfigMap
+#    - storageClassName if "standard" doesn't exist in your cluster
+
+# 2. Apply
+kubectl apply -f deploy/manifest.yaml
+
+# 3. Verify
+kubectl get pods -n remnant
+kubectl logs -n remnant -l app=remnant,component=mcp
+
+# 4. Register with Claude Code
+kubectl port-forward -n remnant svc/remnant 8080:8080
+claude mcp add --transport http --scope user remnant \
+  "http://localhost:8080/mcp" \
+  --header "Authorization: Bearer your-token"
+```
+
+For external access add an Ingress — a commented-out template is included at the bottom of `deploy/manifest.yaml`.
 
 ---
 
@@ -169,6 +245,28 @@ All config via environment variables (see `.env.example`):
 | `TAGGING_MODE` | `keyword` | `keyword` / `llm` / `hybrid` |
 | `REMNANT_USER_ID` | `default` | User ID namespace for stored memories |
 | `APP_PORT` | `8080` | Listen port |
+| `REDIS_URL` | _(unset)_ | Optional. Enables async queue for `add_memory`. Format: `redis://:password@host:6379/0` |
+
+### Redis async queue (optional)
+
+When `REDIS_URL` is set, `add_memory` calls are pushed to a Redis list (`remnant:queue:add_memory`) and processed by a background asyncio worker. The caller gets an immediate response (`{"queued": true, "job_id": "..."}`) instead of blocking while Ollama runs LLM extraction (which can take 15–17 s with `infer=true`).
+
+Without `REDIS_URL` the behaviour is unchanged — writes are synchronous.
+
+**Helm** — enable via:
+
+```yaml
+redis:
+  enabled: true
+  host: redis-replication-master.redis.svc
+  port: 6379
+  db: 0
+  passwordSecret:
+    name: remnant-redis-auth   # Secret in same namespace
+    key: password
+```
+
+The queue depth is exported as `remnant_queue_depth` on the `/metrics` endpoint.
 
 ---
 
