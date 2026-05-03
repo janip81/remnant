@@ -88,15 +88,38 @@ After first full pass, LLM tagging only processes new memories (via `llm_reviewe
 
 ---
 
-## Context savings vs baseline
+## Token injection — measured (2026-05-02)
 
-| Metric | Before (file-based) | After (remnant) |
-|--------|---------------------|-----------------|
+Hook injection size across 5 representative queries (top-5 results each):
+
+| Query | Chars | Tokens (est) |
+|-------|-------|-------------|
+| `remnant prod-k8s etcd argocd cilium` | 3,135 | ~783 |
+| `remnant memory search tag rules` | 7,948 | ~1,987 |
+| `BGP cilium networking OPNsense` | 4,788 | ~1,197 |
+| `CNPG backup postgres barman` | 4,429 | ~1,107 |
+| `velero backup schedule FSB` | 1,526 | ~381 |
+| **avg** | **4,365** | **~1,091** |
+
+**Per-session token budget (20 prompts):** ~21,800 tokens injected total.
+
+---
+
+## Context comparison vs file-based baseline
+
+| Metric | Before (file-based MEMORY.md) | After (remnant) |
+|--------|-------------------------------|-----------------|
 | Tokens at session start | ~7,000 (unconditional) | 0 |
-| Tokens per memory lookup | — | ~200–500 (top-k only) |
-| Relevance | All topics, always | Query-matched only |
-| Truncation | Yes (past 200 lines) | Never |
-| Growth | Unbounded (file) | Bounded (dedup nightly) |
+| Tokens per prompt injection | 0 (static, already loaded) | ~1,091 avg |
+| Tokens over 20-prompt session | ~7,000 (constant) | ~21,800 (cumulative) |
+| Relevance | All topics, always loaded | Query-matched only |
+| Truncation | Yes — past 200 lines silently dropped | Never |
+| Growth | Unbounded (file grew forever) | Bounded (nightly dedup) |
+| Memory count ceiling | ~200 entries before truncation | Unlimited |
+
+**Honest summary:** remnant injects more raw tokens per active session than the old flat file did.
+The benefit is not token count — it's relevance (only what matches the current query), no truncation,
+and the ability to store and retrieve thousands of memories instead of ~200.
 
 ---
 

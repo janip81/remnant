@@ -1,55 +1,53 @@
-# MVP.md — claude-memory
+# MVP.md — remnant
 
-## What is the MVP?
+## What was the MVP?
 
-A working MCP server running in prod-k8s that Claude Code can connect to from both the desktop and starbase.
-It stores and retrieves memories semantically using mem0 + pgvector on CNPG.
-Bearer token auth, exposed at `mem0-mcp.prod.threshold.se` via internal-shared gateway.
+A working MCP server running in prod-k8s that Claude Code can connect to from any machine.
+Stores and retrieves memories semantically using pgvector on CNPG, with Ollama for embeddings.
+Bearer token auth, exposed at `remnant-mcp.prod.threshold.se` via internal-shared gateway.
 
----
-
-## In Scope
-
-- [x] Project skeleton and planning docs
-- [ ] Python MCP server with 4 tools: add_memory, search_memory, get_all_memories, delete_memory
-- [ ] mem0 integration with pgvector backend
-- [ ] sentence-transformers embeddings (CPU, all-MiniLM-L6-v2, in-pod)
-- [ ] Claude API as LLM provider for memory extraction
-- [ ] Bearer token auth middleware
-- [ ] Dockerfile (python:3.12-slim base)
-- [ ] Helm chart with CNPG cluster, Deployment, Service, HTTPRoute, ExternalSecret
-- [ ] Vault secret: `kubernetes/data/prod-k8s/claude-memory` (bearer token + anthropic key)
-- [ ] gitops wiring (ArgoCD app on prod-k8s)
+**Status: MVP complete. Project is now well beyond MVP scope.**
 
 ---
 
-## Out of Scope (for MVP)
+## MVP Checklist — all done
 
-- GPU-accelerated embeddings (add later by swapping embedding provider)
-- Multi-user support (single user_id hardcoded for now)
-- Auto-extraction hook (Claude manually calls add_memory for now)
-- Web UI for browsing memories
-- Metrics / Grafana dashboard
-
----
-
-## Done Criteria
-
-The MVP is complete when:
-
-- [ ] `claude mcp add --transport http mem0-mcp https://mem0-mcp.prod.threshold.se/` works from desktop
-- [ ] `add_memory("test fact")` stores a memory and returns an ID
-- [ ] `search_memory("test")` returns the stored memory
-- [ ] Pod restarts do not lose memories (pgvector persisted via CNPG PVC)
-- [ ] CNPG cluster has WAL archiving active to Garage S3
-- [ ] README explains how to connect
+- [x] Python MCP server with 4 tools: `add_memory`, `search_memory`, `get_all_memories`, `delete_memory`
+- [x] pgvector backend via mem0ai library
+- [x] Ollama embeddings (`nomic-embed-text`) — replaced planned sentence-transformers
+- [x] Ollama LLM (`qwen2.5:7b`) for tagging/dedup — replaced planned Claude API
+- [x] Bearer token auth middleware
+- [x] `Dockerfile.mcp` and `Dockerfile.ui` (split images)
+- [x] Helm chart (0.2.3) with CNPG cluster, Deployment, Service, HTTPRoute, ServiceMonitor, CronJob
+- [x] Vault/AVP secret: bearer token injected via ArgoCD AVP plugin
+- [x] GitOps wiring (ArgoCD app on prod-k8s, namespace `remnant`)
+- [x] `remnant-mcp.prod.threshold.se` reachable from desktop and cluster
+- [x] `add_memory` stores, `search_memory` retrieves, pod restarts do not lose data
+- [x] CNPG WAL archiving active to S3
 
 ---
 
-## Future Phases
+## Beyond MVP — shipped in 0.5.0-beta
 
-- GPU embedding backend (when stargate-prod/burst are live)
-- Auto-extraction: hook into Claude Code conversation end to extract facts automatically
-- Per-project memory scoping (tag memories by project)
-- Grafana dashboard: memory count, search latency, embedding time
-- Periodic memory consolidation (merge redundant facts)
+- [x] React UI for browsing, editing, and managing memories (`remnant.prod.threshold.se`)
+- [x] Nightly dedup CronJob: hash dedup → semantic dedup → LLM merge
+- [x] LLM tagging: keyword at write time + nightly Ollama review pass (hybrid mode)
+- [x] DB-backed tag rules (editable from UI without code changes)
+- [x] Job history viewer (UI tab)
+- [x] Grafana dashboard (memory count, search latency, category/tag distribution)
+- [x] Claude Code hooks: `UserPromptSubmit` memory injection, `PreCompact`/`Stop` saves
+- [x] GitHub Actions CI (`:latest`, `:dev`, versioned tags)
+- [x] `dev` branch strategy with PR-to-main flow
+- [x] Benchmarks documented (`BENCHMARKS.md`)
+
+---
+
+## Still open / future
+
+- [ ] Make repo public + switch CI from `CR_PAT` to `GITHUB_TOKEN`
+- [ ] Helm chart sync workflow (remnant repo → helm-charts repo)
+- [ ] GPU embeddings (when burst nodes are live)
+- [ ] Multi-user / per-project memory scoping
+- [ ] Blog series (Parts 2–10)
+- [ ] Memory quality benchmarks — run mem0ai/memory-benchmarks (LoCoMo, LongMemEval) against remnant endpoint to get retrieval precision/recall scores comparable to mem0 cloud numbers
+- [ ] Async task queue for `add_memory` — Redis + Celery (or asyncio queue) so Ollama LLM extraction runs in background, returning a job ID immediately. Fixes readiness probe failures caused by infer=True blocking for 15–17s during Ollama calls

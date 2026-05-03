@@ -4,8 +4,8 @@
 # Output is injected as context before Claude responds.
 set -euo pipefail
 
-MEMORY_URL="${CLAUDE_MEMORY_URL:-}"
-MEMORY_TOKEN="${CLAUDE_MEMORY_TOKEN:-}"
+MEMORY_URL="${REMNANT_URL:-}"
+MEMORY_TOKEN="${REMNANT_TOKEN:-}"
 
 [[ -z "$MEMORY_URL" || -z "$MEMORY_TOKEN" ]] && exit 0
 

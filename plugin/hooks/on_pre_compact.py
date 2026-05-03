@@ -205,10 +205,10 @@ def main():
         if arg.startswith("--source="):
             source = arg.split("=", 1)[1]
 
-    memory_url = os.environ.get("CLAUDE_MEMORY_URL", "")
-    token = os.environ.get("CLAUDE_MEMORY_TOKEN", "")
+    memory_url = os.environ.get("REMNANT_URL", "")
+    token = os.environ.get("REMNANT_TOKEN", "")
     if not memory_url or not token:
-        log.debug("CLAUDE_MEMORY_URL or CLAUDE_MEMORY_TOKEN not set, skipping capture")
+        log.debug("REMNANT_URL or REMNANT_TOKEN not set, skipping capture")
         return
 
     try:

@@ -1,10 +1,10 @@
 {
   "mcpServers": {
-    "claude-memory": {
+    "remnant": {
       "type": "http",
-      "url": "${CLAUDE_MEMORY_URL}/mcp",
+      "url": "${REMNANT_URL}/mcp",
       "headers": {
-        "Authorization": "Bearer ${CLAUDE_MEMORY_TOKEN}"
+        "Authorization": "Bearer ${REMNANT_TOKEN}"
       }
     }
   }

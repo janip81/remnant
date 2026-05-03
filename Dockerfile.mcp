@@ -7,7 +7,7 @@ WORKDIR /app
 COPY requirements-mcp.txt .
 RUN pip install --no-cache-dir -r requirements-mcp.txt
 
-COPY src/main.py src/memory.py src/config.py ./src/
+COPY src/main.py src/memory.py src/config.py src/queue_worker.py ./src/
 COPY scripts/dedup_job.py ./src/scripts/
 
 USER appuser

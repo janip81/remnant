@@ -275,6 +275,54 @@ Update everything:
 
 ---
 
+---
+
+## Phase 11 — Multi-user support
+> Goal: allow multiple users (or agents) to have isolated memory namespaces
+
+- [ ] User identity via configurable `user_id` per MCP connection (header or token-derived)
+- [ ] Per-user memory isolation in pgvector (row-level or schema-level)
+- [ ] UI: user switcher / user filter
+- [ ] Helm: optional list of users with separate bearer tokens
+- [ ] Document: how to run Remnant for a team (shared infra, isolated memories)
+
+---
+
+## Phase 12 — Graph memory
+> Goal: relationship linking between memories using existing CNPG — no new infra needed
+> Approach: `memory_edges` table in existing Postgres, edges built by the nightly dedup job
+
+**Schema (pure SQL — no Apache AGE, no Neo4j):**
+```sql
+CREATE TABLE memory_edges (
+  source_id UUID REFERENCES mem0_memories(id) ON DELETE CASCADE,
+  target_id UUID REFERENCES mem0_memories(id) ON DELETE CASCADE,
+  relationship TEXT,  -- related_to | contradicts | derived_from | supersedes
+  weight FLOAT,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (source_id, target_id, relationship)
+);
+```
+
+- [ ] Add `memory_edges` table to `_ensure_schema()` in memory.py
+- [ ] Nightly job Phase 3: for each semantic cluster (already grouped by cosine similarity), ask Ollama to classify relationships between pairs — write edges
+- [ ] New MCP tool: `get_related(memory_id, limit=5)` — JOIN on memory_edges, return linked memories with relationship type
+- [ ] UI: "Related" section on memory card (expandable, shows linked memories + relationship label)
+- [ ] Optional Phase 12b: recursive CTE for multi-hop traversal
+
+---
+
+## Phase 13 — Embeddable library
+> Goal: make Remnant usable as a general-purpose memory layer, not just for Claude Code
+
+- [ ] Extract core into a Python package (`remnant-core`) with clean `add/search/delete` API
+- [ ] Decouple from Claude Code assumptions (no Claude-specific hook references in core)
+- [ ] Publish to PyPI
+- [ ] SDK example: use Remnant as memory backend in a LangChain / custom agent
+- [ ] Document: embedding Remnant in any Python LLM app (OpenAI, Anthropic, local)
+
+---
+
 ## Phase 6 (old) — Local LLM
 > Adopted in Phase 2 (Ollama). ADR-0001 superseded. No separate phase needed.
 

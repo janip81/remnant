@@ -1,4 +1,4 @@
-# Skill: claude-memory
+# Skill: remnant
 
 You have access to a persistent memory store via four tools: `add_memory`,
 `search_memory`, `get_all_memories`, and `delete_memory`. The store is fully
@@ -20,8 +20,8 @@ Call `add_memory` when you learn something that would save time in a future
 session:
 
 - A correction ("don't use git add -A here — stage specific files only")
-- A convention ("internal-shared gateway for *.prod.threshold.se")
-- A cluster or project-specific fact ("CNPG barman secret is cnpg-barman-s3-creds")
+- A convention ("cert-manager uses ClusterIssuer named letsencrypt-prod")
+- A project-specific fact ("CNPG barman secret is cnpg-barman-s3-creds")
 - A decision and its reason ("selfHeal:false on ArgoCD apps is temporary, not design")
 - A tool or workflow the user prefers
 
@@ -35,7 +35,7 @@ Be specific. Include the WHY when it matters.
 
 Good:
 ```
-add_memory("Never use git add -A in prod-k8s — gitignored paths like prod/clusters_local_only/ contain sensitive files that must not be committed")
+add_memory("Never use git add -A in this repo — gitignored paths contain sensitive files that must not be committed")
 ```
 
 Too vague:
@@ -56,9 +56,9 @@ the old one and add the corrected version.
 | Type | Example |
 |------|---------|
 | Feedback / correction | "Don't mock the database in tests — we got burned when mocked tests passed but prod migration failed" |
-| Convention | "Gateway API, not ingress — internal-shared for *.prod.threshold.se, external-shared for *.threshold.se" |
-| Cluster-specific fact | "prod-k8s etcd: 3 CP nodes on atlantis, one disk in predictive failure as of 2026-04" |
-| Decision + reason | "n8n liveness probe: initialDelaySeconds:120 — EPERM on pg-main-rw-lb takes 90-120s to resolve" |
+| Convention | "Use Gateway API HTTPRoute, not Ingress — internal gateway for private services, external for public" |
+| Project-specific fact | "Readiness probe on CNPG pods uses /readyz — not /healthz" |
+| Decision + reason | "n8n liveness probe: initialDelaySeconds:120 — pg connection takes 90-120s to resolve" |
 | User preference | "User prefers bundled PRs over many small ones for refactors in this repo" |
 
 ## What not to save

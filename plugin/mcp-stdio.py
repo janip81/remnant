@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-stdio ↔ HTTP MCP proxy for claude-memory / Remnant.
+stdio ↔ HTTP MCP proxy for Remnant.
 
 Claude Code spawns this as a stdio MCP server.  It starts instantly
 (no network on startup) and forwards each JSON-RPC message to the HTTP
 MCP endpoint on demand.
 
 Usage:
-  claude mcp add claude-memory python3 /path/to/mcp-stdio.py
-  (env vars CLAUDE_MEMORY_URL and CLAUDE_MEMORY_TOKEN must be set)
+  claude mcp add remnant python3 /path/to/mcp-stdio.py
+  (env vars REMNANT_URL and REMNANT_TOKEN must be set)
 """
 
 import json
@@ -18,8 +18,8 @@ from typing import Optional
 
 import requests
 
-URL = os.environ.get("CLAUDE_MEMORY_URL", "").rstrip("/") + "/mcp"
-TOKEN = os.environ.get("CLAUDE_MEMORY_TOKEN", "")
+URL = os.environ.get("REMNANT_URL", "").rstrip("/") + "/mcp"
+TOKEN = os.environ.get("REMNANT_TOKEN", "")
 
 HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
@@ -57,7 +57,7 @@ def http_post(payload: dict) -> Optional[dict]:
 
 def main():
     if not TOKEN:
-        sys.stderr.write("CLAUDE_MEMORY_TOKEN not set\n")
+        sys.stderr.write("REMNANT_TOKEN not set — set via env var\n")
         sys.exit(1)
 
     for raw_line in sys.stdin:

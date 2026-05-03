@@ -1,147 +1,121 @@
-# AGENTS.md — claude-memory
+# AGENTS.md — remnant
 
-## Project Overview
+## Overview
 
-MCP server that gives Claude persistent semantic memory.
-Stores facts extracted from conversations in pgvector (CNPG), retrieves them via semantic search.
-Deployed in prod-k8s, accessible from any Claude Code client (desktop, starbase) over HTTP.
-
----
-
-## 1. Purpose
-
-Claude's file-based MEMORY.md grows unbounded and gets truncated in context.
-This service replaces it with a queryable vector store — Claude calls `search_memory("topic")`
-and gets back only the relevant facts, not everything ever remembered.
-
-Users: single-user (jani), accessed from desktop + starbase via `mem0-mcp.prod.threshold.se`.
+Remnant is a self-hosted MCP memory server for Claude Code.
+Stores facts in pgvector (CNPG), retrieves them via semantic search.
+Namespace: `remnant` on prod-k8s.
 
 ---
 
-## 2. Tech Stack
+## Tech Stack
 
 | Layer | Technology |
 |-------|------------|
-| MCP server | Python, `mcp` SDK (official), HTTP/SSE transport |
-| Memory library | mem0ai/mem0 |
-| Embeddings | sentence-transformers `all-MiniLM-L6-v2` (CPU, in-pod, ~90MB) |
-| LLM (extraction) | Claude API (Anthropic) |
-| Vector store | PostgreSQL + pgvector via CNPG |
-| Auth | Bearer token (Vault secret) |
-| Deployment | Helm chart → ArgoCD gitops → prod-k8s |
-
-### Why this stack
-- pgvector on CNPG reuses existing infrastructure + Barman/Velero backups — no new DB to operate
-- sentence-transformers runs CPU-only, no external dep, swap to GPU model later with no architecture change
-- Claude API for extraction: best quality, already available
-- Official MCP SDK ensures compatibility with Claude Code clients
+| MCP server | Python, `mcp` SDK, HTTP/SSE (`FastMCP`) |
+| Embeddings | Ollama `nomic-embed-text` (192.168.81.20:11434) |
+| LLM (extraction) | Ollama `qwen2.5:7b` |
+| Vector store | PostgreSQL + pgvector via CNPG (`remnant-pg`) |
+| Async queue | Redis (`redis-replication-master.redis.svc:6379`) — optional, enabled when `REDIS_URL` set |
+| Auth | Bearer token (Vault → ExternalSecret) |
+| Deployment | Helm chart 0.2.3 → ArgoCD → prod-k8s |
 
 ---
 
-## 3. Architecture
+## Architecture
 
 ```
-Claude Code (desktop / starbase)
-    │  HTTP MCP  (Bearer token)
+Claude Code (desktop/starbase)
+    │  HTTP MCP (Bearer token)
     ▼
-mem0-mcp service  [prod-k8s, namespace: claude-memory]
-    │
-    ├── mem0 library
-    │     ├── LLM: Claude API  (memory extraction/dedup)
-    │     ├── Embeddings: sentence-transformers all-MiniLM-L6-v2 (in-pod)
-    │     └── Vector store → pgvector
-    │
-    └── mem0-pg CNPG cluster  [prod-k8s, namespace: claude-memory]
-          └── WAL archiving → Garage S3 (cnpg-prod-k8s bucket)
+remnant deployment  [prod-k8s, ns: remnant]
+    ├── add_memory → Redis queue → queue_worker.py → pgvector
+    ├── search_memory / get_all_memories / delete_memory → pgvector (sync)
+    ├── Ollama (nomic-embed-text embeddings, qwen2.5:7b extraction)
+    └── remnant-pg CNPG cluster (WAL → Garage S3)
+
+remnant-ui deployment  [prod-k8s, ns: remnant]
+    └── React SPA — browse/search/edit/tag memories
+
+remnant-dedup CronJob  [03:30 daily]
+    └── dedup_job.py — LLM dedup + keyword/LLM tagging → job_runs table
+
+plugin/mcp-stdio.py  [starbase local]
+    └── stdio proxy → remnant-mcp.prod.threshold.se (registered as user-scope MCP)
 ```
 
-### MCP tools exposed
-| Tool | Description |
-|------|-------------|
-| `add_memory` | Store a fact or observation |
-| `search_memory` | Semantic search — returns top-k relevant memories |
-| `get_all_memories` | List all stored memories |
-| `delete_memory` | Remove a memory by ID |
+### Endpoints
+| URL | Purpose |
+|-----|---------|
+| `https://remnant-mcp.prod.threshold.se` | MCP HTTP endpoint |
+| `https://remnant.prod.threshold.se` | Web UI |
+
+### MCP tools
+| Tool | Notes |
+|------|-------|
+| `add_memory` | Queued via Redis when `REDIS_URL` set; params: content, agent_id, infer, category, tags |
+| `search_memory` | Semantic search, returns top-k with similarity scores |
+| `get_all_memories` | Full list |
+| `delete_memory` | By ID |
 
 ---
 
-## 4. Folder Structure
+## Folder Structure
 
 ```
-claude-memory/
+remnant/
 ├── src/
-│   ├── main.py          # MCP server, tool definitions, auth middleware
-│   ├── memory.py        # mem0 client wrapper
-│   └── config.py        # settings loaded from env
-├── Dockerfile
-├── requirements.txt
+│   ├── main.py           # MCP server, FastMCP tools, auth, Redis queue dispatch
+│   ├── memory.py         # mem0 wrapper, VALID_CATEGORIES, tag_rules, schema
+│   ├── config.py         # settings (pydantic-settings, env-driven)
+│   ├── queue_worker.py   # Redis consumer — runs inside MCP pod
+│   └── scripts/
+│       └── tag_memories.py   # bulk backfill script
+├── Dockerfile.mcp
+├── Dockerfile.ui
 ├── helm/
-│   ├── Chart.yaml
-│   ├── values.yaml
+│   ├── Chart.yaml        # version: 0.2.3
 │   └── templates/
-│       ├── deployment.yaml
-│       ├── service.yaml
-│       ├── httproute.yaml   (Gateway API, internal-shared)
+│       ├── deployment.yaml          # MCP pod
+│       ├── deployment-ui.yaml       # UI pod
+│       ├── service.yaml / service-ui.yaml
+│       ├── httproute.yaml           # Gateway API, internal-shared
 │       ├── cnpg-cluster.yaml
+│       ├── cronjob-dedup.yaml       # 03:30 daily
+│       ├── configmap-settings.yaml  # TAGGING_MODE, TAGGING_LLM_MODEL
+│       ├── servicemonitor.yaml
 │       └── externalsecret.yaml
-├── scripts/
-│   └── init-db.sh       # pgvector extension bootstrap (run once)
-├── docker-compose.yml   # local dev: postgres+pgvector sidecar
-├── .env.example
-├── Makefile
-├── AGENTS.md
-├── CLAUDE.md
-├── MVP.md
-├── PLAN.md
-├── CHANGELOG.md
-├── ISSUES.md
-├── README.md
-└── memory/
+├── plugin/
+│   ├── mcp-stdio.py      # local stdio proxy
+│   ├── hooks/            # Claude Code hooks (UserPromptSubmit, Stop, PreCompact…)
+│   └── skills/
+├── Makefile              # build/push targets: make build push (both images)
+└── PLAN.md / ISSUES.md / CHANGELOG.md
 ```
 
 ---
 
-## 5. Key Decisions
-
-| Decision | Choice | Reason |
-|----------|--------|--------|
-| Vector store | pgvector on CNPG | Reuse existing postgres + backup infra |
-| Embeddings | sentence-transformers (in-pod) | CPU-only, no external dep, swap to GPU later |
-| LLM | Claude API | Best extraction quality, already available |
-| MCP transport | HTTP/SSE | Matches ha-mcp pattern already working |
-| Auth | Bearer token | Simple, Vault-managed, standard for internal MCP servers |
-| Namespace | `claude-memory` | Isolated from other apps |
-| Gateway | internal-shared | Not internet-facing; desktop reaches it via LAN |
-
----
-
-## 6. Local Development
+## Build & Deploy
 
 ```bash
-# Start postgres+pgvector locally
-make dev
+cd /opt/git/app-development/remnant
 
-# Build image
-make build
+make build push          # build + push both MCP and UI images
+make build-mcp push-mcp  # MCP only
+make build-ui push-ui    # UI only
 
-# Push image
-make push
-
-# Run tests
-make test
+kubectl rollout restart deployment/remnant deployment/remnant-ui -n remnant
+kubectl rollout status deployment/remnant -n remnant --timeout=120s
 ```
+
+Helm chart lives in `/opt/git/helm-charts/charts/remnant/`.
+Gitops target: `/opt/git/k8s-gitops/prod/clusters/prod-k8s/cluster-apps/remnant/`.
 
 ---
 
-## 7. How Claude Should Work Each Session
+## Session Workflow
 
-1. Read `PLAN.md` — find the current phase and next unchecked task
-2. Check `ISSUES.md` — be aware of known blockers
-3. State briefly: what phase, what will be changed
-4. Implement in small focused steps
-5. Update `PLAN.md` checkboxes as tasks complete
-6. Write a memory file to `memory/` before ending the session
-
-### Memory file convention
-Filename: `YYYY-MM-DD_topic_phase.md`
-Content: key decisions, what was implemented, what's next, any blockers or non-obvious context.
+1. `search_memory` for relevant context (already done by hook at prompt time).
+2. Read `PLAN.md` — current phase, next unchecked task.
+3. Check `ISSUES.md` — known blockers.
+4. Implement. Save memory via `add_memory` at session end.

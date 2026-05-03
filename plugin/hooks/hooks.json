@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_MEMORY_PLUGIN_DIR}/hooks/search-memory.sh",
+            "command": "${REMNANT_PLUGIN_DIR}/hooks/search-memory.sh",
             "statusMessage": "Searching memory...",
             "timeout": 10
           }
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_MEMORY_PLUGIN_DIR}/hooks/save-context.sh",
+            "command": "${REMNANT_PLUGIN_DIR}/hooks/save-context.sh",
             "statusMessage": "Preparing memory save...",
             "timeout": 15
           }
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_MEMORY_PLUGIN_DIR}/hooks/save-context.sh",
+            "command": "${REMNANT_PLUGIN_DIR}/hooks/save-context.sh",
             "timeout": 15
           }
         ]
