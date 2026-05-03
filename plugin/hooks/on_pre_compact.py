@@ -4,9 +4,13 @@
 Safety net for PreCompact and Stop hooks — reads the transcript JSONL,
 extracts structured session state, and stores it in mem0 directly.
 
+For session-end (Stop / /clear), also asks Ollama to extract discrete
+learnings from the conversation and saves each as a separate memory.
+This runs autonomously — no Claude response needed.
+
 Used by:
   - PreCompact hook: Tags with "pre-compaction" (context about to be lost)
-  - Stop hook:       Tags with "session-end" (session ending)
+  - Stop hook:       Tags with "session-end" (session ending) + memory extraction
 
 Input:  JSON on stdin with transcript_path, session_id, cwd
 Output: stderr logs only (exit 0 always — must not block)
@@ -149,6 +153,101 @@ def build_content(state: dict, source: str) -> str:
     return result
 
 
+def build_conversation_text(lines: list[str], max_chars: int = 6000) -> str:
+    """Build a readable conversation excerpt for Ollama extraction."""
+    parts: list[str] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("type") not in ("user", "assistant"):
+            continue
+        if entry.get("isSidechain"):
+            continue
+        message = entry.get("message", {})
+        content_blocks = message.get("content", [])
+        role = "User" if entry["type"] == "user" else "Assistant"
+        texts: list[str] = []
+        if isinstance(content_blocks, str):
+            texts.append(content_blocks)
+        elif isinstance(content_blocks, list):
+            for block in content_blocks:
+                if isinstance(block, str):
+                    texts.append(block)
+                elif isinstance(block, dict):
+                    if block.get("type") == "text":
+                        texts.append(block.get("text", ""))
+        combined = " ".join(t.strip() for t in texts if t.strip())
+        if combined and len(combined) > 20 and not combined.startswith("<"):
+            parts.append(f"{role}: {combined[:400]}")
+    text = "\n".join(parts)
+    return text[-max_chars:] if len(text) > max_chars else text
+
+
+def extract_memories_with_ollama(conversation: str, ollama_url: str) -> list[str]:
+    """Ask Ollama to extract discrete learnings from the conversation."""
+    if not conversation.strip():
+        return []
+
+    prompt = (
+        "You are analyzing a software engineering session between a user and Claude Code.\n\n"
+        "Extract 1-5 discrete facts that are worth remembering in future sessions.\n\n"
+        "Include:\n"
+        "- Decisions and their reasons\n"
+        "- User preferences or corrections\n"
+        "- Project-specific conventions discovered\n"
+        "- Things that should NOT be done (and why)\n"
+        "- Environment-specific facts\n\n"
+        "Exclude:\n"
+        "- In-progress work status\n"
+        "- Things derivable from the code itself\n"
+        "- Generic observations\n"
+        "- Session summaries\n\n"
+        "Output ONLY a JSON array of strings. Each string is one concise memory. "
+        "If nothing is worth saving, output [].\n\n"
+        f"Conversation:\n{conversation}\n\n"
+        "JSON array:"
+    )
+
+    payload = {
+        "model": "qwen2.5:7b",
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.1, "num_predict": 512},
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{ollama_url}/api/generate",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            obj = json.loads(raw)
+            response_text = obj.get("response", "").strip()
+            # Find first JSON array in response
+            start = response_text.find("[")
+            end = response_text.rfind("]") + 1
+            if start == -1 or end == 0:
+                log.warning("Ollama returned no JSON array: %s", response_text[:200])
+                return []
+            memories = json.loads(response_text[start:end])
+            if not isinstance(memories, list):
+                return []
+            return [m for m in memories if isinstance(m, str) and m.strip()]
+    except (urllib.error.URLError, json.JSONDecodeError, KeyError) as e:
+        log.warning("Ollama extraction failed: %s", e)
+        return []
+
+
 def store_memory(memory_url: str, token: str, content: str, source: str) -> bool:
     """Store session state via mem0 MCP JSON-RPC endpoint."""
     payload = {
@@ -211,6 +310,8 @@ def main():
         log.debug("REMNANT_URL or REMNANT_TOKEN not set, skipping capture")
         return
 
+    ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+
     try:
         hook_input = json.loads(sys.stdin.read())
     except (json.JSONDecodeError, OSError):
@@ -242,6 +343,47 @@ def main():
     )
 
     store_memory(memory_url, token, content, source)
+
+    # For session-end (Stop / /clear): also extract discrete learnings via Ollama
+    # and save each as a separate memory. Runs autonomously — no Claude response needed.
+    if source == "session-end":
+        conversation = build_conversation_text(lines)
+        if conversation:
+            log.info("Extracting memories from session via Ollama...")
+            memories = extract_memories_with_ollama(conversation, ollama_url)
+            log.info("Ollama extracted %d memories", len(memories))
+            for i, mem in enumerate(memories):
+                payload = {
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "add_memory",
+                        "arguments": {
+                            "content": mem,
+                            "infer": False,
+                            "category": "feedback",
+                            "tags": ["auto-extracted"],
+                        },
+                    },
+                    "id": i + 10,
+                }
+                data = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(
+                    f"{memory_url}/mcp",
+                    data=data,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/json, text/event-stream",
+                    },
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        resp.read()
+                        log.info("Saved extracted memory %d/%d", i + 1, len(memories))
+                except urllib.error.URLError as e:
+                    log.warning("Failed to save extracted memory %d: %s", i + 1, e)
 
 
 if __name__ == "__main__":
