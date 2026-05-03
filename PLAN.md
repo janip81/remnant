@@ -289,14 +289,26 @@ Update everything:
 ---
 
 ## Phase 12 — Graph memory
-> Goal: relationship linking between memories (entity → entity, fact → fact)
+> Goal: relationship linking between memories using existing CNPG — no new infra needed
+> Approach: `memory_edges` table in existing Postgres, edges built by the nightly dedup job
 
-- [ ] Research: how mem0 cloud implements graph memory (what graph DB / structure?)
-- [ ] Design: node types (entity, fact, session) + edge types (related_to, derived_from, contradicts)
-- [ ] Storage: pgvector + a graph extension (Apache AGE on CNPG) or a separate Neo4j/memgraph instance
-- [ ] API: `get_related(memory_id)` MCP tool
-- [ ] UI: simple graph view for a selected memory
-- [ ] Nightly job: build/update graph edges from embedding similarity + LLM relationship extraction
+**Schema (pure SQL — no Apache AGE, no Neo4j):**
+```sql
+CREATE TABLE memory_edges (
+  source_id UUID REFERENCES mem0_memories(id) ON DELETE CASCADE,
+  target_id UUID REFERENCES mem0_memories(id) ON DELETE CASCADE,
+  relationship TEXT,  -- related_to | contradicts | derived_from | supersedes
+  weight FLOAT,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (source_id, target_id, relationship)
+);
+```
+
+- [ ] Add `memory_edges` table to `_ensure_schema()` in memory.py
+- [ ] Nightly job Phase 3: for each semantic cluster (already grouped by cosine similarity), ask Ollama to classify relationships between pairs — write edges
+- [ ] New MCP tool: `get_related(memory_id, limit=5)` — JOIN on memory_edges, return linked memories with relationship type
+- [ ] UI: "Related" section on memory card (expandable, shows linked memories + relationship label)
+- [ ] Optional Phase 12b: recursive CTE for multi-hop traversal
 
 ---
 
