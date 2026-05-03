@@ -35,3 +35,6 @@ node_modules/
 
 # Scripts — runtime output, not source
 scripts/imported.json
+
+# Personal research notes — not part of public repo
+RESEARCH.md
