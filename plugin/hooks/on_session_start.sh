@@ -17,8 +17,8 @@ SOURCE=$(echo "$INPUT" | jq -r '.source // "startup"' 2>/dev/null || echo "start
 CWD=$(echo "$INPUT" | jq -r '.cwd // ""' 2>/dev/null || echo "")
 PROJECT=$(basename "$CWD")
 
-MEMORY_URL="${CLAUDE_MEMORY_URL:-}"
-MEMORY_TOKEN="${CLAUDE_MEMORY_TOKEN:-}"
+MEMORY_URL="${REMNANT_URL:-}"
+MEMORY_TOKEN="${REMNANT_TOKEN:-}"
 
 # Helper: search mem0 via HTTP directly and return result text
 search_direct() {

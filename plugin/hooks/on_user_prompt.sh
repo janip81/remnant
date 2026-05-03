@@ -8,7 +8,7 @@
 # Output: Matching memories as context text (exit 0)
 #
 # Skips search for very short prompts (< 20 chars) and when
-# CLAUDE_MEMORY_URL / CLAUDE_MEMORY_TOKEN are not set.
+# REMNANT_URL / REMNANT_TOKEN are not set.
 
 # Intentionally omit -e so the script always exits 0 even if
 # curl or jq fail — must never block the user's prompt.
@@ -19,8 +19,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INPUT=$(cat)
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // ""' 2>/dev/null || echo "")
 
-MEMORY_URL="${CLAUDE_MEMORY_URL:-}"
-MEMORY_TOKEN="${CLAUDE_MEMORY_TOKEN:-}"
+MEMORY_URL="${REMNANT_URL:-}"
+MEMORY_TOKEN="${REMNANT_TOKEN:-}"
 
 # /clear wipes context immediately — capture session state before it's gone.
 # UserPromptSubmit fires before the command executes, so this runs in time.

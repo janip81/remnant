@@ -1,31 +1,31 @@
 {
-  "name": "claude-memory",
+  "name": "remnant",
   "version": "0.1.0",
   "description": "Fully local persistent memory for Claude Code — mem0 + pgvector + Ollama, self-hosted",
   "author": "Jani Pesonen",
-  "homepage": "https://github.com/janip81/claude-memory",
+  "homepage": "https://github.com/janip81/remnant",
   "license": "Apache-2.0",
   "mcp": {
     "servers": {
-      "claude-memory": {
+      "remnant": {
         "type": "http",
-        "url": "${CLAUDE_MEMORY_URL}/mcp",
+        "url": "${REMNANT_URL}/mcp",
         "headers": {
-          "Authorization": "Bearer ${CLAUDE_MEMORY_TOKEN}"
+          "Authorization": "Bearer ${REMNANT_TOKEN}"
         }
       }
     }
   },
   "hooks": "../hooks/hooks.json",
   "skills": [
-    "../skills/claude-memory/SKILL.md"
+    "../skills/remnant/SKILL.md"
   ],
   "env": {
-    "CLAUDE_MEMORY_URL": {
-      "description": "Base URL of your claude-memory server (e.g. https://mem0-mcp.example.com)",
+    "REMNANT_URL": {
+      "description": "Base URL of your remnant server (e.g. https://remnant-mcp.example.com)",
       "required": true
     },
-    "CLAUDE_MEMORY_TOKEN": {
+    "REMNANT_TOKEN": {
       "description": "Bearer token for authentication",
       "required": true
     }
