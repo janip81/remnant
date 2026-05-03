@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://192.168.81.20:11434"
     ollama_model: str = "qwen2.5:7b"
     ollama_embed_model: str = "nomic-embed-text"
+    redis_url: str = ""  # optional: enable async add_memory queue
 
 
 settings = Settings()

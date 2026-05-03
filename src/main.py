@@ -31,6 +31,10 @@ async def add_memory(content: str, agent_id: str = "", infer: bool = True, categ
     Set infer=False to store as-is."""
     if category and category not in mem_store.VALID_CATEGORIES:
         return f"Invalid category '{category}'. Valid: {', '.join(sorted(mem_store.VALID_CATEGORIES) - {''})}"
+    if settings.redis_url:
+        from queue_worker import enqueue
+        job_id = await enqueue(content, agent_id, infer, category, tags)
+        return json.dumps({"queued": True, "job_id": job_id})
     result = mem_store.add(content, agent_id=agent_id, infer=infer, category=category, tags=tags)
     return json.dumps(result)
 
@@ -253,6 +257,18 @@ async def app(scope, receive, send):
             ]
             for tag, count in sorted(tags.items()):
                 lines.append(f'remnant_memories_by_tag{{tag="{tag}"}} {count}')
+        if settings.redis_url:
+            try:
+                from queue_worker import _get_client, _QUEUE_KEY
+                rc = await _get_client()
+                depth = await rc.llen(_QUEUE_KEY)
+                lines += [
+                    "# HELP remnant_queue_depth Current number of jobs pending in the Redis add_memory queue",
+                    "# TYPE remnant_queue_depth gauge",
+                    f"remnant_queue_depth {depth}",
+                ]
+            except Exception:
+                pass
         lines.append("")
         body = "\n".join(lines).encode()
         await _send_response(send, 200, [[b"content-type", b"text/plain; version=0.0.4"]], body)
@@ -417,7 +433,11 @@ async def app(scope, receive, send):
                 content = urllib.parse.unquote_plus(params.get("content", "")).strip()
                 src_agent = agent_id
             if content:
-                mem_store.add(content, agent_id=src_agent)
+                if settings.redis_url:
+                    from queue_worker import enqueue
+                    await enqueue(content, src_agent, True, "", [])
+                else:
+                    mem_store.add(content, agent_id=src_agent)
             await _send_response(send, *_json_response({"ok": True}))
             return
 

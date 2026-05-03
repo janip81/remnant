@@ -6,6 +6,10 @@ Self-hosted MCP memory server for Claude Code. Stores facts in PostgreSQL + pgve
 
 ```
 Claude Code  ──HTTP/MCP──►  remnant (MCP server)  ──►  pgvector (CNPG)
+                                    │         │
+                                    │         └──►  Redis queue (optional)
+                                    │                      │
+                                    │              background worker
                                     │
                                     ├──►  Ollama (nomic-embed-text embeddings)
                                     └──►  Ollama (qwen2.5:7b — tagging/dedup)
@@ -241,6 +245,28 @@ All config via environment variables (see `.env.example`):
 | `TAGGING_MODE` | `keyword` | `keyword` / `llm` / `hybrid` |
 | `REMNANT_USER_ID` | `default` | User ID namespace for stored memories |
 | `APP_PORT` | `8080` | Listen port |
+| `REDIS_URL` | _(unset)_ | Optional. Enables async queue for `add_memory`. Format: `redis://:password@host:6379/0` |
+
+### Redis async queue (optional)
+
+When `REDIS_URL` is set, `add_memory` calls are pushed to a Redis list (`remnant:queue:add_memory`) and processed by a background asyncio worker. The caller gets an immediate response (`{"queued": true, "job_id": "..."}`) instead of blocking while Ollama runs LLM extraction (which can take 15–17 s with `infer=true`).
+
+Without `REDIS_URL` the behaviour is unchanged — writes are synchronous.
+
+**Helm** — enable via:
+
+```yaml
+redis:
+  enabled: true
+  host: redis-replication-master.redis.svc
+  port: 6379
+  db: 0
+  passwordSecret:
+    name: remnant-redis-auth   # Secret in same namespace
+    key: password
+```
+
+The queue depth is exported as `remnant_queue_depth` on the `/metrics` endpoint.
 
 ---
 
