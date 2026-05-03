@@ -1,5 +1,7 @@
 # remnant
 
+> **Personal project.** I built this for myself to explore what's possible with self-hosted LLM memory for Claude Code. It works well for my use case but comes with no guarantees — no warranty, no support commitment, no SLA. Use it, fork it, adapt it.
+
 Self-hosted MCP memory server for Claude Code. Stores facts in PostgreSQL + pgvector, retrieves them via semantic search using Ollama embeddings. No external API calls — fully self-hosted.
 
 ## Architecture

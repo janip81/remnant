@@ -240,38 +240,21 @@ Update everything:
 
 ---
 
-## Phase 10 — Gap Analysis vs mem0.ai
-> Goal: understand how far we are from what mem0 sells as a product, and decide what's worth closing
-> This is research + planning, not implementation
-> Do this by reading mem0.ai docs, pricing page, and changelog — then map against what we have
+## Phase 10 — Gap Analysis vs mem0
+> Status: complete — see `remnant-vs-mem0.md` in the prod-k8s repo for full comparison
 
-**What we have:**
-- Self-hosted, fully local (intentional — our differentiator)
-- MCP server with `add_memory`, `search_memory`, `get_all_memories`, `delete_memory`
-- Semantic search via pgvector + nomic-embed-text embeddings (Ollama)
-- `infer=False` — Claude decides what to save, no LLM extraction layer at write time
-- Auto-inject on every prompt (UserPromptSubmit hook)
-- Save reminder at session end (Stop + PreCompact hooks)
-- SKILL.md teaching Claude when/what/how to save
-- Import script for migrating existing docs
-- Basic Web UI (HTMX, search + add + delete)
-- CNPG-backed with WAL archiving and S3 backups
+**Summary of deliberate design differences:**
+- `infer=False` — Claude decides what to save; no LLM extraction at write time (unlike mem0's default)
+- Fully local — no data leaves the homelab; no cloud dependency
+- Single-user by design — simpler, no RBAC needed
+- pgvector on existing CNPG — no separate vector store to operate
+- Built-in MCP server + Claude Code hooks — zero glue code
+- Nightly dedup in batch (qwen2.5:7b) rather than per-write LLM calls
 
-**Research tasks:**
-- [ ] Read mem0.ai product page, docs, and pricing — what are their paid tiers?
-- [ ] What memory categories do they support that we don't? (e.g. episodic, semantic, procedural, user-level vs session-level)
-- [ ] Do they have memory relationships / a memory graph?
-- [ ] Do they have source app tagging (which agent/session added a memory)?
-- [ ] What does their infer pipeline actually produce vs our manual approach?
-- [ ] Multi-user / org support — do they support teams?
-- [ ] SDK vs API — how do they expect apps to integrate?
-- [ ] What's their retention / expiry model?
-
-**Gap assessment output:**
-- [ ] Write up: features in mem0 we deliberately skipped (infer, cloud) and why
-- [ ] Write up: features in mem0 we want and don't have yet
-- [ ] Decide: which gaps are worth closing for our use case
-- [ ] Feed findings into Part 11 blog post ("What's next")
+**Gaps we decided to close (in later phases):**
+- Graph memory / relationship linking → Phase 12
+- Multi-user support → Phase 11
+- Embeddable library mode → Phase 13
 
 ---
 
