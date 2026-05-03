@@ -275,6 +275,42 @@ Update everything:
 
 ---
 
+---
+
+## Phase 11 — Multi-user support
+> Goal: allow multiple users (or agents) to have isolated memory namespaces
+
+- [ ] User identity via configurable `user_id` per MCP connection (header or token-derived)
+- [ ] Per-user memory isolation in pgvector (row-level or schema-level)
+- [ ] UI: user switcher / user filter
+- [ ] Helm: optional list of users with separate bearer tokens
+- [ ] Document: how to run Remnant for a team (shared infra, isolated memories)
+
+---
+
+## Phase 12 — Graph memory
+> Goal: relationship linking between memories (entity → entity, fact → fact)
+
+- [ ] Research: how mem0 cloud implements graph memory (what graph DB / structure?)
+- [ ] Design: node types (entity, fact, session) + edge types (related_to, derived_from, contradicts)
+- [ ] Storage: pgvector + a graph extension (Apache AGE on CNPG) or a separate Neo4j/memgraph instance
+- [ ] API: `get_related(memory_id)` MCP tool
+- [ ] UI: simple graph view for a selected memory
+- [ ] Nightly job: build/update graph edges from embedding similarity + LLM relationship extraction
+
+---
+
+## Phase 13 — Embeddable library
+> Goal: make Remnant usable as a general-purpose memory layer, not just for Claude Code
+
+- [ ] Extract core into a Python package (`remnant-core`) with clean `add/search/delete` API
+- [ ] Decouple from Claude Code assumptions (no Claude-specific hook references in core)
+- [ ] Publish to PyPI
+- [ ] SDK example: use Remnant as memory backend in a LangChain / custom agent
+- [ ] Document: embedding Remnant in any Python LLM app (OpenAI, Anthropic, local)
+
+---
+
 ## Phase 6 (old) — Local LLM
 > Adopted in Phase 2 (Ollama). ADR-0001 superseded. No separate phase needed.
 
