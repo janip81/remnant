@@ -55,6 +55,9 @@ MIN_CLUSTER_SIZE = 2
 # Batch size for LLM tagging — smaller = fewer tokens per request
 LLM_TAG_BATCH = 20
 
+# Fast connectivity check timeout (seconds)
+OLLAMA_CONNECT_TIMEOUT = 5
+
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -206,6 +209,19 @@ def load_tag_list(cur) -> list[str]:
     except Exception as e:
         log.warning("Could not load tag_rules: %s — using empty list", e)
         return []
+
+
+# ---------------------------------------------------------------------------
+# Ollama health check
+# ---------------------------------------------------------------------------
+
+def ollama_is_reachable() -> bool:
+    try:
+        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=OLLAMA_CONNECT_TIMEOUT)
+        return resp.status_code == 200
+    except Exception as e:
+        log.error("Ollama unreachable at %s: %s", OLLAMA_BASE_URL, e)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +583,20 @@ def main() -> None:
         args.dry_run, args.threshold, TAGGING_MODE,
     )
 
+    run_llm = TAGGING_MODE != "keyword" and not args.phase2_only
+    run_semantic = not args.phase1_only
+    needs_ollama = run_llm or run_semantic
+
+    ollama_ok = True
+    if needs_ollama:
+        ollama_ok = ollama_is_reachable()
+        if not ollama_ok:
+            log.error(
+                "Ollama at %s is unreachable — LLM phases will be skipped. "
+                "Fix connectivity and re-run, or use --phase1-only for hash dedup only.",
+                OLLAMA_BASE_URL,
+            )
+
     conn = connect()
     try:
         # Ensure tables exist (idempotent)
@@ -576,17 +606,26 @@ def main() -> None:
         conn.commit()
 
         if args.tagging_only:
+            if not ollama_ok:
+                log.error("Skipping tagging-only run: Ollama unreachable")
+                sys.exit(1)
             phase0_llm_tagging(conn, args.dry_run)
             return
 
         if not args.phase1_only and not args.phase2_only:
-            phase0_llm_tagging(conn, args.dry_run)
+            if ollama_ok:
+                phase0_llm_tagging(conn, args.dry_run)
+            else:
+                log.warning("Phase 0 skipped: Ollama unreachable")
 
         if not args.phase2_only:
             phase1_hash_dedup(conn, args.dry_run)
 
         if not args.phase1_only:
-            phase2_semantic_dedup(conn, args.threshold, args.dry_run)
+            if ollama_ok:
+                phase2_semantic_dedup(conn, args.threshold, args.dry_run)
+            else:
+                log.warning("Phase 2 skipped: Ollama unreachable")
 
         log.info("Job complete")
     finally:
