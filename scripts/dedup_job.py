@@ -400,8 +400,7 @@ def find_semantic_clusters(
     parent: dict[str, str] = {}
 
     def find(x: str) -> str:
-        while parent.get(x, x) != x:
-            parent[x] = parent.get(parent.get(x, x), x)
+        while x in parent:
             x = parent[x]
         return x
 
