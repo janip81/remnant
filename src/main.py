@@ -51,7 +51,9 @@ async def add_memory(content: str, agent_id: str = "", infer: Optional[bool] = N
 @mcp.tool()
 async def search_memory(query: str, limit: int = 5) -> str:
     """Search memory by meaning and exact terms (hostnames, versions, error codes, names).
-    Returns top matching facts with a 0..1 relevance score."""
+    Each hit shows rank (fused ordering, 0..1), cos (cosine similarity, when the
+    vector side matched) and which side matched. Neither is a calibrated
+    probability: treat low-cos or keyword-only hits as weaker evidence."""
     results = await asyncio.to_thread(mem_store.hybrid_search, query, limit=limit)
     if not results:
         return "No memories found."
