@@ -55,11 +55,14 @@ async def search_memory(query: str, limit: int = 5) -> str:
     results = await asyncio.to_thread(mem_store.hybrid_search, query, limit=limit)
     if not results:
         return "No memories found."
+    # rank = fused rank score (ordering only); cos = cosine similarity when the
+    # vector side found it — use that, not rank, to judge how relevant a hit is.
     lines = []
     for r in results:
-        score = r.get("score", "")
         text = r.get("memory", r.get("text", str(r)))
-        lines.append(f"[{score:.3f}] {text}" if score else text)
+        cos = r.get("vector_score")
+        evidence = f"cos {cos:.2f}" if cos is not None else "keyword only"
+        lines.append(f"[rank {r.get('score', 0):.2f} | {evidence} | {r.get('match', '')}] {text}")
     return "\n".join(lines)
 
 
