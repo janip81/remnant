@@ -507,8 +507,19 @@ def ensure_fts_index() -> bool:
         logger.info("fts column check skipped, database unreachable (%s)", type(e).__name__)
         return False
     try:
+        if _has_fts_column():
+            # already migrated: skip the ALTER, which would take an ACCESS EXCLUSIVE lock again
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("SET LOCAL lock_timeout = '3s'")
+                    cur.execute(f"CREATE INDEX IF NOT EXISTS {_MEM_TABLE}_fts_idx ON {_MEM_TABLE} USING gin (fts)")
+            _FTS_DOC = "fts"
+            return True
         with conn:
             with conn.cursor() as cur:
+                # bounded: never block startup or writers behind a long transaction
+                cur.execute("SET LOCAL lock_timeout = '3s'")
+                cur.execute("SET LOCAL statement_timeout = '60s'")
                 cur.execute(f"ALTER TABLE {_MEM_TABLE} ADD COLUMN IF NOT EXISTS fts tsvector "
                             f"GENERATED ALWAYS AS ({_FTS_EXPR}) STORED")
                 cur.execute(f"CREATE INDEX IF NOT EXISTS {_MEM_TABLE}_fts_idx ON {_MEM_TABLE} USING gin (fts)")
@@ -575,11 +586,12 @@ def _keyword_search(query: str, limit: int) -> list[dict]:
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             conds = [cond(t) for t in terms]
-            counts = ", ".join(f"count(*) FILTER (WHERE {c})" for c, _ in conds)
+            # unique aliases: RealDictCursor keeps one value per column name
+            counts = ", ".join(f"count(*) FILTER (WHERE {c}) AS df{i}" for i, (c, _) in enumerate(conds))
             cur.execute(f"SELECT count(*) AS n, {counts} FROM {_MEM_TABLE} WHERE {user}",
                         [p for _, ps in conds for p in ps] + [settings.mem0_user_id])
-            row = list(cur.fetchone().values())
-            n, dfs = row[0], row[1:]
+            row = cur.fetchone()
+            n, dfs = row["n"], [row[f"df{i}"] for i in range(len(conds))]
             weighted = [(c, df) for c, df in zip(conds, dfs) if df]
             if not weighted or not n:
                 return []
