@@ -59,3 +59,76 @@ def test_idempotent():
 ])
 def test_secret_references_are_kept(text):
     assert redact(text) == text
+
+
+# --- Cases from the Codex review of PR #4 ---------------------------------
+
+@pytest.mark.parametrize("text, leaked", [
+    ('password="correct horse battery staple"', "horse battery staple"),
+    ("password=abcde", "abcde"),
+    ("Authorization: bearer " + "b" * 40, "b" * 40),
+    ("-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ\n"
+     "-----END OPENSSH PRIVATE KEY-----", "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ"),
+    ("-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAtruncatedkeybody", "MIIEowIBAAKCAQEAtruncatedkeybody"),
+    ("admin-password='CHOOSE-A-GOOD-ONE'", "CHOOSE-A-GOOD-ONE"),
+    ("totpSecret: JBSWY3DPEHPK3PXP", "JBSWY3DPEHPK3PXP"),
+    ("--set discordBot.token=MTIzNDU2Nzg5MDEy.abc", "MTIzNDU2Nzg5MDEy"),
+    ("chpasswd: root:hunter22", "root:hunter22"),
+])
+def test_review_secrets_are_masked(text, leaked):
+    out = redact(text)
+    assert leaked not in out, out
+    assert MASK in out
+
+
+@pytest.mark.parametrize("text", [
+    "tokenizer=sentence-transformers",
+    "token_limit=100000",
+    "max_tokens=4096",
+    "context budget: token_budget=8000 per prompt",
+    "imagePullSecret: ghcr-creds",
+    "the token: we rotate it monthly",
+])
+def test_review_settings_are_kept(text):
+    assert redact(text) == text
+
+
+def test_bearer_keeps_trailing_full_stop():
+    assert redact("Authorization: Bearer " + "a" * 40 + ". Next sentence") == \
+        "Authorization: Bearer [REDACTED]. Next sentence"
+
+
+@pytest.mark.parametrize("payload", [
+    "a." * 50_000, "a-" * 50_000, "password" * 20_000, "a=" * 50_000,
+    "x:" * 50_000, "Bearer " * 20_000, "://" * 30_000, "-" * 100_000,
+])
+def test_linear_time_on_pathological_input(payload):
+    import time
+    t = time.perf_counter()
+    redact(payload)
+    assert time.perf_counter() - t < 1.0
+
+
+@pytest.mark.parametrize("text", [
+    'password="correct horse battery staple"',
+    "Authorization: bearer " + "b" * 40,
+    "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA",
+    "postgresql://u:pw123456@h/db",
+    "--token=abcdefghij",
+    "totpSecret: JBSWY3DPEHPK3PXP",
+    f"REMNANT_TOKEN={FAKE_HEX}",
+])
+def test_idempotent_all_patterns(text):
+    once = redact(text)
+    assert redact(once) == once
+
+
+@pytest.mark.parametrize("text", [
+    "SmartConnect(host=host, user=user, pwd=password)",
+    "Password: blank",
+    'admin-password="<from vault kubernetes/data/x>"',
+    "password: ****",
+    "password=your-password-here",
+])
+def test_placeholders_are_kept(text):
+    assert redact(text) == text
