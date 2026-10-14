@@ -9,6 +9,56 @@
 
 ---
 
+## Phase 14 — Hardening & memory quality (PROPOSED 2026-10-14 — not yet agreed, nothing implemented)
+> Goal: make writes reliable and retrieval trustworthy for a single-user homelab setup, while keeping
+> the data model ready for multiple agents later. Source: external review (ChatGPT) verified against local `dev` @ 9b64ae8.
+> Principle: no new infrastructure unless it removes a real failure mode. Redis + CNPG + one MCP pod stays the shape.
+
+### P0 — correctness / security (small, do first)
+- [ ] Commit the WIP `asyncio.to_thread` wrapping in `main.py` + `queue_worker.py` (currently uncommitted on `dev`)
+- [ ] Thread safety: create the mem0 `Memory` once at startup (or behind a lock) — `get_memory()` lazy init can race under `to_thread`. mem0 2.0 stores themselves are thread-safe (SQLite history has a lock, pgvector uses `ThreadedConnectionPool`); verify against the pinned version
+- [ ] Pin `mem0ai` (currently `>=0.1.0`, so each image build may pull a new major)
+- [ ] mem0 history DB lives in `~/.mem0` inside the container — lost on every restart. Move to a PVC or disable, decide together with lifecycle metadata
+- [ ] Start queue worker at app startup (lifespan), not lazily on first `enqueue` — jobs left in Redis after a restart currently wait for the next `add_memory`
+- [ ] Replace BLPOP list with Redis Stream + consumer group (`XADD` / `XREADGROUP` / `XACK`, `XAUTOCLAIM` for stuck jobs, max 3 attempts → `remnant:dlq` stream). Same process, no new Deployment
+- [ ] Retry idempotency by `job_id`, not content: store `job_id` in memory metadata and skip the write if a row with that `job_id` exists (covers crash after write, before `XACK`). Content-level dedup stays the nightly job's job
+- [ ] Claim timeout well above worst-case Ollama call (e.g. 10 min `XAUTOCLAIM` min-idle) so a slow job is never reclaimed while still running
+- [ ] Queue metrics: pending, in-flight, DLQ depth, failures (replace `LLEN` gauge)
+- [ ] Refuse to start when `BEARER_TOKEN` is empty or `change-me`; remove `change-me` from `deploy/manifest.yaml` / `.env.example` (document `openssl rand -hex 32`); constant-time compare (`hmac.compare_digest`)
+- [ ] Web UI auth: UI proxy injects the bearer token server-side, so anyone reaching `remnant.prod.threshold.se` has full read/write/delete/export. Decide: Keycloak via oauth2-proxy / gateway auth, or drop the UI HTTPRoute until auth exists
+- [ ] Fix env-var drift: docs say `REMNANT_USER_ID`, code reads `MEM0_USER_ID` (accept both via pydantic alias)
+- [ ] Secret redaction before storage: session-end/pre-compact hooks store raw "Recent commands" incl. `Authorization: Bearer …`. Redact in hooks AND server-side in `add` (Bearer tokens, `password=`/`token=`/`secret=` values, `-p<pw>`, `<path:…>` is fine). 2026-10-14 scan: 5 memories with Bearer tokens, ~42 broader matches
+- [ ] One-off cleanup of existing memories containing secrets (reviewed list → redact or delete)
+- [ ] `/metrics`, `/api/stats`, UI listing via SQL counts/pagination instead of `get_all()` — pod OOMKilled 3× on 2026-10-14 at 512Mi (limit raised to 1Gi as stopgap, k8s-gitops c46e6ae8)
+- [ ] Read paths (list/export/stats) must work while Ollama is offline (desktop GPU host) — today `Memory()` init blocks on Ollama
+
+### P1 — memory quality
+- [ ] Lifecycle metadata on every memory: `status` (active | superseded | historical | uncertain), `superseded_by`, `valid_from`, `source` (agent_id, client, session_id, hook vs manual), keep `created_at`/`updated_at`
+- [ ] `search_memory` returns `active` by default; optional `include_history` flag
+- [ ] Updates/merges mark the old memory `superseded` (or archive with pointer) instead of overwriting in place; dedup job does the same
+- [ ] Hybrid search: Postgres FTS (`tsvector` + GIN on memory text) + pgvector, merged with reciprocal rank fusion — catches exact identifiers (k8s names, versions, hostnames, error codes)
+- [ ] Relevance floor (min score) + context budget (max chars/tokens) in hooks; per-session cache so the same memory isn't injected on every prompt
+- [ ] `/metrics` via cheap SQL counts instead of `get_all()` (currently loads all memories every 30s scrape)
+- [ ] DNS rebinding protection back on with `allowed_hosts` from config/Helm (`gatewayApi.host`) instead of disabled
+- [ ] Minimal pytest suite (auth, queue ack/retry/DLQ, hybrid merge) run in CI
+
+### P1 — documentation (single source of truth)
+- [ ] README = users/operators, AGENTS.md = agent working rules + architecture, PLAN.md = roadmap only, CHANGELOG = history; fold MVP.md into README/CHANGELOG
+- [ ] Fix stale content: `claude-memory`/`mem0.*` hostnames, unchecked Phase 9 rename items, duplicate "Phase 11", Phase 10 claims `infer=False` while prod runs `infer: "true"`, chart version (docs 0.2.3, prod 0.2.6), non-existent `externalsecret.yaml`
+- [ ] Renumber phases; move finished phases to "Completed"
+- [ ] Chart: `helm-charts/charts/remnant` is the source of truth; `helm/` here becomes a generated mirror via a GitHub Actions sync (copies removals too, failures visible). No such workflow exists yet — build it, then let it resolve current drift
+- [ ] Populate ISSUES.md with open items from this review
+
+### P2 — multi-agent readiness (design now, build when needed)
+- [ ] Agent identity from token, not self-declared header: token → {agent_id, scopes: read|write} map (Secret); keep single `user_id`
+- [ ] Namespaces via metadata `scope` (`shared` | `project:<name>`); `search_memory(scope=…)` filter (today `agent_id` is stored but ignored by search)
+- [ ] Remote MCP compatibility: re-test against current MCP spec/clients, remove `initialize` + `outputSchema` workarounds if no longer needed
+- [ ] External clients (ChatGPT etc.) need a public HTTPS endpoint + OAuth — only if wanted; separate decision, not on internal-shared gateway
+- [ ] Separate worker Deployment only if >1 MCP replica or worker load hurts request latency
+- [ ] Align Phase 12 graph edges (`supersedes`, `contradicts`) with lifecycle metadata above
+
+---
+
 ## Phase 0 — Setup & Skeleton ✓
 > Goal: project scaffolding in place, repo initialized, planning docs complete
 
