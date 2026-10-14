@@ -3,6 +3,7 @@ import hmac
 import json
 import logging
 import urllib.parse
+from typing import Optional
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
@@ -30,11 +31,13 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def add_memory(content: str, agent_id: str = "", infer: bool = True, category: str = "", tags: list[str] = []) -> str:
-    """Store a fact or observation in memory.
+async def add_memory(content: str, agent_id: str = "", infer: Optional[bool] = None, category: str = "", tags: list[str] = []) -> str:
+    """Store a fact or observation in memory, as written (one self-contained fact per call works best).
     category: project|feedback|reference|user|session|incident
     tags: free-form list, e.g. ["prod-k8s", "remnant", "cnpg"] — use app names, cluster names, topics.
-    Set infer=False to store as-is."""
+    infer: omit to use the server default (stored as-is); True asks the LLM to extract facts first."""
+    if infer is None:
+        infer = settings.mem0_infer
     if category and category not in mem_store.VALID_CATEGORIES:
         return f"Invalid category '{category}'. Valid: {', '.join(sorted(mem_store.VALID_CATEGORIES) - {''})}"
     if settings.redis_url:
@@ -426,7 +429,7 @@ async def app(scope, receive, send):
             if content:
                 if settings.redis_url:
                     from queue_worker import enqueue
-                    await enqueue(content, src_agent, True, "", [])
+                    await enqueue(content, src_agent, settings.mem0_infer, "", [])
                 else:
                     await asyncio.to_thread(mem_store.add, content, agent_id=src_agent)
             await _send_response(send, *_json_response({"ok": True}))
