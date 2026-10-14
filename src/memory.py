@@ -5,6 +5,7 @@ import time
 from typing import Optional
 import psycopg2
 import psycopg2.extras
+import psycopg2.errors
 from mem0 import Memory
 from mem0.configs.base import MemoryConfig, EmbedderConfig, LlmConfig, VectorStoreConfig
 
@@ -276,6 +277,8 @@ def list_rows(agent_id: str = "") -> list[dict]:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params)
             return [_row_to_result(r) for r in cur.fetchall()]
+    except psycopg2.errors.UndefinedTable:
+        return []  # fresh install, nothing written yet
     finally:
         conn.close()
 
@@ -300,6 +303,9 @@ def stats() -> dict:
                         f"jsonb_array_elements_text(CASE WHEN jsonb_typeof({_META}->'tags') = 'array' "
                         f"THEN {_META}->'tags' ELSE '[]'::jsonb END) AS t {where} GROUP BY 1", p)
             by_tag = dict(cur.fetchall())
+    except psycopg2.errors.UndefinedTable:
+        return {"total": 0, "first_added": None, "last_added": None,
+                "by_agent": {}, "by_category": {}, "by_tag": {}}
     finally:
         conn.close()
     return {"total": total, "first_added": first, "last_added": last,
@@ -391,6 +397,8 @@ def job_written(job_id: str) -> bool:
         with conn.cursor() as cur:
             cur.execute(f"SELECT 1 FROM {_MEM_TABLE} WHERE payload->>'job_id' = %s LIMIT 1", (job_id,))
             return cur.fetchone() is not None
+    except psycopg2.errors.UndefinedTable:
+        return False  # fresh install: mem0 creates its table on the first write
     finally:
         conn.close()
 
