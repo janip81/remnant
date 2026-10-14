@@ -7,7 +7,8 @@ secret shapes and credential key=value assignments; references such as AVP
 `{{ .Values.x }}`) and secret *names* (`existingSecret`, `*Ref`) are kept.
 
 All patterns are linear: keys only match at the start of an identifier run
-(lookbehind), lengths are bounded, and there is no nested repetition.
+(lookbehind), the reference check uses offsets, and every repetition consumes
+each character through exactly one branch.
 """
 import re
 
@@ -15,6 +16,7 @@ MASK = "[REDACTED]"
 
 # Value prefixes that are references, not secrets.
 _REF = r"(?!<path:|\$|\{\{|\[REDACTED\])"
+_REF_PREFIX = re.compile(r"[\"']?(?:<path:|\$|\{\{|\[REDACTED\])")
 
 # Key normalisation: lowercase, drop separators. A key is a credential when its
 # last dotted segment ends with one of these words (REMNANT_TOKEN, db-password,
@@ -60,26 +62,30 @@ def _min_len(key: str) -> int:
 _ASSIGN = re.compile(
     r"(?<![A-Za-z0-9_.\-])([A-Za-z][A-Za-z0-9_.\-]{0,63})"   # key, start of run only
     r"([\"']?[ \t]*[:=][ \t]*)"                              # separator
-    r"(?:\"([^\"\n]{1,200})\"|'([^'\n]{1,200})'|"            # quoted value (spaces ok)
-    r"([^\s\"'`,;)}\]]{1,200}))"                             # or bare value
+    r"(?:\"((?:[^\"\\\n]|\\.)+)\"|'((?:[^'\\\n]|\\.)+)'|"  # quoted value (spaces, \" ok)
+    r"([^\s\"'`,;)}\]]+)|"                                   # or bare value
+    r"[\"']([^\"'\n]+))"                                      # or unterminated quote: to end of line
+    # Unbounded but linear: each character is consumed by exactly one branch.
 )
 
 
 def _assign_repl(m: re.Match) -> str:
     key, sep = m.group(1), m.group(2)
-    quoted = m.group(3) if m.group(3) is not None else m.group(4)
-    value = quoted if quoted is not None else m.group(5)
+    value = next(g for g in m.groups()[2:] if g is not None)
     if not _is_credential_key(key) or len(value) < _min_len(key):
         return m.group(0)
     # References/already-masked values: look at the original text, because a
     # bare value stops before "]" and would see "[REDACTED" without it.
-    rest = m.string[m.end(2):].lstrip("\"'")
-    if re.match(_REF, rest) is None:
+    if _REF_PREFIX.match(m.string, m.end(2)):  # offset match, no suffix copy
         return m.group(0)
     if _PLACEHOLDER.fullmatch(value):
         return m.group(0)
-    q = '"' if m.group(3) is not None else ("'" if m.group(4) is not None else "")
-    return f"{key}{sep}{q}{MASK}{q}"
+    if m.group(3) is not None or m.group(4) is not None:
+        q = m.string[m.end(2)]
+        return f"{key}{sep}{q}{MASK}{q}"
+    if m.group(6) is not None:
+        return f"{key}{sep}{m.string[m.end(2)]}{MASK}"
+    return f"{key}{sep}{MASK}"
 
 
 _PATTERNS: list[tuple[re.Pattern, object]] = [
@@ -96,11 +102,11 @@ _PATTERNS: list[tuple[re.Pattern, object]] = [
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), MASK),
     (re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}(?:\.[A-Za-z0-9_\-]+)?"), MASK),
     # Credentials embedded in URLs: scheme://user:pass@host
-    (re.compile(r"(://[^\s:/@]{1,64}:)" + _REF + r"[^\s@/]{1,200}(@)"), r"\1" + MASK + r"\2"),
+    (re.compile(r"(://[^\s:/@]{1,64}:)" + _REF + r"[^\s@/]+(@)"), r"\1" + MASK + r"\2"),
     # Credential key=value pairs
     (_ASSIGN, _assign_repl),
     # --password value / --token=value CLI flags
-    (re.compile(r"(?i)(--(?:password|passwd|token|secret|api-key)(?:=|[ \t]+)[\"']?)" + _REF + r"[^\s\"']{1,200}"),
+    (re.compile(r"(?i)(--(?:password|passwd|token|secret|api-key)(?:=|[ \t]+)[\"']?)" + _REF + r"[^\s\"']+"),
      r"\1" + MASK),
 ]
 
