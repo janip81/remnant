@@ -9,6 +9,7 @@ from mem0 import Memory
 from mem0.configs.base import MemoryConfig, EmbedderConfig, LlmConfig, VectorStoreConfig
 
 from config import settings
+from redact import redact
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +286,7 @@ VALID_CATEGORIES = {"project", "feedback", "reference", "user", "session", "inci
 
 def add(content: str, agent_id: str = "", infer: Optional[bool] = None, category: str = "", tags: Optional[list] = None) -> dict:
     m = get_memory()
+    content = redact(content)
     metadata: dict = {}
     if category:
         metadata["category"] = category
@@ -325,7 +327,7 @@ def get_all(agent_id: str = "") -> list[dict]:
 
 def update(memory_id: str, content: str) -> dict:
     m = get_memory()
-    return m.update(memory_id, content)
+    return m.update(memory_id, redact(content))
 
 
 def delete(memory_id: str) -> dict:
