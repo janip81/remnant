@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import urllib.parse
@@ -35,14 +36,14 @@ async def add_memory(content: str, agent_id: str = "", infer: bool = True, categ
         from queue_worker import enqueue
         job_id = await enqueue(content, agent_id, infer, category, tags)
         return json.dumps({"queued": True, "job_id": job_id})
-    result = mem_store.add(content, agent_id=agent_id, infer=infer, category=category, tags=tags)
+    result = await asyncio.to_thread(mem_store.add, content, agent_id=agent_id, infer=infer, category=category, tags=tags)
     return json.dumps(result)
 
 
 @mcp.tool()
 async def search_memory(query: str, limit: int = 5) -> str:
     """Search memory semantically. Returns top matching facts."""
-    results = mem_store.search(query, limit=limit)
+    results = await asyncio.to_thread(mem_store.search, query, limit=limit)
     if not results:
         return "No memories found."
     lines = []
@@ -56,7 +57,7 @@ async def search_memory(query: str, limit: int = 5) -> str:
 @mcp.tool()
 async def get_all_memories() -> str:
     """List all stored memories."""
-    results = mem_store.get_all()
+    results = await asyncio.to_thread(mem_store.get_all)
     if not results:
         return "No memories stored."
     lines = [r.get("memory", r.get("text", str(r))) for r in results]
@@ -66,7 +67,7 @@ async def get_all_memories() -> str:
 @mcp.tool()
 async def delete_memory(memory_id: str) -> str:
     """Delete a memory by ID."""
-    result = mem_store.delete(memory_id)
+    result = await asyncio.to_thread(mem_store.delete, memory_id)
     return json.dumps(result)
 
 
@@ -226,7 +227,7 @@ async def app(scope, receive, send):
 
     # Prometheus metrics — no auth
     if path == "/metrics" and method == "GET":
-        all_memories = mem_store.get_all()
+        all_memories = await asyncio.to_thread(mem_store.get_all)
         categories: dict = {}
         agents: dict = {}
         tags: dict = {}
@@ -285,7 +286,7 @@ async def app(scope, receive, send):
 
         # GET /api/stats
         if path == "/api/stats" and method == "GET":
-            all_memories = mem_store.get_all()
+            all_memories = await asyncio.to_thread(mem_store.get_all)
             total = len(all_memories)
             dates = [r.get("created_at", "") for r in all_memories if r.get("created_at")]
             dates_sorted = sorted(dates)
@@ -312,7 +313,7 @@ async def app(scope, receive, send):
 
         # GET /api/tag-rules
         if path == "/api/tag-rules" and method == "GET":
-            rules = mem_store.list_tag_rules()
+            rules = await asyncio.to_thread(mem_store.list_tag_rules)
             grouped: dict = {}
             for r in rules:
                 tag = r["tag"]
@@ -335,7 +336,7 @@ async def app(scope, receive, send):
             if not tag or not keyword:
                 await _send_response(send, 400, [[b"content-type", b"text/plain"]], b"tag and keyword required")
                 return
-            ok = mem_store.add_tag_rule(tag, keyword)
+            ok = await asyncio.to_thread(mem_store.add_tag_rule, tag, keyword)
             await _send_response(send, *_json_response({"ok": ok}))
             return
 
@@ -344,7 +345,8 @@ async def app(scope, receive, send):
             rest = path[len("/api/tag-rules/"):]
             if "/" in rest:
                 tag_part, kw_part = rest.split("/", 1)
-                ok = mem_store.delete_tag_rule(
+                ok = await asyncio.to_thread(
+                    mem_store.delete_tag_rule,
                     urllib.parse.unquote(tag_part),
                     urllib.parse.unquote(kw_part),
                 )
@@ -353,14 +355,14 @@ async def app(scope, receive, send):
 
         # GET /api/jobs
         if path == "/api/jobs" and method == "GET":
-            jobs = mem_store.list_job_runs()
+            jobs = await asyncio.to_thread(mem_store.list_job_runs)
             await _send_response(send, *_json_response(jobs))
             return
 
         # GET /api/jobs/{id}
         if path.startswith("/api/jobs/") and method == "GET":
             run_id = path[len("/api/jobs/"):]
-            job = mem_store.get_job_run(run_id)
+            job = await asyncio.to_thread(mem_store.get_job_run, run_id)
             if job is None:
                 await _send_response(send, 404, [[b"content-type", b"text/plain"]], b"Not Found")
                 return
@@ -369,7 +371,7 @@ async def app(scope, receive, send):
 
         # GET /api/memories/export — download all memories as JSON
         if path == "/api/memories/export" and method == "GET":
-            all_memories = mem_store.get_all()
+            all_memories = await asyncio.to_thread(mem_store.get_all)
             body = json.dumps([_memory_dict(r) for r in all_memories], default=str, indent=2).encode()
             await _send_response(send, 200, [
                 [b"content-type", b"application/json"],
@@ -392,7 +394,7 @@ async def app(scope, receive, send):
                 content = item.get("memory") or item.get("text") or item.get("content", "")
                 src_agent = item.get("agent_id", "") or agent_id
                 if content.strip():
-                    mem_store.add(content.strip(), agent_id=src_agent)
+                    await asyncio.to_thread(mem_store.add, content.strip(), agent_id=src_agent)
                     imported += 1
             await _send_response(send, *_json_response({"imported": imported}))
             return
@@ -405,12 +407,12 @@ async def app(scope, receive, send):
             filter_category = qs.get("category", "").strip()
 
             if q:
-                results = mem_store.search(q, limit=200)
+                results = await asyncio.to_thread(mem_store.search, q, limit=200)
                 if sort in ("newest", "oldest"):
                     reverse = sort == "newest"
                     results.sort(key=lambda r: r.get("created_at", ""), reverse=reverse)
             else:
-                results = mem_store.get_all(agent_id=filter_agent)
+                results = await asyncio.to_thread(mem_store.get_all, filter_agent)
                 reverse = sort != "oldest"
                 results.sort(key=lambda r: r.get("created_at", ""), reverse=reverse)
 
@@ -437,7 +439,7 @@ async def app(scope, receive, send):
                     from queue_worker import enqueue
                     await enqueue(content, src_agent, True, "", [])
                 else:
-                    mem_store.add(content, agent_id=src_agent)
+                    await asyncio.to_thread(mem_store.add, content, agent_id=src_agent)
             await _send_response(send, *_json_response({"ok": True}))
             return
 
@@ -455,7 +457,7 @@ async def app(scope, receive, send):
                     params = dict(p.split("=", 1) for p in raw.decode().split("&") if "=" in p)
                     content = urllib.parse.unquote_plus(params.get("content", "")).strip()
                 if content:
-                    mem_store.update(memory_id, content)
+                    await asyncio.to_thread(mem_store.update, memory_id, content)
                 await _send_response(send, *_json_response({"ok": True}))
                 return
 
@@ -471,13 +473,13 @@ async def app(scope, receive, send):
                 except Exception:
                     await _send_response(send, 400, [[b"content-type", b"text/plain"]], b"Bad Request")
                     return
-                ok = mem_store.update_tags(real_id, tags)
+                ok = await asyncio.to_thread(mem_store.update_tags, real_id, tags)
                 await _send_response(send, *_json_response({"ok": ok}))
                 return
 
             # DELETE /api/memories/{id}
             if method == "DELETE":
-                mem_store.delete(memory_id)
+                await asyncio.to_thread(mem_store.delete, memory_id)
                 await _send_response(send, *_json_response({"ok": True}))
                 return
 
