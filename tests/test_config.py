@@ -15,3 +15,17 @@ def test_unsafe_tokens_refused(token):
 
 def test_real_token_accepted():
     Settings(bearer_token="a" * 64).require_safe_token()
+
+
+@pytest.mark.parametrize("var", ["REMNANT_USER_ID", "MEM0_USER_ID"])
+def test_user_id_env_names(monkeypatch, var):
+    monkeypatch.delenv("REMNANT_USER_ID", raising=False)
+    monkeypatch.delenv("MEM0_USER_ID", raising=False)
+    monkeypatch.setenv(var, "jani")
+    assert Settings(_env_file=None).mem0_user_id == "jani"
+
+
+def test_remnant_name_wins(monkeypatch):
+    monkeypatch.setenv("REMNANT_USER_ID", "new")
+    monkeypatch.setenv("MEM0_USER_ID", "old")
+    assert Settings(_env_file=None).mem0_user_id == "new"
