@@ -1,28 +1,99 @@
 """Strip credentials from memory text before it is stored.
 
-Applied server-side in memory.add/update, so every client (hooks, Claude,
-Codex, UI, import) is covered. Patterns aim at real secret shapes and
-key=value assignments; references such as AVP `<path:...>` placeholders and
-shell variables (`$TOKEN`, `${TOKEN}`, `$(cmd)`) are left alone.
+Applied server-side in memory.add/update and before queueing, so every client
+(hooks, Claude, Codex, UI, import, dedup job) is covered. Patterns aim at real
+secret shapes and credential key=value assignments; references such as AVP
+`<path:...>` placeholders, shell/template variables (`$TOKEN`, `${TOKEN}`,
+`{{ .Values.x }}`) and secret *names* (`existingSecret`, `*Ref`) are kept.
+
+All patterns are linear: keys only match at the start of an identifier run
+(lookbehind), the reference check uses offsets, and every repetition consumes
+each character through exactly one branch.
 """
 import re
 
 MASK = "[REDACTED]"
 
-# Values that are references, not secrets.
-_NOT_A_SECRET = r"(?!<path:|\$|\[REDACTED\])"
+# Value prefixes that are references, not secrets.
+_REF = r"(?!<path:|\$|\{\{|\[REDACTED\])"
+_REF_PREFIX = re.compile(r"[\"']?(?:<path:|\$|\{\{|\[REDACTED\])")
 
-def _keep_key(key: str) -> bool:
-    """Keys whose value is a reference to a secret, not the secret itself."""
-    k = key.lower().replace("-", "").replace("_", "")
-    return k.endswith(("ref", "name", "names", "existingsecret", "tokenurl", "tokenpath",
-                         "secrets", "secrettype", "authentication", "pullsecret")) \
-        or k.startswith("existingsecret")
+# Key normalisation: lowercase, drop separators. A key is a credential when its
+# last dotted segment ends with one of these words (REMNANT_TOKEN, db-password,
+# totpSecret, discordBot.token) ...
+_CREDENTIAL_SUFFIXES = (
+    "password", "passwd", "passphrase", "pwd", "secret", "token", "apikey",
+    "accesskey", "secretkey", "privatekey", "clientsecret", "credential",
+    "credentials",
+)
+# ... unless it names a secret object or is a known non-secret setting.
+_KEEP_SUFFIXES = ("ref", "name", "names", "type", "path", "url", "file", "id", "ids", "pullsecret")
+_KEEP_PREFIXES = ("existingsecret",)
+# Short values are allowed for password-like keys (password=abcde); other
+# credential keys need a longer value so prose like "token: 5" stays intact.
+_SHORT_OK = ("password", "passwd", "passphrase", "pwd")
+
+
+def _norm(key: str) -> str:
+    last = key.rsplit(".", 1)[-1]
+    return re.sub(r"[-_]", "", last).lower()
+
+
+def _is_credential_key(key: str) -> bool:
+    k = _norm(key)
+    if k.startswith(_KEEP_PREFIXES) or k.endswith(_KEEP_SUFFIXES):
+        return False
+    return k.endswith(_CREDENTIAL_SUFFIXES)
+
+
+# Values that are placeholders or variable names, not secrets
+# (pwd=password, Password: blank, <from vault>, ****, ...).
+_PLACEHOLDER = re.compile(
+    r"(?i)(?:<.*|\*+|\.+|x+|password|passwd|secret|token|blank|none|null|empty|"
+    r"changeme|change-me|redacted|your[-_a-z]*|example|placeholder|password\)?|\.\.\..*)"
+)
+
+
+def _min_len(key: str) -> int:
+    return 4 if _norm(key).endswith(_SHORT_OK) else 8
+
+
+# key = value / key: value / "key": "value" / key='multi word value'
+_ASSIGN = re.compile(
+    r"(?<![A-Za-z0-9_.\-])([A-Za-z][A-Za-z0-9_.\-]{0,63})"   # key, start of run only
+    r"([\"']?[ \t]*[:=][ \t]*)"                              # separator
+    r"(?:\"((?:[^\"\\\n]|\\.)+)\"|'((?:[^'\\\n]|\\.)+)'|"  # quoted value (spaces, \" ok)
+    r"([^\s\"'`,;)}\]]+)|"                                   # or bare value
+    r"[\"']([^\n]+))"                                         # or unterminated quote: to end of line
+    # Unbounded but linear: each character is consumed by exactly one branch.
+)
+
+
+def _assign_repl(m: re.Match) -> str:
+    key, sep = m.group(1), m.group(2)
+    value = next(g for g in m.groups()[2:] if g is not None)
+    if not _is_credential_key(key) or len(value) < _min_len(key):
+        return m.group(0)
+    # References/already-masked values: look at the original text, because a
+    # bare value stops before "]" and would see "[REDACTED" without it.
+    if _REF_PREFIX.match(m.string, m.end(2)):  # offset match, no suffix copy
+        return m.group(0)
+    if _PLACEHOLDER.fullmatch(value):
+        return m.group(0)
+    if m.group(3) is not None or m.group(4) is not None:
+        q = m.string[m.end(2)]
+        return f"{key}{sep}{q}{MASK}{q}"
+    if m.group(6) is not None:
+        return f"{key}{sep}{m.string[m.end(2)]}{MASK}"
+    return f"{key}{sep}{MASK}"
 
 
 _PATTERNS: list[tuple[re.Pattern, object]] = [
-    # Authorization headers / bearer tokens
-    (re.compile(r"(\bBearer\s+)" + _NOT_A_SECRET + r"[A-Za-z0-9._~+/=\-]{16,}"), r"\1" + MASK),
+    # PEM private keys (also truncated ones without an END line)
+    (re.compile(r"(-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----)[\r\n \t]*[A-Za-z0-9+/=][A-Za-z0-9+/=\r\n \t]*"),
+     r"\1\n" + MASK + "\n"),
+    # Authorization headers / bearer tokens (any case); never ends on a dot
+    (re.compile(r"(?i)(\bbearer[ \t]+)" + _REF + r"[A-Za-z0-9._~+/\-]{15,}[A-Za-z0-9_~+/\-]=*"), r"\1" + MASK),
     # Well-known token formats
     (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{8,}"), MASK),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{16,}"), MASK),
@@ -31,15 +102,13 @@ _PATTERNS: list[tuple[re.Pattern, object]] = [
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), MASK),
     (re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}(?:\.[A-Za-z0-9_\-]+)?"), MASK),
     # Credentials embedded in URLs: scheme://user:pass@host
-    (re.compile(r"(://[^\s:/@]+:)" + _NOT_A_SECRET + r"[^\s@/]+(@)"), r"\1" + MASK + r"\2"),
-    # key=value / key: value / "key": "value" for secret-looking keys
-    # (keys naming a Secret object, e.g. existingSecret/secretName/*Ref, are kept: see _keep_key)
-    (re.compile(
-        r"(?i)(\b([A-Za-z0-9_.\-]*(?:token|passw(?:or)?d|passwd|secret|api[_-]?key|access[_-]?key|private[_-]?key)"
-        r"[A-Za-z0-9_.\-]*)[\"']?\s*[:=]\s*[\"']?)" + _NOT_A_SECRET + r"([^\s\"'`,;)}\]]{6,})"),
-     lambda m: m.group(0) if _keep_key(m.group(2)) else m.group(1) + MASK),
+    (re.compile(r"(://[^\s:/@]{1,64}:)" + _REF + r"[^\s@/]+(@)"), r"\1" + MASK + r"\2"),
+    # Credential key=value pairs
+    (_ASSIGN, _assign_repl),
+    # sshpass -p 'pw' / sshpass -p pw (the password follows -p directly)
+    (re.compile(r"(\bsshpass[ \t]+-p[ \t]*)(?![\"']?(?:<path:|\$|\{\{|\[REDACTED\]))" + r"(?:'[^'\n]*'|\"[^\"\n]*\"|[^\s'\"]+)"), r"\1" + MASK),
     # --password value / --token=value CLI flags
-    (re.compile(r"(?i)(--(?:password|passwd|token|secret|api-key)[= ]\s*[\"']?)" + _NOT_A_SECRET + r"[^\s\"']+"),
+    (re.compile(r"(?i)(--(?:password|passwd|token|secret|api-key)(?:=|[ \t]+)[\"']?)" + _REF + r"[^\s\"']+"),
      r"\1" + MASK),
 ]
 
