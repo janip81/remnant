@@ -53,7 +53,8 @@ async def _run_worker():
                 continue
             _, raw = result
             job = json.loads(raw)
-            mem_store.add(
+            await asyncio.to_thread(
+                mem_store.add,
                 job["content"],
                 agent_id=job.get("agent_id", ""),
                 infer=job.get("infer", True),
