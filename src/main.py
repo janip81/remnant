@@ -50,8 +50,9 @@ async def add_memory(content: str, agent_id: str = "", infer: Optional[bool] = N
 
 @mcp.tool()
 async def search_memory(query: str, limit: int = 5) -> str:
-    """Search memory semantically. Returns top matching facts."""
-    results = await asyncio.to_thread(mem_store.search, query, limit=limit)
+    """Search memory by meaning and exact terms (hostnames, versions, error codes, names).
+    Returns top matching facts with a 0..1 relevance score."""
+    results = await asyncio.to_thread(mem_store.hybrid_search, query, limit=limit)
     if not results:
         return "No memories found."
     lines = []
@@ -399,7 +400,7 @@ async def app(scope, receive, send):
             filter_category = qs.get("category", "").strip()
 
             if q:
-                results = await asyncio.to_thread(mem_store.search, q, limit=200)
+                results = await asyncio.to_thread(mem_store.hybrid_search, q, limit=200)
                 if sort in ("newest", "oldest"):
                     reverse = sort == "newest"
                     results.sort(key=lambda r: r.get("created_at", ""), reverse=reverse)
