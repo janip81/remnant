@@ -271,6 +271,12 @@ async def app(scope, receive, send):
                     "# HELP remnant_queue_dead Jobs in the dead-letter stream",
                     "# TYPE remnant_queue_dead gauge",
                     f"remnant_queue_dead {q['dead']}",
+                    "# HELP remnant_queue_worker_up 1 when the queue worker loop ran within the last minute",
+                    "# TYPE remnant_queue_worker_up gauge",
+                    f"remnant_queue_worker_up {q['worker_up']}",
+                    "# HELP remnant_queue_metrics_error 1 when queue state could not be read (backlog unknown)",
+                    "# TYPE remnant_queue_metrics_error gauge",
+                    f"remnant_queue_metrics_error {q['error']}",
                 ]
             except Exception:
                 pass

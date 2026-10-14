@@ -390,6 +390,16 @@ def add(content: str, agent_id: str = "", infer: Optional[bool] = None, category
     return result
 
 
+def ollama_up(timeout: float = 3.0) -> bool:
+    """Cheap reachability check for the Ollama host (it may be a desktop that sleeps)."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"{settings.ollama_base_url.rstrip('/')}/api/tags", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
 def job_written(job_id: str) -> bool:
     """True when a memory carrying this queue job_id already exists."""
     conn = _db_conn()
