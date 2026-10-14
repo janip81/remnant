@@ -155,3 +155,17 @@ def test_linear_with_many_assignments():
     t = time.perf_counter()
     redact("password=hunter2x " * 40_000)
     assert time.perf_counter() - t < 1.0
+
+
+@pytest.mark.parametrize("text, leaked", [
+    ("sshpass -p 'Fake9pw' ssh root@192.168.81.91 esxcli", "Fake9pw"),
+    ('sshpass -p "Fake9pw" ssh admin@h', "Fake9pw"),
+    ("sshpass -pFake9pw ssh h", "Fake9pw"),
+])
+def test_sshpass_password_masked(text, leaked):
+    out = redact(text)
+    assert leaked not in out and "ssh" in out
+
+
+def test_sshpass_env_reference_kept():
+    assert redact('sshpass -p "$ESXI_PW" ssh h') == 'sshpass -p "$ESXI_PW" ssh h'
