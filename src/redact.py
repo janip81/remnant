@@ -64,7 +64,7 @@ _ASSIGN = re.compile(
     r"([\"']?[ \t]*[:=][ \t]*)"                              # separator
     r"(?:\"((?:[^\"\\\n]|\\.)+)\"|'((?:[^'\\\n]|\\.)+)'|"  # quoted value (spaces, \" ok)
     r"([^\s\"'`,;)}\]]+)|"                                   # or bare value
-    r"[\"']([^\"'\n]+))"                                      # or unterminated quote: to end of line
+    r"[\"']([^\n]+))"                                         # or unterminated quote: to end of line
     # Unbounded but linear: each character is consumed by exactly one branch.
 )
 

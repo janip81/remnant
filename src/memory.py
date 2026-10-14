@@ -363,6 +363,25 @@ def _agent_id(agent_id: str) -> str:
     return agent_id if agent_id else settings.mem0_agent_id
 
 
+# mem0 2.0.x catches these inside the infer=True pipeline, logs them and returns
+# [] or a partial result. A genuine "nothing new to extract" logs none of them.
+_SWALLOWED = ("LLM extraction failed", "Error parsing extraction response",
+              "Failed to embed memory text", "Failed to insert memory")
+
+
+class _ThreadErrorCapture(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.thread = threading.get_ident()
+        self.errors: list[str] = []
+
+    def emit(self, record):
+        if record.thread == self.thread:
+            msg = record.getMessage()
+            if msg.startswith(_SWALLOWED):
+                self.errors.append(msg)
+
+
 VALID_CATEGORIES = {"project", "feedback", "reference", "user", "session", "incident", ""}
 
 
@@ -380,14 +399,41 @@ def add(content: str, agent_id: str = "", infer: Optional[bool] = None, category
     merged = sorted(set(auto) | set(explicit))
     if merged:
         metadata["tags"] = merged
-    result = m.add(
-        content,
-        user_id=settings.mem0_user_id,
-        agent_id=_agent_id(agent_id),
-        infer=settings.mem0_infer if infer is None else infer,
-        metadata=metadata if metadata else None,
-    )
-    return result
+    use_infer = settings.mem0_infer if infer is None else infer
+    kwargs = dict(user_id=settings.mem0_user_id, agent_id=_agent_id(agent_id))
+    if not use_infer:
+        return m.add(content, infer=False, metadata=metadata or None, **kwargs)
+
+    # infer=True: mem0 2.0.x returns [] when the LLM's JSON is not in the shape it
+    # expects (qwen2.5:7b often answers {"message": ...}), swallows extraction
+    # errors, and crashes on {"memory": ["plain string"]}. Any of these used to
+    # drop the write silently. Store the raw text instead; a genuine duplicate
+    # this creates is merged by the nightly dedup job.
+    capture = _ThreadErrorCapture()
+    mem0_log = logging.getLogger("mem0.memory.main")
+    mem0_log.addHandler(capture)
+    reason = ""
+    try:
+        result = m.add(content, infer=True, metadata=metadata or None, **kwargs)
+    except Exception as e:  # mem0 bug on unexpected LLM output
+        result, reason = None, f"{type(e).__name__}: {e}"
+    finally:
+        mem0_log.removeHandler(capture)
+    if capture.errors:
+        reason = "; ".join(capture.errors)
+    elif not reason and not _has_results(result):
+        reason = "inference extracted nothing"
+    if not reason:
+        return result
+    logger.warning("infer=True produced no memory (%s); storing raw text", reason[:200])
+    fallback_meta = {**metadata, "infer_fallback": reason[:200]}
+    return m.add(content, infer=False, metadata=fallback_meta, **kwargs)
+
+
+def _has_results(result) -> bool:
+    if isinstance(result, dict):
+        result = result.get("results", [])
+    return bool(result)
 
 
 def ollama_up(timeout: float = 3.0) -> bool:

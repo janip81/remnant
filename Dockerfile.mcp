@@ -17,4 +17,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 EXPOSE 8080
 
+# mem0 sends usage telemetry to PostHog by default; Remnant keeps all data local.
+ENV MEM0_TELEMETRY=false
 CMD ["python", "src/main.py"]

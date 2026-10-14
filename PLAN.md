@@ -32,6 +32,10 @@
 - [x] `/metrics`, `/api/stats`, list, export, `get_all_memories` via SQL without vectors (root cause of the 3× OOM: mem0 `get_all` loads every embedding). Stopgap 1Gi limit in k8s-gitops c46e6ae8 can go back down after deploy — *done on branch `hardening/p0`, not deployed*
 - [x] Read paths (list/export/stats/metrics) work while Ollama is offline — tested with Ollama unreachable — *done on branch `hardening/p0`, not deployed*
 
+- [x] **infer=True silently dropped writes in prod** (found 2026-10-14): mem0 2.0.2 + qwen2.5:7b returns `[]` (model answers `{"message": ...}`) or crashes on `{"memory": ["string"]}`; the old worker logged "Processed". Raw text is now stored as fallback with `infer_fallback` metadata — *done on branch `hardening/p0-followup`, not deployed*
+- [ ] Decide: make `add_memory` default `infer=false` (original Phase 10 design, "Claude decides what to save"), or pick an extraction model that follows mem0's JSON format
+- [x] Disable mem0 PostHog telemetry (`MEM0_TELEMETRY=false` in the image) — *branch only*
+
 ### P1 — memory quality
 - [ ] Lifecycle metadata on every memory: `status` (active | superseded | historical | uncertain), `superseded_by`, `valid_from`, `source` (agent_id, client, session_id, hook vs manual), keep `created_at`/`updated_at`
 - [ ] `search_memory` returns `active` by default; optional `include_history` flag
