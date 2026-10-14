@@ -287,7 +287,7 @@ def stats() -> dict:
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT count(*), min(payload->>'created_at'), max(payload->>'created_at') "
+            cur.execute(f"SELECT count(*), min(nullif(payload->>'created_at', '')), max(nullif(payload->>'created_at', '')) "
                         f"FROM {_MEM_TABLE} {where}", p)
             total, first, last = cur.fetchone()
             cur.execute(f"SELECT coalesce(nullif(payload->>'agent_id', ''), 'unknown'), count(*) "

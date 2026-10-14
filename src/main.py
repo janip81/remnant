@@ -14,6 +14,10 @@ from config import settings
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Fail fast for every launcher (python main.py, uvicorn main:app, tests):
+# an empty token would otherwise make "Authorization: Bearer " valid.
+settings.require_safe_token()
+
 mcp = FastMCP(
     "claude-memory",
     stateless_http=True,
@@ -502,5 +506,4 @@ async def app(scope, receive, send):
 
 
 if __name__ == "__main__":
-    settings.require_safe_token()
     uvicorn.run(app, host="0.0.0.0", port=settings.app_port)
