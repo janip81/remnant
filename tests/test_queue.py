@@ -19,16 +19,24 @@ class FakeMemory(types.ModuleType):
     def __init__(self):
         super().__init__("memory")
         self.calls, self.written, self.fail_times = [], set(), 0
+        self.up = True                 # Ollama reachable
+        self.infer_result = None       # override what add() returns for infer=True
 
     def add(self, content, **kw):
         self.calls.append((content, kw))
         if self.fail_times:
             self.fail_times -= 1
-            raise ConnectionError("ollama down")
+            raise ValueError("bad job")
         self.written.add(kw["job_id"])
+        if kw.get("infer") and self.infer_result is not None:
+            return self.infer_result
+        return {"results": [{"id": "x", "event": "ADD"}]}
 
     def job_written(self, job_id):
         return job_id in self.written
+
+    def ollama_up(self):
+        return self.up
 
 
 @pytest.fixture
@@ -52,6 +60,11 @@ async def _deliver(client):
     return [m for _s, msgs in resp or [] for m in msgs]
 
 
+def _reclaim_and_process(client):
+    for mid, f in run(qw._claim_stale(client))[1]:
+        run(qw._process(client, mid, f))
+
+
 def test_enqueue_redacts_before_redis(env):
     client, _ = env
     run(qw.enqueue(f"REMNANT_TOKEN={FAKE} note", "codex", False, "session", []))
@@ -59,13 +72,14 @@ def test_enqueue_redacts_before_redis(env):
     assert FAKE not in fields["job"] and "[REDACTED]" in fields["job"]
 
 
-def test_success_acks_and_passes_job_id(env):
+def test_success_acks_deletes_and_passes_job_id(env):
     client, mem = env
     job_id = run(qw.enqueue("fact", "codex", False, "", []))
     for msg_id, fields in run(_deliver(client)):
         run(qw._process(client, msg_id, fields))
     assert mem.calls[0][1]["job_id"] == job_id
     assert run(qw.queue_metrics())["pending"] == 0
+    assert run(client.xlen(qw.STREAM)) == 0      # acked entries are deleted, never trimmed
 
 
 def test_failure_stays_pending_then_retry_succeeds(env):
@@ -75,18 +89,26 @@ def test_failure_stays_pending_then_retry_succeeds(env):
     (msg_id, fields), = run(_deliver(client))
     run(qw._process(client, msg_id, fields))
     assert run(qw.queue_metrics())["pending"] == 1      # not acked after failure
-    for mid, f in run(qw._claim_stale(client)):           # reclaimed after idle
-        run(qw._process(client, mid, f))
+    _reclaim_and_process(client)                         # reclaimed after idle
     assert len(mem.calls) == 2 and run(qw.queue_metrics())["pending"] == 0
 
 
 def test_crash_after_write_does_not_duplicate(env):
     client, mem = env
     job_id = run(qw.enqueue("fact", "codex", False, "", []))
-    mem.written.add(job_id)                                # memory written, then crash before XACK
+    mem.written.add(job_id)                              # written, then crash before XACK
     (msg_id, fields), = run(_deliver(client))
     run(qw._process(client, msg_id, fields))
     assert mem.calls == [] and run(qw.queue_metrics())["pending"] == 0
+
+
+def test_infer_true_retry_is_rerun_not_skipped(env):
+    client, mem = env
+    job_id = run(qw.enqueue("fact", "codex", True, "", []))
+    mem.written.add(job_id)                              # partial write before a crash
+    (msg_id, fields), = run(_deliver(client))
+    run(qw._process(client, msg_id, fields))
+    assert len(mem.calls) == 1                           # mem0 LLM dedup handles repeats
 
 
 def test_dead_letter_after_max_attempts(env, monkeypatch):
@@ -96,20 +118,74 @@ def test_dead_letter_after_max_attempts(env, monkeypatch):
     run(qw.enqueue("fact", "codex", False, "", []))
     (msg_id, fields), = run(_deliver(client))
     run(qw._process(client, msg_id, fields))
-    for mid, f in run(qw._claim_stale(client)):
-        run(qw._process(client, mid, f))
+    _reclaim_and_process(client)
     m = run(qw.queue_metrics())
     assert m["dead"] == 1 and m["pending"] == 0
     (_, dead), = run(client.xrange(qw.DEAD))
-    assert "ConnectionError" in dead["error"]
+    assert "ValueError" in dead["error"]
+
+
+def test_ollama_down_does_not_spend_attempts(env, monkeypatch):
+    client, mem = env
+    monkeypatch.setattr(qw, "MAX_ATTEMPTS", 1)
+    mem.up = False
+    run(qw.enqueue("fact", "codex", False, "", []))
+    (msg_id, fields), = run(_deliver(client))
+    for _ in range(5):                                   # hours of outage
+        _reclaim_and_process(client)
+    m = run(qw.queue_metrics())
+    assert mem.calls == [] and m["pending"] == 1 and m["dead"] == 0
+    mem.up = True                                        # Ollama back
+    _reclaim_and_process(client)
+    assert len(mem.calls) == 1 and run(qw.queue_metrics())["depth"] == 0
+
+
+def test_infer_empty_result_during_outage_is_retried(env, monkeypatch):
+    client, mem = env
+    monkeypatch.setattr(qw, "MAX_ATTEMPTS", 1)
+    mem.infer_result = []                                # mem0 swallowed the LLM error
+    real_add = mem.add
+
+    def add_then_go_down(content, **kw):
+        mem.up = False                                   # Ollama dies during extraction
+        return real_add(content, **kw)
+    monkeypatch.setattr(mem, "add", add_then_go_down)
+    run(qw.enqueue("fact", "codex", True, "", []))
+    (msg_id, fields), = run(_deliver(client))
+    run(qw._process(client, msg_id, fields))
+    m = run(qw.queue_metrics())
+    assert m["pending"] == 1 and m["dead"] == 0          # not acked, not dead
+    assert run(client.hget(qw.ATTEMPTS, msg_id)) == "0"  # attempt given back
 
 
 def test_legacy_list_jobs_are_migrated_and_redacted(env):
     client, mem = env
     run(client.rpush(qw.LEGACY_LIST, json.dumps({"job_id": "old-1", "content": f"password: {FAKE}", "agent_id": "x"})))
     assert run(qw._migrate_legacy(client)) == 1
-    assert run(client.llen(qw.LEGACY_LIST)) == 0
+    assert run(client.llen(qw.LEGACY_LIST)) == 0 and run(client.llen(qw.LEGACY_STAGING)) == 0
     (msg_id, fields), = run(_deliver(client))
     assert FAKE not in fields["job"]
     run(qw._process(client, msg_id, fields))
     assert mem.calls[0][1]["job_id"] == "old-1"
+
+
+def test_legacy_staging_leftover_is_recovered(env):
+    client, _ = env
+    job = json.dumps({"job_id": "stuck-1", "content": "x", "agent_id": "a", "infer": False})
+    run(client.rpush(qw.LEGACY_STAGING, job))           # crash after LMOVE, before XADD
+    assert run(qw._migrate_legacy(client)) == 1
+    assert run(client.llen(qw.LEGACY_STAGING)) == 0
+
+
+def test_unparseable_legacy_item_goes_to_dead_letter(env):
+    client, _ = env
+    run(client.rpush(qw.LEGACY_LIST, "not json"))
+    assert run(qw._migrate_legacy(client)) == 0
+    assert run(client.xlen(qw.DEAD)) == 1 and run(client.llen(qw.LEGACY_STAGING)) == 0
+
+
+def test_metrics_report_error_without_group(env):
+    client, _ = env
+    run(client.delete(qw.STREAM))
+    m = run(qw.queue_metrics())
+    assert m["error"] == 1 and m["worker_up"] == 0
