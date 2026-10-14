@@ -239,7 +239,7 @@ All config via environment variables (see `.env.example`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BEARER_TOKEN` | `change-me` | Auth token for MCP endpoint |
+| `BEARER_TOKEN` | — (required) | Auth token for MCP and `/api`; server refuses to start if empty, `change-me` or < 16 chars |
 | `DATABASE_URL` | `postgresql://remnant:remnant@localhost:5432/remnant` | PostgreSQL connection |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `qwen2.5:7b` | Chat model for tagging and dedup merging |

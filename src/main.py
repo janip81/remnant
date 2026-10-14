@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import logging
 import urllib.parse
@@ -94,7 +95,7 @@ async def _send_response(send, status, headers, body):
 
 def _check_auth(headers: dict) -> bool:
     auth = headers.get(b"authorization", b"").decode()
-    return auth.startswith("Bearer ") and auth[7:] == settings.bearer_token
+    return auth.startswith("Bearer ") and hmac.compare_digest(auth[7:].encode(), settings.bearer_token.encode())
 
 
 def _get_agent_id(headers: dict) -> str:
@@ -532,4 +533,5 @@ async def app(scope, receive, send):
 
 
 if __name__ == "__main__":
+    settings.require_safe_token()
     uvicorn.run(app, host="0.0.0.0", port=settings.app_port)
