@@ -147,8 +147,16 @@ async def _run_worker() -> None:
     moved = await _migrate_legacy(client)
     logger.info("Queue worker started (stream=%s group=%s consumer=%s, migrated %d legacy jobs)",
                 STREAM, GROUP, _consumer, moved)
+    last_migrate = asyncio.get_running_loop().time()
     while True:
         try:
+            # During a rolling update the previous version may still push to the
+            # old list; keep draining it (one LPOP per minute once it is empty).
+            now = asyncio.get_running_loop().time()
+            if now - last_migrate > 60:
+                last_migrate = now
+                if moved := await _migrate_legacy(client):
+                    logger.info("Migrated %d late legacy jobs", moved)
             for msg_id, fields in await _claim_stale(client):
                 if fields:  # deleted entries come back with no fields
                     await _process(client, msg_id, fields)
