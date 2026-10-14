@@ -58,7 +58,7 @@ async def search_memory(query: str, limit: int = 5) -> str:
 @mcp.tool()
 async def get_all_memories() -> str:
     """List all stored memories."""
-    results = await asyncio.to_thread(mem_store.get_all)
+    results = await asyncio.to_thread(mem_store.list_rows)
     if not results:
         return "No memories stored."
     lines = [r.get("memory", r.get("text", str(r))) for r in results]
@@ -228,18 +228,8 @@ async def app(scope, receive, send):
 
     # Prometheus metrics — no auth
     if path == "/metrics" and method == "GET":
-        all_memories = await asyncio.to_thread(mem_store.get_all)
-        categories: dict = {}
-        agents: dict = {}
-        tags: dict = {}
-        for r in all_memories:
-            meta = _extract_meta(r)
-            cat = meta.get("category", "") or "uncategorized"
-            categories[cat] = categories.get(cat, 0) + 1
-            agent = r.get("agent_id") or "unknown"
-            agents[agent] = agents.get(agent, 0) + 1
-            for tag in (meta.get("tags") or []):
-                tags[tag] = tags.get(tag, 0) + 1
+        st = await asyncio.to_thread(mem_store.stats)
+        categories, agents, tags = st["by_category"], st["by_agent"], st["by_tag"]
         lines = [
             "# HELP remnant_memories_total Total number of memories stored",
             "# TYPE remnant_memories_total gauge",
@@ -287,29 +277,8 @@ async def app(scope, receive, send):
 
         # GET /api/stats
         if path == "/api/stats" and method == "GET":
-            all_memories = await asyncio.to_thread(mem_store.get_all)
-            total = len(all_memories)
-            dates = [r.get("created_at", "") for r in all_memories if r.get("created_at")]
-            dates_sorted = sorted(dates)
-            agents: dict = {}
-            categories: dict = {}
-            tags_count: dict = {}
-            for r in all_memories:
-                a = r.get("agent_id") or "unknown"
-                agents[a] = agents.get(a, 0) + 1
-                meta = _extract_meta(r)
-                c = meta.get("category", "") or "uncategorized"
-                categories[c] = categories.get(c, 0) + 1
-                for tag in (meta.get("tags") or []):
-                    tags_count[tag] = tags_count.get(tag, 0) + 1
-            await _send_response(send, *_json_response({
-                "total": total,
-                "first_added": dates_sorted[0] if dates_sorted else None,
-                "last_added": dates_sorted[-1] if dates_sorted else None,
-                "by_agent": agents,
-                "by_category": categories,
-                "by_tag": tags_count,
-            }))
+            st = await asyncio.to_thread(mem_store.stats)
+            await _send_response(send, *_json_response(st))
             return
 
         # GET /api/tag-rules
@@ -372,7 +341,7 @@ async def app(scope, receive, send):
 
         # GET /api/memories/export — download all memories as JSON
         if path == "/api/memories/export" and method == "GET":
-            all_memories = await asyncio.to_thread(mem_store.get_all)
+            all_memories = await asyncio.to_thread(mem_store.list_rows)
             body = json.dumps([_memory_dict(r) for r in all_memories], default=str, indent=2).encode()
             await _send_response(send, 200, [
                 [b"content-type", b"application/json"],
@@ -413,7 +382,7 @@ async def app(scope, receive, send):
                     reverse = sort == "newest"
                     results.sort(key=lambda r: r.get("created_at", ""), reverse=reverse)
             else:
-                results = await asyncio.to_thread(mem_store.get_all, filter_agent)
+                results = await asyncio.to_thread(mem_store.list_rows, filter_agent)
                 reverse = sort != "oldest"
                 results.sort(key=lambda r: r.get("created_at", ""), reverse=reverse)
 
