@@ -360,12 +360,15 @@ def _agent_id(agent_id: str) -> str:
 VALID_CATEGORIES = {"project", "feedback", "reference", "user", "session", "incident", ""}
 
 
-def add(content: str, agent_id: str = "", infer: Optional[bool] = None, category: str = "", tags: Optional[list] = None) -> dict:
+def add(content: str, agent_id: str = "", infer: Optional[bool] = None, category: str = "",
+        tags: Optional[list] = None, job_id: str = "") -> dict:
     m = get_memory()
     content = redact(content)
     metadata: dict = {}
     if category:
         metadata["category"] = category
+    if job_id:
+        metadata["job_id"] = job_id  # lets a retried queue job detect it already wrote
     auto = _auto_tag(content)
     explicit = [t for t in (tags or []) if isinstance(t, str) and t.strip()]
     merged = sorted(set(auto) | set(explicit))
@@ -379,6 +382,17 @@ def add(content: str, agent_id: str = "", infer: Optional[bool] = None, category
         metadata=metadata if metadata else None,
     )
     return result
+
+
+def job_written(job_id: str) -> bool:
+    """True when a memory carrying this queue job_id already exists."""
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT 1 FROM {_MEM_TABLE} WHERE payload->>'job_id' = %s LIMIT 1", (job_id,))
+            return cur.fetchone() is not None
+    finally:
+        conn.close()
 
 
 def search(query: str, limit: int = 5, agent_id: str = "") -> list[dict]:
