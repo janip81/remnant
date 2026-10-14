@@ -132,3 +132,25 @@ def test_idempotent_all_patterns(text):
 ])
 def test_placeholders_are_kept(text):
     assert redact(text) == text
+
+
+# --- Cases from the Codex review of hardening/p0-followup -----------------
+
+@pytest.mark.parametrize("text, leaked", [
+    ('password="' + "p" * 201 + '"', "p" * 30),
+    ("password=" + "q" * 250, "q" * 30),
+    (r'password="abc\"defghij"', "defghij"),
+    ("https://user:" + "s" * 300 + "@host/x", "s" * 30),
+    ("password=\"abc defghij", "abc"),
+    ("token: \"Xm5Iabcdefghijkl unterminated", "Xm5Iabcdefghijkl"),
+])
+def test_long_and_escaped_values_fully_masked(text, leaked):
+    out = redact(text)
+    assert leaked not in out, out
+
+
+def test_linear_with_many_assignments():
+    import time
+    t = time.perf_counter()
+    redact("password=hunter2x " * 40_000)
+    assert time.perf_counter() - t < 1.0
