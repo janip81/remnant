@@ -143,6 +143,7 @@ def test_placeholders_are_kept(text):
     ("https://user:" + "s" * 300 + "@host/x", "s" * 30),
     ("password=\"abc defghij", "abc"),
     ("token: \"Xm5Iabcdefghijkl unterminated", "Xm5Iabcdefghijkl"),
+    (r'password="abc\"def ghijkl', "ghijkl"),
 ])
 def test_long_and_escaped_values_fully_masked(text, leaked):
     out = redact(text)

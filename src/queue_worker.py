@@ -55,6 +55,7 @@ _client = None
 _worker_task: Optional[asyncio.Task] = None
 _consumer = os.environ.get("HOSTNAME") or socket.gethostname()
 _heartbeat = 0.0          # monotonic time of the last worker loop iteration
+_busy = False             # a job is being processed (a single add can take minutes)
 
 
 class DependencyDown(Exception):
@@ -89,7 +90,7 @@ def ensure_worker() -> None:
 
 def worker_alive() -> bool:
     return (_worker_task is not None and not _worker_task.done()
-            and time.monotonic() - _heartbeat < HEARTBEAT_STALE_S)
+            and (_busy or time.monotonic() - _heartbeat < HEARTBEAT_STALE_S))
 
 
 async def _ensure_group(client) -> None:
@@ -119,9 +120,11 @@ async def _migrate_legacy(client) -> int:
                 return moved
         try:
             job = json.loads(raw)
-        except ValueError:
-            logger.error("Unreadable legacy queue item moved to %s", DEAD)
-            await client.xadd(DEAD, {"job": raw, "error": "unparseable legacy item", "source_id": "legacy"})
+            if not isinstance(job, dict) or not isinstance(job.get("content"), str):
+                raise ValueError("not a job object")
+        except ValueError as e:
+            logger.error("Unreadable legacy queue item moved to %s: %s", DEAD, e)
+            await client.xadd(DEAD, {"job": raw, "error": f"bad legacy item: {e}"[:200], "source_id": "legacy"})
         else:
             job["content"] = redact(job.get("content", ""))
             await client.xadd(STREAM, {"job": json.dumps(job)})
@@ -130,9 +133,21 @@ async def _migrate_legacy(client) -> int:
 
 
 async def _process(client, msg_id: str, fields: dict) -> None:
+    global _busy, _heartbeat
+    _busy = True
+    try:
+        await _process_one(client, msg_id, fields)
+    finally:
+        _busy = False
+        _heartbeat = time.monotonic()
+
+
+async def _process_one(client, msg_id: str, fields: dict) -> None:
     import memory as mem_store
     try:
         job = json.loads(fields["job"])
+        if not isinstance(job, dict) or not isinstance(job.get("content"), str):
+            raise ValueError("not a job object")
     except Exception:
         await _dead(client, msg_id, fields, "unparseable job")
         return

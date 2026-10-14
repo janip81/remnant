@@ -189,3 +189,24 @@ def test_metrics_report_error_without_group(env):
     run(client.delete(qw.STREAM))
     m = run(qw.queue_metrics())
     assert m["error"] == 1 and m["worker_up"] == 0
+
+
+@pytest.mark.parametrize("raw", ["null", "[1, 2]", '{"job_id": "x", "content": 5}'])
+def test_valid_json_but_bad_job_is_quarantined(env, raw):
+    client, _ = env
+    run(client.rpush(qw.LEGACY_LIST, raw))
+    run(client.rpush(qw.LEGACY_LIST, json.dumps({"job_id": "ok-1", "content": "x", "agent_id": "a", "infer": False})))
+    assert run(qw._migrate_legacy(client)) == 1          # bad one dead-lettered, good one moved
+    assert run(client.xlen(qw.DEAD)) == 1 and run(client.llen(qw.LEGACY_STAGING)) == 0
+
+
+def test_worker_reported_alive_while_busy(monkeypatch):
+    class Running:
+        def done(self):
+            return False
+    monkeypatch.setattr(qw, "_worker_task", Running())
+    monkeypatch.setattr(qw, "_heartbeat", 0.0)           # last loop long ago
+    monkeypatch.setattr(qw, "_busy", True)               # but a slow add is running
+    assert qw.worker_alive()
+    monkeypatch.setattr(qw, "_busy", False)
+    assert not qw.worker_alive()
