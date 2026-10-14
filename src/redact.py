@@ -105,6 +105,8 @@ _PATTERNS: list[tuple[re.Pattern, object]] = [
     (re.compile(r"(://[^\s:/@]{1,64}:)" + _REF + r"[^\s@/]+(@)"), r"\1" + MASK + r"\2"),
     # Credential key=value pairs
     (_ASSIGN, _assign_repl),
+    # sshpass -p 'pw' / sshpass -p pw (the password follows -p directly)
+    (re.compile(r"(\bsshpass[ \t]+-p[ \t]*)(?![\"']?(?:<path:|\$|\{\{|\[REDACTED\]))" + r"(?:'[^'\n]*'|\"[^\"\n]*\"|[^\s'\"]+)"), r"\1" + MASK),
     # --password value / --token=value CLI flags
     (re.compile(r"(?i)(--(?:password|passwd|token|secret|api-key)(?:=|[ \t]+)[\"']?)" + _REF + r"[^\s\"']+"),
      r"\1" + MASK),
