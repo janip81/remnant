@@ -11,7 +11,9 @@ class Settings(BaseSettings):
     # REMNANT_* is the documented name; MEM0_* kept for existing deployments (Helm chart).
     mem0_user_id: str = Field("default", validation_alias=AliasChoices("REMNANT_USER_ID", "MEM0_USER_ID"))
     mem0_agent_id: str = Field("default", validation_alias=AliasChoices("REMNANT_AGENT_ID", "MEM0_AGENT_ID"))  # fallback agent_id
-    mem0_infer: bool = True           # enable LLM extraction and deduplication
+    # Default for add_memory when a client omits infer. False = store as written
+    # (agents decide what to save); True = mem0 LLM extraction first.
+    mem0_infer: bool = False
     app_port: int = 8080
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5:7b"
