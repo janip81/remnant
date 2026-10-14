@@ -251,24 +251,19 @@ All config via environment variables (see `.env.example`):
 
 ### Redis async queue (optional)
 
-When `REDIS_URL` is set, `add_memory` calls are pushed to a Redis list (`remnant:queue:add_memory`) and processed by a background asyncio worker. The caller gets an immediate response (`{"queued": true, "job_id": "..."}`) instead of blocking while Ollama runs LLM extraction (which can take 15–17 s with `infer=true`).
+When `REDIS_URL` is set, `add_memory` calls are added to a Redis Stream (`remnant:stream:add_memory`, consumer group `remnant-workers`) and written by a worker inside the MCP process. The caller gets an immediate response (`{"queued": true, "job_id": "..."}`) instead of blocking while Ollama runs LLM extraction (which can take 15–17 s with `infer=true`).
 
-Without `REDIS_URL` the behaviour is unchanged — writes are synchronous.
+Delivery is at-least-once and safe to retry:
+- content is redacted before it is queued; a job is acknowledged (and deleted from the stream) only after the memory is written — the stream is never trimmed by length
+- jobs from a crashed or restarted pod are reclaimed after `QUEUE_CLAIM_IDLE_SECONDS` (default 600)
+- **Ollama offline** (e.g. the GPU desktop is asleep): jobs stay pending and are retried every `QUEUE_CLAIM_IDLE_SECONDS` for as long as the outage lasts, without using up attempts
+- other failures count as attempts; after `QUEUE_MAX_ATTEMPTS` (default 5) a job moves to `remnant:stream:add_memory:dead`
+- `infer=false`: the `job_id` is stored in the memory's metadata, so a retry after a crash never writes twice. `infer=true`: a retry re-runs mem0's extraction, whose LLM step NOOPs facts that already exist
+- the worker starts with the app (retrying until Redis is reachable) and moves any jobs left in the old `remnant:queue:add_memory` list into the stream
 
-**Helm** — enable via:
+Inspect dead jobs with `XRANGE remnant:stream:add_memory:dead - +`; to replay one, `XADD remnant:stream:add_memory * job '<job field>'` and `XDEL` it from the dead stream.
 
-```yaml
-redis:
-  enabled: true
-  host: redis-replication-master.redis.svc
-  port: 6379
-  db: 0
-  passwordSecret:
-    name: remnant-redis-auth   # Secret in same namespace
-    key: password
-```
-
-The queue depth is exported as `remnant_queue_depth` on the `/metrics` endpoint.
+`/metrics` exports `remnant_queue_depth` (pending + not yet delivered), `remnant_queue_pending`, `remnant_queue_dead`, `remnant_queue_worker_up` and `remnant_queue_metrics_error` (1 = backlog unknown). Alert on `remnant_queue_worker_up == 0` or `remnant_queue_dead > 0`.
 
 ---
 

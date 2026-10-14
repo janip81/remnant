@@ -14,6 +14,10 @@ from config import settings
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Fail fast for every launcher (python main.py, uvicorn main:app, tests):
+# an empty token would otherwise make "Authorization: Bearer " valid.
+settings.require_safe_token()
+
 mcp = FastMCP(
     "claude-memory",
     stateless_http=True,
@@ -211,6 +215,10 @@ def _memory_dict(r: dict) -> dict:
 
 async def app(scope, receive, send):
     if scope["type"] == "lifespan":
+        if settings.redis_url:
+            # Start at startup so jobs left in Redis resume without waiting for a new add_memory.
+            from queue_worker import ensure_worker
+            ensure_worker()
         await _starlette_app(scope, receive, send)
         return
 
@@ -251,13 +259,24 @@ async def app(scope, receive, send):
                 lines.append(f'remnant_memories_by_tag{{tag="{tag}"}} {count}')
         if settings.redis_url:
             try:
-                from queue_worker import _get_client, _QUEUE_KEY
-                rc = await _get_client()
-                depth = await rc.llen(_QUEUE_KEY)
+                from queue_worker import queue_metrics
+                q = await queue_metrics()
                 lines += [
-                    "# HELP remnant_queue_depth Current number of jobs pending in the Redis add_memory queue",
+                    "# HELP remnant_queue_depth Jobs not yet written (pending + not yet delivered)",
                     "# TYPE remnant_queue_depth gauge",
-                    f"remnant_queue_depth {depth}",
+                    f"remnant_queue_depth {q['depth']}",
+                    "# HELP remnant_queue_pending Jobs delivered to a worker but not acknowledged",
+                    "# TYPE remnant_queue_pending gauge",
+                    f"remnant_queue_pending {q['pending']}",
+                    "# HELP remnant_queue_dead Jobs in the dead-letter stream",
+                    "# TYPE remnant_queue_dead gauge",
+                    f"remnant_queue_dead {q['dead']}",
+                    "# HELP remnant_queue_worker_up 1 when the queue worker loop ran within the last minute",
+                    "# TYPE remnant_queue_worker_up gauge",
+                    f"remnant_queue_worker_up {q['worker_up']}",
+                    "# HELP remnant_queue_metrics_error 1 when queue state could not be read (backlog unknown)",
+                    "# TYPE remnant_queue_metrics_error gauge",
+                    f"remnant_queue_metrics_error {q['error']}",
                 ]
             except Exception:
                 pass
@@ -502,5 +521,4 @@ async def app(scope, receive, send):
 
 
 if __name__ == "__main__":
-    settings.require_safe_token()
     uvicorn.run(app, host="0.0.0.0", port=settings.app_port)

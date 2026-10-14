@@ -5,6 +5,7 @@ import time
 from typing import Optional
 import psycopg2
 import psycopg2.extras
+import psycopg2.errors
 from mem0 import Memory
 from mem0.configs.base import MemoryConfig, EmbedderConfig, LlmConfig, VectorStoreConfig
 
@@ -276,6 +277,8 @@ def list_rows(agent_id: str = "") -> list[dict]:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params)
             return [_row_to_result(r) for r in cur.fetchall()]
+    except psycopg2.errors.UndefinedTable:
+        return []  # fresh install, nothing written yet
     finally:
         conn.close()
 
@@ -287,7 +290,7 @@ def stats() -> dict:
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT count(*), min(payload->>'created_at'), max(payload->>'created_at') "
+            cur.execute(f"SELECT count(*), min(nullif(payload->>'created_at', '')), max(nullif(payload->>'created_at', '')) "
                         f"FROM {_MEM_TABLE} {where}", p)
             total, first, last = cur.fetchone()
             cur.execute(f"SELECT coalesce(nullif(payload->>'agent_id', ''), 'unknown'), count(*) "
@@ -300,6 +303,9 @@ def stats() -> dict:
                         f"jsonb_array_elements_text(CASE WHEN jsonb_typeof({_META}->'tags') = 'array' "
                         f"THEN {_META}->'tags' ELSE '[]'::jsonb END) AS t {where} GROUP BY 1", p)
             by_tag = dict(cur.fetchall())
+    except psycopg2.errors.UndefinedTable:
+        return {"total": 0, "first_added": None, "last_added": None,
+                "by_agent": {}, "by_category": {}, "by_tag": {}}
     finally:
         conn.close()
     return {"total": total, "first_added": first, "last_added": last,
@@ -357,28 +363,100 @@ def _agent_id(agent_id: str) -> str:
     return agent_id if agent_id else settings.mem0_agent_id
 
 
+# mem0 2.0.x catches these inside the infer=True pipeline, logs them and returns
+# [] or a partial result. A genuine "nothing new to extract" logs none of them.
+_SWALLOWED = ("LLM extraction failed", "Error parsing extraction response",
+              "Failed to embed memory text", "Failed to insert memory")
+
+
+class _ThreadErrorCapture(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.thread = threading.get_ident()
+        self.errors: list[str] = []
+
+    def emit(self, record):
+        if record.thread == self.thread:
+            msg = record.getMessage()
+            if msg.startswith(_SWALLOWED):
+                self.errors.append(msg)
+
+
 VALID_CATEGORIES = {"project", "feedback", "reference", "user", "session", "incident", ""}
 
 
-def add(content: str, agent_id: str = "", infer: Optional[bool] = None, category: str = "", tags: Optional[list] = None) -> dict:
+def add(content: str, agent_id: str = "", infer: Optional[bool] = None, category: str = "",
+        tags: Optional[list] = None, job_id: str = "") -> dict:
     m = get_memory()
     content = redact(content)
     metadata: dict = {}
     if category:
         metadata["category"] = category
+    if job_id:
+        metadata["job_id"] = job_id  # lets a retried queue job detect it already wrote
     auto = _auto_tag(content)
     explicit = [t for t in (tags or []) if isinstance(t, str) and t.strip()]
     merged = sorted(set(auto) | set(explicit))
     if merged:
         metadata["tags"] = merged
-    result = m.add(
-        content,
-        user_id=settings.mem0_user_id,
-        agent_id=_agent_id(agent_id),
-        infer=settings.mem0_infer if infer is None else infer,
-        metadata=metadata if metadata else None,
-    )
-    return result
+    use_infer = settings.mem0_infer if infer is None else infer
+    kwargs = dict(user_id=settings.mem0_user_id, agent_id=_agent_id(agent_id))
+    if not use_infer:
+        return m.add(content, infer=False, metadata=metadata or None, **kwargs)
+
+    # infer=True: mem0 2.0.x returns [] when the LLM's JSON is not in the shape it
+    # expects (qwen2.5:7b often answers {"message": ...}), swallows extraction
+    # errors, and crashes on {"memory": ["plain string"]}. Any of these used to
+    # drop the write silently. Store the raw text instead; a genuine duplicate
+    # this creates is merged by the nightly dedup job.
+    capture = _ThreadErrorCapture()
+    mem0_log = logging.getLogger("mem0.memory.main")
+    mem0_log.addHandler(capture)
+    reason = ""
+    try:
+        result = m.add(content, infer=True, metadata=metadata or None, **kwargs)
+    except Exception as e:  # mem0 bug on unexpected LLM output
+        result, reason = None, f"{type(e).__name__}: {e}"
+    finally:
+        mem0_log.removeHandler(capture)
+    if capture.errors:
+        reason = "; ".join(capture.errors)
+    elif not reason and not _has_results(result):
+        reason = "inference extracted nothing"
+    if not reason:
+        return result
+    logger.warning("infer=True produced no memory (%s); storing raw text", reason[:200])
+    fallback_meta = {**metadata, "infer_fallback": reason[:200]}
+    return m.add(content, infer=False, metadata=fallback_meta, **kwargs)
+
+
+def _has_results(result) -> bool:
+    if isinstance(result, dict):
+        result = result.get("results", [])
+    return bool(result)
+
+
+def ollama_up(timeout: float = 3.0) -> bool:
+    """Cheap reachability check for the Ollama host (it may be a desktop that sleeps)."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"{settings.ollama_base_url.rstrip('/')}/api/tags", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def job_written(job_id: str) -> bool:
+    """True when a memory carrying this queue job_id already exists."""
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT 1 FROM {_MEM_TABLE} WHERE payload->>'job_id' = %s LIMIT 1", (job_id,))
+            return cur.fetchone() is not None
+    except psycopg2.errors.UndefinedTable:
+        return False  # fresh install: mem0 creates its table on the first write
+    finally:
+        conn.close()
 
 
 def search(query: str, limit: int = 5, agent_id: str = "") -> list[dict]:

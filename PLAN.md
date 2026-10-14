@@ -19,11 +19,11 @@
 - [ ] Thread safety: create the mem0 `Memory` once at startup (or behind a lock) — *lock added on `hardening/p0`; startup init still open* — `get_memory()` lazy init can race under `to_thread`. mem0 2.0 stores themselves are thread-safe (SQLite history has a lock, pgvector uses `ThreadedConnectionPool`); verify against the pinned version
 - [x] Pin MCP server deps to prod versions (mcp 1.27.1, mem0ai 2.0.2; unpinned would pull mcp 2.3.0) — *done on branch `hardening/p0`, not deployed*
 - [ ] mem0 history DB lives in `~/.mem0` inside the container — lost on every restart. Move to a PVC or disable, decide together with lifecycle metadata
-- [ ] Start queue worker at app startup (lifespan), not lazily on first `enqueue` — jobs left in Redis after a restart currently wait for the next `add_memory`
-- [ ] Replace BLPOP list with Redis Stream + consumer group (`XADD` / `XREADGROUP` / `XACK`, `XAUTOCLAIM` for stuck jobs, max 3 attempts → `remnant:dlq` stream). Same process, no new Deployment
-- [ ] Retry idempotency by `job_id`, not content: store `job_id` in memory metadata and skip the write if a row with that `job_id` exists (covers crash after write, before `XACK`). Content-level dedup stays the nightly job's job
-- [ ] Claim timeout well above worst-case Ollama call (e.g. 10 min `XAUTOCLAIM` min-idle) so a slow job is never reclaimed while still running
-- [ ] Queue metrics: pending, in-flight, DLQ depth, failures (replace `LLEN` gauge)
+- [x] Start queue worker at app startup (lifespan) — *done on branch `hardening/p0-followup`, not deployed*
+- [x] Redis Stream + consumer group (`XADD`/`XREADGROUP`/`XACK`, `XAUTOCLAIM`, max 5 attempts → `remnant:stream:add_memory:dead`), legacy list migrated on start. Same process, no new Deployment — *done on branch `hardening/p0-followup`, not deployed*
+- [x] Retry idempotency by `job_id` stored in memory metadata (covers crash after write, before `XACK`) — *done on branch `hardening/p0-followup`, not deployed*
+- [x] Claim timeout 10 min (`QUEUE_CLAIM_IDLE_SECONDS`) — *done on branch `hardening/p0-followup`, not deployed*
+- [x] Queue metrics: `remnant_queue_depth`/`_pending`/`_dead` — *done on branch `hardening/p0-followup`, not deployed*
 - [x] Refuse to start when `BEARER_TOKEN` is empty, `change-me` or < 16 chars; removed `change-me` from manifest/.env.example/README; constant-time compare — *done on branch `hardening/p0`, not deployed*
 - [ ] Web UI auth: UI proxy injects the bearer token server-side, so anyone reaching `remnant.prod.threshold.se` has full read/write/delete/export. Decide: Keycloak via oauth2-proxy / gateway auth, or drop the UI HTTPRoute until auth exists
 - [x] Fix env-var drift: accept `REMNANT_USER_ID`/`REMNANT_AGENT_ID`, keep `MEM0_*` — *done on branch `hardening/p0`, not deployed*
@@ -31,6 +31,10 @@
 - [ ] One-off cleanup of existing memories containing secrets — *pass 1 done 2026-10-14 (32 rows + 102 archive); pass 2 with redact.py rules prepared (64 + 38 rows), awaiting run*
 - [x] `/metrics`, `/api/stats`, list, export, `get_all_memories` via SQL without vectors (root cause of the 3× OOM: mem0 `get_all` loads every embedding). Stopgap 1Gi limit in k8s-gitops c46e6ae8 can go back down after deploy — *done on branch `hardening/p0`, not deployed*
 - [x] Read paths (list/export/stats/metrics) work while Ollama is offline — tested with Ollama unreachable — *done on branch `hardening/p0`, not deployed*
+
+- [x] **infer=True silently dropped writes in prod** (found 2026-10-14): mem0 2.0.2 + qwen2.5:7b returns `[]` (model answers `{"message": ...}`) or crashes on `{"memory": ["string"]}`; the old worker logged "Processed". Raw text is now stored as fallback with `infer_fallback` metadata — *done on branch `hardening/p0-followup`, not deployed*
+- [ ] Decide: make `add_memory` default `infer=false` (original Phase 10 design, "Claude decides what to save"), or pick an extraction model that follows mem0's JSON format
+- [x] Disable mem0 PostHog telemetry (`MEM0_TELEMETRY=false` in the image) — *branch only*
 
 ### P1 — memory quality
 - [ ] Lifecycle metadata on every memory: `status` (active | superseded | historical | uncertain), `superseded_by`, `valid_from`, `source` (agent_id, client, session_id, hook vs manual), keep `created_at`/`updated_at`
