@@ -251,7 +251,16 @@ All config via environment variables (see `.env.example`):
 
 ### Redis async queue (optional)
 
-When `REDIS_URL` is set, `add_memory` calls are pushed to a Redis list (`remnant:queue:add_memory`) and processed by a background asyncio worker. The caller gets an immediate response (`{"queued": true, "job_id": "..."}`) instead of blocking while Ollama runs LLM extraction (which can take 15–17 s with `infer=true`).
+When `REDIS_URL` is set, `add_memory` calls are added to a Redis Stream (`remnant:stream:add_memory`, consumer group `remnant-workers`) and written by a worker inside the MCP process. The caller gets an immediate response (`{"queued": true, "job_id": "..."}`) instead of blocking while Ollama runs LLM extraction (which can take 15–17 s with `infer=true`).
+
+Delivery is at-least-once and safe to retry:
+- content is redacted before it is queued; a job is acknowledged only after the memory is written
+- jobs from a crashed or restarted pod are reclaimed after `QUEUE_CLAIM_IDLE_SECONDS` (default 600)
+- the `job_id` is stored in the memory's metadata, so a retry after a crash never writes twice
+- after `QUEUE_MAX_ATTEMPTS` failures (default 5) a job moves to `remnant:stream:add_memory:dead`
+- the worker starts with the app and migrates any jobs left in the old `remnant:queue:add_memory` list
+
+Inspect dead jobs with `XRANGE remnant:stream:add_memory:dead - +`.
 
 Without `REDIS_URL` the behaviour is unchanged — writes are synchronous.
 
@@ -268,7 +277,7 @@ redis:
     key: password
 ```
 
-The queue depth is exported as `remnant_queue_depth` on the `/metrics` endpoint.
+`/metrics` exports `remnant_queue_depth` (pending + not yet delivered), `remnant_queue_pending` and `remnant_queue_dead`.
 
 ---
 
