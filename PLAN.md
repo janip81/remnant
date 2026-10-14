@@ -26,7 +26,7 @@
 - [ ] Queue metrics: pending, in-flight, DLQ depth, failures (replace `LLEN` gauge)
 - [x] Refuse to start when `BEARER_TOKEN` is empty, `change-me` or < 16 chars; removed `change-me` from manifest/.env.example/README; constant-time compare — *done on branch `hardening/p0`, not deployed*
 - [ ] Web UI auth: UI proxy injects the bearer token server-side, so anyone reaching `remnant.prod.threshold.se` has full read/write/delete/export. Decide: Keycloak via oauth2-proxy / gateway auth, or drop the UI HTTPRoute until auth exists
-- [ ] Fix env-var drift: docs say `REMNANT_USER_ID`, code reads `MEM0_USER_ID` (accept both via pydantic alias)
+- [x] Fix env-var drift: accept `REMNANT_USER_ID`/`REMNANT_AGENT_ID`, keep `MEM0_*` — *done on branch `hardening/p0`, not deployed*
 - [ ] Secret redaction before storage (*server-side `src/redact.py` in add/update done on `hardening/p0`, not deployed; hook-side not needed since all writes go through the server*): session-end/pre-compact hooks store raw "Recent commands" incl. `Authorization: Bearer …`. Redact in hooks AND server-side in `add` (Bearer tokens, `password=`/`token=`/`secret=` values, `-p<pw>`, `<path:…>` is fine). 2026-10-14 scan: 5 memories with Bearer tokens, ~42 broader matches
 - [ ] One-off cleanup of existing memories containing secrets — *pass 1 done 2026-10-14 (32 rows + 102 archive); pass 2 with redact.py rules prepared (64 + 38 rows), awaiting run*
 - [x] `/metrics`, `/api/stats`, list, export, `get_all_memories` via SQL without vectors (root cause of the 3× OOM: mem0 `get_all` loads every embedding). Stopgap 1Gi limit in k8s-gitops c46e6ae8 can go back down after deploy — *done on branch `hardening/p0`, not deployed*
