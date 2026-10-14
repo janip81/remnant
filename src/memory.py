@@ -9,6 +9,7 @@ from mem0 import Memory
 from mem0.configs.base import MemoryConfig, EmbedderConfig, LlmConfig, VectorStoreConfig
 
 from config import settings
+from redact import redact
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +235,78 @@ def get_job_run(run_id: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Direct read paths — plain SQL on the mem0 table, no vectors, no Ollama.
+# mem0's get_all() selects every embedding (~25 KB per row as Python floats),
+# which OOM-killed the pod at 512Mi; it also needs Ollama just to initialise.
+# Category/tags follow the same precedence as main._extract_meta: a nested
+# payload.metadata object (older rows) wins over top-level keys (newer rows).
+# ---------------------------------------------------------------------------
+
+_MEM_TABLE = "mem0"
+_META = ("(CASE WHEN jsonb_typeof(payload->'metadata') = 'object' "
+         "THEN payload->'metadata' ELSE payload END)")
+
+
+def _row_to_result(row: dict) -> dict:
+    """Shape a SQL row like a mem0 get_all() item, so callers need no changes."""
+    meta = {"category": row["category"] or "", "tags": row["tags"] or []}
+    return {
+        "id": str(row["id"]),
+        "memory": row["memory"] or "",
+        "agent_id": row["agent_id"] or "",
+        "created_at": row["created_at"] or "",
+        "updated_at": row["updated_at"] or "",
+        "metadata": meta,
+    }
+
+
+def list_rows(agent_id: str = "") -> list[dict]:
+    """All memories for the configured user, without vectors."""
+    sql = (f"SELECT id, payload->>'data' AS memory, payload->>'agent_id' AS agent_id, "
+           f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
+           f"{_META}->>'category' AS category, "
+           f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags "
+           f"FROM {_MEM_TABLE} WHERE payload->>'user_id' = %s")
+    params: list = [settings.mem0_user_id]
+    if agent_id:
+        sql += " AND payload->>'agent_id' = %s"
+        params.append(agent_id)
+    conn = _db_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return [_row_to_result(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def stats() -> dict:
+    """Aggregate counts in SQL — same shape as the old in-Python /api/stats."""
+    where = "WHERE payload->>'user_id' = %s"
+    p = (settings.mem0_user_id,)
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT count(*), min(payload->>'created_at'), max(payload->>'created_at') "
+                        f"FROM {_MEM_TABLE} {where}", p)
+            total, first, last = cur.fetchone()
+            cur.execute(f"SELECT coalesce(nullif(payload->>'agent_id', ''), 'unknown'), count(*) "
+                        f"FROM {_MEM_TABLE} {where} GROUP BY 1", p)
+            by_agent = dict(cur.fetchall())
+            cur.execute(f"SELECT coalesce(nullif({_META}->>'category', ''), 'uncategorized'), count(*) "
+                        f"FROM {_MEM_TABLE} {where} GROUP BY 1", p)
+            by_category = dict(cur.fetchall())
+            cur.execute(f"SELECT t, count(*) FROM {_MEM_TABLE}, "
+                        f"jsonb_array_elements_text(CASE WHEN jsonb_typeof({_META}->'tags') = 'array' "
+                        f"THEN {_META}->'tags' ELSE '[]'::jsonb END) AS t {where} GROUP BY 1", p)
+            by_tag = dict(cur.fetchall())
+    finally:
+        conn.close()
+    return {"total": total, "first_added": first, "last_added": last,
+            "by_agent": by_agent, "by_category": by_category, "by_tag": by_tag}
+
+
+# ---------------------------------------------------------------------------
 # mem0 client
 # ---------------------------------------------------------------------------
 
@@ -267,12 +340,16 @@ def _build_config() -> MemoryConfig:
 
 
 _mem: Optional[Memory] = None
+_mem_lock = threading.Lock()
 
 
 def get_memory() -> Memory:
+    # Calls arrive from worker threads (asyncio.to_thread); build the client once.
     global _mem
     if _mem is None:
-        _mem = Memory(config=_build_config())
+        with _mem_lock:
+            if _mem is None:
+                _mem = Memory(config=_build_config())
     return _mem
 
 
@@ -285,6 +362,7 @@ VALID_CATEGORIES = {"project", "feedback", "reference", "user", "session", "inci
 
 def add(content: str, agent_id: str = "", infer: Optional[bool] = None, category: str = "", tags: Optional[list] = None) -> dict:
     m = get_memory()
+    content = redact(content)
     metadata: dict = {}
     if category:
         metadata["category"] = category
@@ -325,7 +403,7 @@ def get_all(agent_id: str = "") -> list[dict]:
 
 def update(memory_id: str, content: str) -> dict:
     m = get_memory()
-    return m.update(memory_id, content)
+    return m.update(memory_id, redact(content))
 
 
 def delete(memory_id: str) -> dict:

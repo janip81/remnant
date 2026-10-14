@@ -9,6 +9,7 @@ MCP endpoint on demand.
 Usage:
   claude mcp add remnant python3 /path/to/mcp-stdio.py
   (env vars REMNANT_URL and REMNANT_TOKEN must be set)
+  Optional REMNANT_AGENT_ID: default agent_id for add_memory calls that omit it.
 """
 
 import json
@@ -20,6 +21,7 @@ import requests
 
 URL = os.environ.get("REMNANT_URL", "").rstrip("/") + "/mcp"
 TOKEN = os.environ.get("REMNANT_TOKEN", "")
+AGENT_ID = os.environ.get("REMNANT_AGENT_ID", "").strip()
 
 HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
@@ -55,6 +57,18 @@ def http_post(payload: dict) -> Optional[dict]:
         }
 
 
+def apply_default_agent_id(msg: dict) -> None:
+    """Fill in agent_id on add_memory calls that don't set one."""
+    if not AGENT_ID or msg.get("method") != "tools/call":
+        return
+    params = msg.get("params") or {}
+    if params.get("name") != "add_memory":
+        return
+    args = params.setdefault("arguments", {})
+    if not str(args.get("agent_id") or "").strip():
+        args["agent_id"] = AGENT_ID
+
+
 def main():
     if not TOKEN:
         sys.stderr.write("REMNANT_TOKEN not set — set via env var\n")
@@ -70,6 +84,7 @@ def main():
             continue
 
         is_request = "id" in msg
+        apply_default_agent_id(msg)
         result = http_post(msg)
 
         if is_request and result is not None:

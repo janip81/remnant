@@ -32,7 +32,7 @@ metadata:
   namespace: remnant
 type: Opaque
 stringData:
-  BEARER_TOKEN: "change-me"
+  BEARER_TOKEN: ""  # ← required: openssl rand -hex 32 (server refuses to start without it)
 
 ---
 # ── Settings ConfigMap ─────────────────────────────────────────────────────────
