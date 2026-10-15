@@ -275,3 +275,70 @@ def _count(conn):
         n = cur.fetchone()[0]
     conn.commit()
     return n
+
+
+# --- Lifecycle slice 1 -------------------------------------------------------
+
+def test_candidates_and_superseded_excluded_by_default(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    _insert("cand morbius.prod.threshold.se", {"state": "candidate"})
+    _insert("old morbius.prod.threshold.se", {"state": "superseded"})
+    assert texts(mem.keyword_search("morbius.prod.threshold.se", 5)) == [DOCS[0]]
+    got = texts(mem.keyword_search("morbius.prod.threshold.se", 5, states=("active", "superseded")))
+    assert sorted(got) == sorted([DOCS[0], "old morbius.prod.threshold.se"])
+    vec = texts(mem.search("x", limit=50))
+    assert "cand morbius.prod.threshold.se" not in vec and "old morbius.prod.threshold.se" not in vec
+    assert "cand morbius.prod.threshold.se" in texts(mem.search("x", limit=50, states=("active", "candidate")))
+
+
+def test_review_promote_reject_conflict_notfound(mem):
+    import uuid
+    cid = str(uuid.uuid4())
+    conn = psycopg2.connect(URL)
+    with conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO mem0 VALUES (%s, '[1,0,0]', %s)",
+                    (cid, json_dumps({"user_id": "u", "data": "llm chatter", "state": "candidate"})))
+    conn.close()
+    assert mem.review(cid, "promote", "jani", "looks right") == {"ok": True, "id": cid, "state": "active"}
+    again = mem.review(cid, "reject")
+    assert again["ok"] is False and again["error"] == "conflict" and again["state"] == "active"
+    assert mem.review(str(uuid.uuid4()), "promote")["error"] == "not found"
+    assert mem.review(cid, "delete")["ok"] is False
+    conn = psycopg2.connect(URL)
+    with conn.cursor() as cur:
+        cur.execute("SELECT payload->>'reviewed_by', payload->>'review_note' FROM mem0 WHERE id = %s", (cid,))
+        assert cur.fetchone() == ("jani", "looks right")
+    conn.close()
+
+
+def test_expired_checkpoint_not_restored(mem):
+    _insert("cp gone", {"kind": "checkpoint", "session_id": "exp", "expires_at": "2026-01-01T00:00:00+00:00",
+                        "captured_at": "2026-01-01T00:00:00+00:00"})
+    assert mem.get_checkpoint("exp") is None
+
+
+def test_dedup_ignores_candidates(mem):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import dedup_job
+    import psycopg2.extras
+    _insert("same text", {"hash": "h1", "created_at": "2026-01-01"})
+    _insert("same text", {"hash": "h1", "created_at": "2026-01-02", "state": "candidate"})
+    conn = psycopg2.connect(URL)
+    psycopg2.extras.register_uuid(conn_or_curs=conn)
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS job_runs (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                started_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ, phase TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running', memories_scanned INT DEFAULT 0, memories_changed INT DEFAULT 0,
+                rules_added INT DEFAULT 0, duration_seconds FLOAT, error TEXT)""")
+        dedup_job.phase1_hash_dedup(conn, dry_run=False)
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM mem0 WHERE payload->>'hash' = 'h1'")
+            assert cur.fetchone()[0] == 2          # the candidate is not deduplicated away
+    finally:
+        conn.rollback(); conn.close()
+
+
+def json_dumps(o):
+    import json
+    return json.dumps(o)
