@@ -60,7 +60,8 @@ CHECKPOINT_SQL = ("(coalesce(payload->>'kind', '') = 'checkpoint' "
 # *start* with the hook heading. LLM-merged rows that merely contain the section
 # header may carry durable facts — they are skipped by dedup but never expired.
 EXPIRABLE_SQL = ("(coalesce(payload->>'kind', '') = 'checkpoint' "
-                 "OR coalesce(payload->>'data', '') LIKE '## Session State%%')")
+                 "OR coalesce(payload->>'data', '') LIKE '## Session State%%' "
+                 "OR coalesce(payload->>'data', '') LIKE '## Codex session state%%')")
 CHECKPOINT_TTL_DAYS = int(os.environ.get("CHECKPOINT_TTL_DAYS", "7"))
 # Stop starting new LLM merges after this many seconds (one merge can take ~20s
 # on the shared Ollama GPU and delays interactive search embeddings).

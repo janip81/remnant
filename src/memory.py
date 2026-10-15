@@ -256,10 +256,11 @@ _MEM_TABLE = "mem0"
 # '%%' because these fragments go into parameterised SQL.
 # coalesce: payload->>'kind' is NULL for normal memories, and NOT (NULL OR ...)
 # would be NULL, i.e. exclude every normal row.
-# '## Codex session state' is not listed yet: Codex's own hook still restores
-# its snapshot through search_memory until it moves to get_checkpoint.
+# Codex writes its own snapshots ('## Codex session state') as checkpoints via
+# save_checkpoint since 2026-10-15; its legacy add_memory snapshots are excluded too.
 _CHECKPOINT = ("(coalesce(payload->>'kind', '') = 'checkpoint' "
                "OR coalesce(payload->>'data', '') LIKE '## Session State%%' "
+               "OR coalesce(payload->>'data', '') LIKE '## Codex session state%%' "
                "OR coalesce(payload->>'data', '') LIKE '%%### What the user was working on%%')")
 _SEARCHABLE = f"NOT {_CHECKPOINT}"
 CHECKPOINT_TTL_DAYS = int(os.environ.get("CHECKPOINT_TTL_DAYS", "7"))
