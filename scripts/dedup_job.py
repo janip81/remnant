@@ -49,6 +49,17 @@ TAGGING_MODE = os.environ.get("TAGGING_MODE", "keyword")  # keyword | llm | hybr
 ARCHIVE_TABLE = "mem0_archive"
 MEM_TABLE = "mem0"
 
+# Session checkpoints (hook snapshots) are never merged or LLM-tagged: they are
+# replaced per session and expire. Same predicate as src/memory.py _CHECKPOINT.
+CHECKPOINT_SQL = ("(coalesce(payload->>'kind', '') = 'checkpoint' "
+                  "OR coalesce(payload->>'data', '') LIKE '## Session State%%' "
+                  "OR coalesce(payload->>'data', '') LIKE '## Codex session state%%' "
+                  "OR coalesce(payload->>'data', '') LIKE '%%### What the user was working on%%')")
+CHECKPOINT_TTL_DAYS = int(os.environ.get("CHECKPOINT_TTL_DAYS", "7"))
+# Stop starting new LLM merges after this many seconds (one merge can take ~20s
+# on the shared Ollama GPU and delays interactive search embeddings).
+DEDUP_BUDGET_SECONDS = int(os.environ.get("DEDUP_BUDGET_SECONDS", "1800"))
+
 DEFAULT_SEMANTIC_THRESHOLD = 0.92
 MIN_CLUSTER_SIZE = 2
 
@@ -279,7 +290,7 @@ def phase0_llm_tagging(conn, dry_run: bool) -> int:
                 finish_job_phase(conn, run_id, "completed", 0, 0)
                 return 0
 
-            cur.execute(f"SELECT id, payload FROM {MEM_TABLE}")
+            cur.execute(f"SELECT id, payload FROM {MEM_TABLE} WHERE NOT {CHECKPOINT_SQL}")
             rows = cur.fetchall()
 
         # Process any memory not yet reviewed by LLM — includes keyword-tagged ones
@@ -387,6 +398,8 @@ def find_semantic_clusters(
         FROM {MEM_TABLE} a
         JOIN {MEM_TABLE} b ON a.id < b.id
         WHERE (a.vector <=> b.vector) < %s
+          AND NOT {CHECKPOINT_SQL.replace("payload", "a.payload")}
+          AND NOT {CHECKPOINT_SQL.replace("payload", "b.payload")}
         ORDER BY similarity DESC
         """,
         (cosine_distance,),
@@ -497,6 +510,37 @@ def store_memory_direct(content: str, category: str = "") -> Optional[str]:
     return None
 
 
+def phase_expire_checkpoints(conn, dry_run: bool) -> int:
+    """Archive checkpoints past expires_at and legacy snapshots older than the TTL."""
+    log.info("Checkpoint expiry (ttl=%dd)", CHECKPOINT_TTL_DAYS)
+    run_id = start_job_phase(conn, "checkpoint-expiry")
+    expired = 0
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            ensure_archive_table(cur)
+            cur.execute(
+                f"""SELECT id FROM {MEM_TABLE} WHERE {CHECKPOINT_SQL} AND (
+                        (payload ? 'expires_at' AND (payload->>'expires_at')::timestamptz < now())
+                     OR (NOT payload ? 'expires_at'
+                         AND (payload->>'created_at')::timestamptz < now() - make_interval(days => %s)))""",
+                (CHECKPOINT_TTL_DAYS,))
+            ids = [uuid.UUID(str(r["id"])) for r in cur.fetchall()]
+            log.info("Found %d expired checkpoints/snapshots", len(ids))
+            if ids and not dry_run:
+                for i in range(0, len(ids), 200):
+                    batch = ids[i:i + 200]
+                    archive_rows(cur, batch, "checkpoint-expired")
+                    delete_rows(cur, batch)
+                    conn.commit()
+            expired = len(ids)
+        finish_job_phase(conn, run_id, "completed", scanned=expired, changed=0 if dry_run else expired)
+    except Exception as e:
+        conn.rollback()
+        finish_job_phase(conn, run_id, "failed", error=str(e))
+        log.error("Checkpoint expiry failed: %s", e)
+    return expired
+
+
 def phase2_semantic_dedup(conn, threshold: float, dry_run: bool) -> int:
     log.info("Phase 2: semantic dedup (threshold=%.2f)", threshold)
     run_id = start_job_phase(conn, "semantic-dedup")
@@ -506,13 +550,20 @@ def phase2_semantic_dedup(conn, threshold: float, dry_run: bool) -> int:
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             ensure_archive_table(cur)
             clusters = find_semantic_clusters(cur, threshold)
+            conn.commit()
+            started = time.monotonic()
 
-            for cluster_ids in clusters:
+            for n, cluster_ids in enumerate(clusters):
+                if time.monotonic() - started > DEDUP_BUDGET_SECONDS:
+                    log.info("Time budget of %ds reached after %d/%d clusters; the rest waits for the next run",
+                             DEDUP_BUDGET_SECONDS, n, len(clusters))
+                    break
                 cur.execute(
                     f"SELECT id, payload FROM {MEM_TABLE} WHERE id = ANY(%s)",
                     (cluster_ids,),
                 )
                 rows = cur.fetchall()
+                conn.commit()  # never hold a transaction open across the LLM call
 
                 categories = [
                     (_extract_meta(r["payload"]).get("category") or "")
@@ -618,6 +669,7 @@ def main() -> None:
                 log.warning("Phase 0 skipped: Ollama unreachable")
 
         if not args.phase2_only:
+            phase_expire_checkpoints(conn, args.dry_run)
             phase1_hash_dedup(conn, args.dry_run)
 
         if not args.phase1_only:
