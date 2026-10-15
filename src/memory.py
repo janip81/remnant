@@ -368,13 +368,42 @@ _mem: Optional[Memory] = None
 _mem_lock = threading.Lock()
 
 
+# nomic-embed-text runs with Ollama's default 2048-token context; longer input
+# fails with "the input length exceeds the context length" and the write is
+# lost (a 6105-char memory was dead-lettered on 2026-10-15). The full text is
+# still stored — only the embedding input is capped, so a long memory is found
+# by its first part. ~3 chars/token for code-heavy text keeps 4000 chars safe.
+MAX_EMBED_CHARS = int(os.environ.get("MAX_EMBED_CHARS", "4000"))
+
+
+def _cap_embedding_input(embedder) -> None:
+    original = embedder.embed
+
+    def embed(text, memory_action=None, *args, **kwargs):
+        if isinstance(text, str) and len(text) > MAX_EMBED_CHARS:
+            text = text[:MAX_EMBED_CHARS]
+        return original(text, memory_action, *args, **kwargs)
+
+    embedder.embed = embed
+    if hasattr(embedder, "embed_batch"):          # used by mem0's infer=True pipeline
+        original_batch = embedder.embed_batch
+
+        def embed_batch(texts, memory_action=None, *args, **kwargs):
+            texts = [t[:MAX_EMBED_CHARS] if isinstance(t, str) else t for t in texts]
+            return original_batch(texts, memory_action, *args, **kwargs)
+
+        embedder.embed_batch = embed_batch
+
+
 def get_memory() -> Memory:
     # Calls arrive from worker threads (asyncio.to_thread); build the client once.
     global _mem
     if _mem is None:
         with _mem_lock:
             if _mem is None:
-                _mem = Memory(config=_build_config())
+                m = Memory(config=_build_config())
+                _cap_embedding_input(m.embedding_model)
+                _mem = m
     return _mem
 
 
