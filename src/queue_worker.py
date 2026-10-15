@@ -71,10 +71,11 @@ async def _get_client():
     return _client
 
 
-async def enqueue(content: str, agent_id: str, infer: bool, category: str, tags: list) -> str:
+async def enqueue(content: str, agent_id: str, infer: bool, category: str, tags: list, **extra) -> str:
+    """extra: kind="checkpoint" with session_id/project routes to save_checkpoint."""
     job_id = str(uuid.uuid4())
     job = {"job_id": job_id, "content": redact(content), "agent_id": agent_id,
-           "infer": infer, "category": category, "tags": tags}
+           "infer": infer, "category": category, "tags": tags, **extra}
     client = await _get_client()
     await client.xadd(STREAM, {"job": json.dumps(job)})
     ensure_worker()
@@ -158,7 +159,14 @@ async def _process_one(client, msg_id: str, fields: dict) -> None:
         return
     attempts = await client.hincrby(ATTEMPTS, msg_id, 1)
     try:
-        if not infer and job_id and await asyncio.to_thread(mem_store.job_written, job_id):
+        if job.get("kind") == "checkpoint":
+            # replace-by-session is idempotent, so a retry simply writes it again
+            # ordered by captured_at, so a late retry never replaces a newer capture
+            await asyncio.to_thread(mem_store.save_checkpoint, job.get("session_id", ""), job["content"],
+                                    job.get("agent_id", ""), job.get("project", ""),
+                                    job.get("captured_at", ""), job.get("capture_id", ""))
+            logger.info("Saved checkpoint for session %s (attempt %d)", job.get("session_id"), attempts)
+        elif not infer and job_id and await asyncio.to_thread(mem_store.job_written, job_id):
             logger.info("Queue job %s already written; acking retry", job_id)
         else:
             result = await asyncio.to_thread(

@@ -24,7 +24,7 @@ def mem(monkeypatch):
     conn = psycopg2.connect(URL)
     with conn, conn.cursor() as cur:
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        cur.execute("DROP TABLE IF EXISTS mem0")
+        cur.execute("DROP TABLE IF EXISTS mem0, mem0_archive")
         cur.execute("CREATE TABLE mem0 (id uuid PRIMARY KEY, vector vector(3), payload jsonb)")
         for d in DOCS:
             cur.execute("INSERT INTO mem0 VALUES (gen_random_uuid(), '[1,0,0]', jsonb_build_object('user_id','u','data',%s::text))", (d,))
@@ -86,3 +86,143 @@ def test_existing_column_missing_index_is_recreated(mem):
         cur.execute("SELECT 1 FROM pg_indexes WHERE indexname = 'mem0_fts_idx'")
         assert cur.fetchone()
     conn.close()
+
+
+# --- Session checkpoints ---------------------------------------------------
+
+SNAP = "## Session State (session-end)\n\nalpha morbius.prod.threshold.se worked on remnant"
+
+
+class FakeMem0ForDB:
+    """mem0 Memory stand-in that writes rows the way mem0 2.0.2 does (top-level metadata keys)."""
+
+    class embedding_model:
+        @staticmethod
+        def embed(text, kind):
+            return [1, 0, 0]
+
+    def add(self, content, user_id, agent_id, infer, metadata):
+        import json, uuid
+        mid = str(uuid.uuid4())
+        payload = {"data": content, "user_id": user_id, "agent_id": agent_id,
+                   "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()), **metadata}
+        conn = psycopg2.connect(URL)
+        with conn, conn.cursor() as cur:
+            cur.execute("INSERT INTO mem0 VALUES (%s, '[1,0,0]', %s)", (mid, json.dumps(payload)))
+        conn.close()
+        time.sleep(0.01)
+        return {"results": [{"id": mid, "event": "ADD"}]}
+
+
+def _insert(data, extra=None):
+    import json, uuid
+    conn = psycopg2.connect(URL)
+    with conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO mem0 VALUES (%s, '[1,0,0]', %s)",
+                    (str(uuid.uuid4()), json.dumps({"user_id": "u", "data": data, **(extra or {})})))
+    conn.close()
+
+
+def test_snapshots_excluded_from_keyword_search_unless_asked(mem):
+    _insert(SNAP)
+    _insert("## Comprehensive Merged Memory\n\n### What the user was working on\n- morbius.prod.threshold.se")
+    _insert("checkpoint text about morbius.prod.threshold.se", {"kind": "checkpoint", "session_id": "s1"})
+    assert texts(mem.keyword_search("morbius.prod.threshold.se", 5)) == [DOCS[0]]
+    assert len(mem.keyword_search("morbius.prod.threshold.se", 5, include_checkpoints=True)) == 4
+
+
+def test_snapshots_excluded_from_vector_search(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    _insert(SNAP)
+    out = texts(mem.search("anything", limit=50))
+    assert SNAP not in out and len(out) == len(DOCS)
+    assert SNAP in texts(mem.search("anything", limit=50, include_checkpoints=True))
+
+
+def test_checkpoint_is_replaced_per_session_and_read_back_by_id(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    mem.save_checkpoint("sess-1", "first state", project="remnant")
+    r = mem.save_checkpoint("sess-1", "second state, REMNANT_TOKEN=" + "f" * 40, project="remnant")
+    mem.save_checkpoint("sess-2", "other session")
+    assert r["removed"] == 1
+    cp = mem.get_checkpoint("sess-1")
+    assert cp["memory"].startswith("second state") and "f" * 40 not in cp["memory"]
+    assert cp["project"] == "remnant"
+    assert mem.get_checkpoint("nope") is None
+    conn = psycopg2.connect(URL)
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM mem0 WHERE payload->>'kind' = 'checkpoint'")
+        assert cur.fetchone()[0] == 2                     # one per session
+    conn.close()
+
+
+def test_dedup_expiry_archives_old_snapshots_and_expired_checkpoints(mem, monkeypatch):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import dedup_job
+    monkeypatch.setattr(dedup_job, "DATABASE_URL", URL, raising=False)
+    _insert(SNAP, {"created_at": "2026-01-01T00:00:00+00:00"})                       # legacy, old
+    _insert(SNAP, {"created_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())})  # legacy, fresh
+    _insert("cp old", {"kind": "checkpoint", "session_id": "a", "expires_at": "2026-01-01T00:00:00+00:00"})
+    _insert("cp live", {"kind": "checkpoint", "session_id": "b", "expires_at": "2999-01-01T00:00:00+00:00"})
+    merged = "## Comprehensive Merged Memory\n\n### What the user was working on\n- durable fact"
+    _insert(merged, {"created_at": "2026-01-01T00:00:00+00:00"})               # old LLM-merged row
+    import psycopg2.extras
+    conn = psycopg2.connect(URL)
+    psycopg2.extras.register_uuid(conn_or_curs=conn)   # as dedup_job.get_conn() does
+    with conn, conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS job_runs (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            started_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ, phase TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'running', memories_scanned INT DEFAULT 0, memories_changed INT DEFAULT 0,
+            rules_added INT DEFAULT 0, duration_seconds FLOAT, error TEXT)""")
+    try:
+        _check_expiry(dedup_job, conn, merged)
+    finally:
+        conn.rollback(); conn.close()
+
+
+def _check_expiry(dedup_job, conn, merged):
+    assert dedup_job.phase_expire_checkpoints(conn, dry_run=False) == 2
+    with conn.cursor() as cur:
+        cur.execute("SELECT payload->>'data' FROM mem0 WHERE " + dedup_job.CHECKPOINT_SQL.replace("%%", "%"))
+        assert sorted(r[0][:7] for r in cur.fetchall()) == ["## Comp", "## Sess", "cp live"]
+        cur.execute("SELECT count(*) FROM mem0_archive WHERE archive_reason = 'checkpoint-expired'")
+        assert cur.fetchone()[0] == 2
+        cur.execute("SELECT count(*) FROM mem0 WHERE payload->>'data' = %s", (merged,))
+        assert cur.fetchone()[0] == 1                     # hidden from search, never expired
+
+
+def test_stale_retry_does_not_replace_newer_capture(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    mem.save_checkpoint("s", "newer", captured_at="2026-10-15T10:05:00+00:00")
+    mem.save_checkpoint("s", "older retry", captured_at="2026-10-15T10:00:00+00:00")
+    assert mem.get_checkpoint("s")["memory"] == "newer"
+
+
+def test_concurrent_saves_keep_exactly_the_newest(mem, monkeypatch):
+    import threading
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    caps = [f"2026-10-15T10:0{i}:00+00:00" for i in range(6)]
+    threads = [threading.Thread(target=mem.save_checkpoint, args=("c", f"state {i}"), kwargs={"captured_at": c})
+               for i, c in enumerate(caps)]
+    [t.start() for t in threads]; [t.join() for t in threads]
+    conn = psycopg2.connect(URL)
+    with conn.cursor() as cur:
+        cur.execute("SELECT payload->>'data' FROM mem0 WHERE payload->>'session_id' = 'c'")
+        assert [r[0] for r in cur.fetchall()] == ["state 5"]
+    conn.close()
+
+
+def test_mixed_timezone_offsets_order_by_real_time(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    mem.save_checkpoint("tz", "newer", captured_at="2026-10-15T09:30:00+00:00")      # 09:30 UTC
+    mem.save_checkpoint("tz", "older", captured_at="2026-10-15T10:00:00+01:00")      # 09:00 UTC
+    assert mem.get_checkpoint("tz")["memory"] == "newer"
+
+
+def test_same_instant_tie_broken_by_capture_id_not_row_id(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    t = "2026-10-15T10:00:00.123456+00:00"
+    mem.save_checkpoint("tie", "b-capture", captured_at=t, capture_id="bbbb")
+    mem.save_checkpoint("tie", "a-capture", captured_at=t, capture_id="aaaa")
+    mem.save_checkpoint("tie", "b-capture retry", captured_at=t, capture_id="bbbb")
+    assert mem.get_checkpoint("tie")["memory"].startswith("b-capture")

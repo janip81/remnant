@@ -14,6 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 INPUT=$(cat)
 SOURCE=$(echo "$INPUT" | jq -r '.source // "startup"' 2>/dev/null || echo "startup")
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // ""' 2>/dev/null || echo "")
 CWD=$(echo "$INPUT" | jq -r '.cwd // ""' 2>/dev/null || echo "")
 PROJECT=$(basename "$CWD")
 
@@ -42,6 +43,22 @@ search_direct() {
     jq -r '.result.content[0].text // ""' 2>/dev/null || echo ""
 }
 
+# Helper: this session's own checkpoint, by exact session_id (never by similarity)
+checkpoint_direct() {
+  if [ -z "$MEMORY_URL" ] || [ -z "$MEMORY_TOKEN" ] || [ -z "$SESSION_ID" ]; then
+    echo ""
+    return
+  fi
+  local payload
+  payload=$(jq -cn --arg s "$SESSION_ID" \
+    '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"get_checkpoint","arguments":{"session_id":$s}},"id":1}')
+  curl -sf --max-time 10 -X POST "${MEMORY_URL}/mcp" \
+    -H "Authorization: Bearer ${MEMORY_TOKEN}" -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" -d "$payload" 2>/dev/null | \
+    grep '^data:' | sed 's/^data: //' | jq -r '.result.content[0].text // ""' 2>/dev/null | \
+    grep -v '^No checkpoint for this session' || echo ""
+}
+
 if [ "$SOURCE" = "startup" ]; then
   cat <<'EOF'
 ## Mem0 Session Bootstrap
@@ -57,11 +74,16 @@ EOF
 
 elif [ "$SOURCE" = "resume" ]; then
   # Do the search directly so Claude gets results even if MCP is slow to connect
-  RESULTS=$(search_direct "project status recent work session $PROJECT $CWD" 6)
+  CHECKPOINT=$(checkpoint_direct)
+  RESULTS=$(search_direct "project status recent work $PROJECT $CWD" 6)
   cat <<EOF
 ## Mem0 Session Resumed
 
-This is a resumed session. Relevant memories retrieved directly:
+This is a resumed session.
+${CHECKPOINT:+### This session's last checkpoint
+$CHECKPOINT
+}
+Relevant memories retrieved directly:
 
 ${RESULTS:-*(no memories found — MCP may still be connecting)*}
 
@@ -71,11 +93,16 @@ EOF
 elif [ "$SOURCE" = "compact" ]; then
   # Context was just lost — fetch the pre-compaction summary and recent session state directly.
   # Do NOT rely on Claude calling search_memory; MCP may not be connected yet.
-  RESULTS=$(search_direct "session state pre-compaction $PROJECT $CWD recent work" 8)
+  CHECKPOINT=$(checkpoint_direct)
+  RESULTS=$(search_direct "$PROJECT $CWD recent work decisions" 6)
   cat <<EOF
 ## Mem0 Post-Compaction Recovery
 
-Context was just compacted. Memories retrieved directly (HTTP fallback — MCP may not be connected yet):
+Context was just compacted.
+${CHECKPOINT:+### This session's latest checkpoint (see "captured" time — may predate the compaction)
+$CHECKPOINT
+}
+Related memories retrieved directly (HTTP fallback — MCP may not be connected yet):
 
 ${RESULTS:-*(no memories found — try calling search_memory manually once MCP reconnects)*}
 
