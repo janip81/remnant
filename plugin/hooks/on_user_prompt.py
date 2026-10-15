@@ -18,10 +18,13 @@ Input: hook JSON on stdin. Output: <memory> block or nothing. Always exits 0.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import sys
+import tempfile
+import time
 import urllib.request
 
 MAX_ITEMS = int(os.environ.get("REMNANT_INJECT_MAX_ITEMS", "3"))
@@ -30,18 +33,27 @@ CANDIDATES = 10
 TIMEOUT = float(os.environ.get("REMNANT_INJECT_TIMEOUT", "5"))
 STATE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "remnant")
 
-_IDENT = re.compile(r"[A-Za-z0-9][\w.\-/:]*[A-Za-z0-9]")
+# \w is Unicode-aware, so Swedish names (åäö-config) are identifiers too; a
+# leading '/' is kept so absolute paths match themselves.
+_IDENT = re.compile(r"/?\w[\w.\-/:]*\w")
 _ID_CHARS = re.compile(r"[\d\-._/:]")
-_BORDER = r"[\w\-/]"   # characters that continue an identifier; '.' may end a sentence
+_IPV4 = re.compile(r"\d{1,3}(\.\d{1,3}){3}")
+# Token boundaries: no identifier character before, and after it neither an
+# identifier character nor a '.' that continues one (node-a vs node-a.example.com).
+# A trailing '.' that ends a sentence is fine.
+_BEFORE = r"(?<![\w\-/.])"
+_AFTER = r"(?![\w\-/]|\.\w)"
 
 
 def identifiers(prompt: str) -> list[str]:
     """Identifier-like tokens of the prompt, lower-cased, in order, unique."""
     out = []
     for tok in _IDENT.findall(prompt):
-        t = tok.lower().rstrip(".:/")
-        if len(t) < 4 or not _ID_CHARS.search(t) or re.fullmatch(r"[\d.:/\-]+", t):
+        t = tok.lower().rstrip(".:/") if tok != "/" else tok
+        if len(t) < 4 or not _ID_CHARS.search(t):
             continue
+        if re.fullmatch(r"[\d.:/\-]+", t) and not _IPV4.fullmatch(t):
+            continue                 # bare numbers and versions (1.35) are too generic
         if t not in out:
             out.append(t)
     return out
@@ -49,7 +61,7 @@ def identifiers(prompt: str) -> list[str]:
 
 def mentions(text: str, ident: str) -> bool:
     """ident occurs in text as a whole token (not inside a longer identifier)."""
-    return re.search(rf"(?<!{_BORDER}){re.escape(ident)}(?!{_BORDER})", text, re.I) is not None
+    return re.search(rf"{_BEFORE}{re.escape(ident)}{_AFTER}", text, re.I) is not None
 
 
 def select(hits: list[dict], idents: list[str], seen: set[str]) -> list[dict]:
@@ -88,12 +100,46 @@ def save_seen(session_id: str, seen: set[str]) -> None:
         return
     try:
         os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-        tmp = cache_path(session_id) + ".tmp"
-        with open(tmp, "w") as f:
+        fd, tmp = tempfile.mkstemp(dir=STATE_DIR, prefix=".injected-")   # unique per writer
+        with os.fdopen(fd, "w") as f:
             json.dump(sorted(seen), f)
         os.replace(tmp, cache_path(session_id))      # atomic
     except OSError:
         pass
+
+
+class session_lock:
+    """Serialise read-select-write of one session's cache across concurrent prompts."""
+
+    def __init__(self, session_id: str):
+        self.path = cache_path(session_id) + ".lock" if session_id else ""
+        self.fd = None
+
+    def __enter__(self):
+        if self.path:
+            try:
+                os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+                self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+                deadline = time.monotonic() + 2
+                while True:
+                    try:
+                        fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() > deadline:
+                            raise TimeoutError("cache lock busy")
+                        time.sleep(0.05)
+            except TimeoutError:
+                os.close(self.fd)
+                self.fd = None
+                raise
+            except OSError:          # cache dir unusable: run without the cache lock
+                self.fd = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            os.close(self.fd)       # releases the lock
 
 
 def search(url: str, token: str, query: str) -> list[dict]:
@@ -103,8 +149,13 @@ def search(url: str, token: str, query: str) -> list[dict]:
     req = urllib.request.Request(f"{url.rstrip('/')}/mcp", data=json.dumps(payload).encode(), method="POST",
                                  headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json",
                                           "Accept": "application/json, text/event-stream"})
+    deadline = time.monotonic() + TIMEOUT           # total budget, not per socket read
     with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        for line in resp.read().decode("utf-8", "replace").splitlines():
+        while time.monotonic() < deadline:
+            raw = resp.readline()
+            if not raw:
+                break
+            line = raw.decode("utf-8", "replace").strip()
             if line.startswith("data:"):
                 result = json.loads(line[5:]).get("result", {})
                 text = (result.get("content") or [{}])[0].get("text", "")
@@ -129,11 +180,16 @@ def main() -> None:
         hits = search(url, token, prompt[:900])
     except Exception:
         return                                       # never block or slow the prompt
-    seen = load_seen(session_id)
-    chosen = select(hits, idents, seen)
+    try:
+        with session_lock(session_id):
+            seen = load_seen(session_id)
+            chosen = select(hits, idents, seen)
+            if chosen:
+                save_seen(session_id, seen | {str(h["id"]) for h in chosen})
+    except TimeoutError:
+        return                                       # another prompt holds the cache; skip rather than wait
     if not chosen:
         return
-    save_seen(session_id, seen | {str(h["id"]) for h in chosen})
     body = "\n\n".join(f"[{h['id'][:8]} | matches {', '.join(i for i in idents if mentions(h['memory'], i))}]\n{h['memory']}"
                        for h in chosen)
     print(f"<memory>\n{body}\n</memory>")

@@ -37,7 +37,7 @@ def load_prompt_hook(tmp_path, monkeypatch):
 def test_identifiers_from_prompt(tmp_path, monkeypatch):
     h = load_prompt_hook(tmp_path, monkeypatch)
     assert h.identifiers("why is pg-main-rw refusing on 192.168.101.11? see cluster-values.yaml") == \
-        ["pg-main-rw", "cluster-values.yaml"]
+        ["pg-main-rw", "192.168.101.11", "cluster-values.yaml"]
     assert h.identifiers("all seems green to me now") == []
     assert h.identifiers("upgrade to 1.35 tonight") == []           # bare number is not an identifier
 
@@ -65,3 +65,59 @@ def test_seen_cache_roundtrip(tmp_path, monkeypatch):
     h = load_prompt_hook(tmp_path, monkeypatch)
     h.save_seen("s-1", {"x", "y"})
     assert h.load_seen("s-1") == {"x", "y"} and h.load_seen("other") == set()
+
+
+def test_review_boundary_cases(tmp_path, monkeypatch):
+    h = load_prompt_hook(tmp_path, monkeypatch)
+    assert not h.mentions("node-a.example.com is down", "node-a")          # dotted continuation
+    assert not h.mentions("see other.main.py", "main.py")                  # dotted prefix
+    assert h.mentions("node-a. Then restart", "node-a")                    # sentence full stop
+    assert h.mentions("edit /etc/hosts first", "/etc/hosts")               # absolute path matches itself
+    assert h.identifiers("check /etc/hosts and https://x.example.se/a?b=1") == \
+        ["/etc/hosts", "https://x.example.se/a"]
+    assert h.identifiers("ping 192.168.81.20 now") == ["192.168.81.20"]    # IPs kept
+    assert h.identifiers("bump to v1.2.6 not 1.35") == ["v1.2.6"]          # bare version dropped
+    assert h.identifiers("åäö-config är trasig") == ["åäö-config"]         # Unicode identifiers
+
+
+def test_cache_lock_serialises_and_times_out(tmp_path, monkeypatch):
+    import fcntl
+    h = load_prompt_hook(tmp_path, monkeypatch)
+    with h.session_lock("s-lock"):
+        holder = os.open(h.cache_path("s-lock") + ".lock", os.O_RDWR)
+        try:
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            raise AssertionError("second lock should not be granted")
+        except BlockingIOError:
+            pass
+        finally:
+            os.close(holder)
+    import threading
+    started = threading.Event()
+
+    def hold():
+        with h.session_lock("s-busy"):
+            started.set(); time.sleep(3)
+    t = threading.Thread(target=hold); t.start(); started.wait()
+    t0 = time.time()
+    try:
+        with h.session_lock("s-busy"):
+            raise AssertionError("should time out")
+    except TimeoutError:
+        assert time.time() - t0 < 3
+    t.join()
+
+
+def test_search_has_total_deadline(tmp_path, monkeypatch):
+    h = load_prompt_hook(tmp_path, monkeypatch)
+    monkeypatch.setattr(h, "TIMEOUT", 0.5)
+
+    class Trickle:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def readline(self):
+            time.sleep(0.2); return b": keep-alive\n"
+    monkeypatch.setattr(h.urllib.request, "urlopen", lambda *a, **k: Trickle())
+    t0 = time.time()
+    assert h.search("http://x", "t", "q") == []
+    assert time.time() - t0 < 1.5
