@@ -33,9 +33,18 @@ Browser  ────────────────►  remnant-ui (memory
 
 **At write time:**
 
-1. `add_memory(content)` is called (by Claude Code hook or directly)
+1. `add_memory(content)` is called (by Claude Code hook or directly). Content is stored as written; credentials are redacted first. `infer=true` (or `MEM0_INFER=true`) asks the LLM to extract facts instead, with the raw text as fallback when extraction yields nothing
 2. Content is embedded via Ollama (`nomic-embed-text`) and stored in pgvector
 3. Keyword tag rules are applied immediately (fast, synchronous)
+
+**At search time** (`search_memory`, UI search) — hybrid:
+
+- **Meaning**: cosine similarity over the embeddings (pgvector, HNSW). Remnant queries pgvector directly; mem0 2.0.2's own `Memory.search()` ranked poorly on this data
+- **Exact terms**: Postgres full-text search (`simple` config, no stemming, stored `fts` column + GIN index), weighted by term rarity (BM25 idf). Identifier-like terms (`pg-main-rw`, `0.2.6`, `project_worklog`) also match as substrings
+- Both lists are merged with reciprocal rank fusion. Keyword hits count fully when the query contains identifier-like terms, at `SEARCH_KEYWORD_WEIGHT_PLAIN` (default 0.3) otherwise. `score` is the fused 0..1 score; `vector_score` is the cosine similarity
+- If Ollama is offline, search returns keyword results instead of failing
+
+Measured on the prod memories (2026-10-14, hit@5): identifier queries 2–12% → 82%, plain-language questions 0% → 47–60%.
 
 **Nightly (03:30 daily CronJob):**
 

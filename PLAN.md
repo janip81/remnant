@@ -33,14 +33,15 @@
 - [x] Read paths (list/export/stats/metrics) work while Ollama is offline — tested with Ollama unreachable — *done on branch `hardening/p0`, not deployed*
 
 - [x] **infer=True silently dropped writes in prod** (found 2026-10-14): mem0 2.0.2 + qwen2.5:7b returns `[]` (model answers `{"message": ...}`) or crashes on `{"memory": ["string"]}`; the old worker logged "Processed". Raw text is now stored as fallback with `infer_fallback` metadata — *done on branch `hardening/p0-followup`, not deployed*
-- [ ] Decide: make `add_memory` default `infer=false` (original Phase 10 design, "Claude decides what to save"), or pick an extraction model that follows mem0's JSON format
+- [x] `add_memory` defaults to `infer=false` (follows `MEM0_INFER`, default false) — *branch `feat/hybrid-search`; gitops `mem0.infer` must be set to "false" too*
 - [x] Disable mem0 PostHog telemetry (`MEM0_TELEMETRY=false` in the image) — *branch only*
 
 ### P1 — memory quality
 - [ ] Lifecycle metadata on every memory: `status` (active | superseded | historical | uncertain), `superseded_by`, `valid_from`, `source` (agent_id, client, session_id, hook vs manual), keep `created_at`/`updated_at`
 - [ ] `search_memory` returns `active` by default; optional `include_history` flag
 - [ ] Updates/merges mark the old memory `superseded` (or archive with pointer) instead of overwriting in place; dedup job does the same
-- [ ] Hybrid search: Postgres FTS (`tsvector` + GIN on memory text) + pgvector, merged with reciprocal rank fusion — catches exact identifiers (k8s names, versions, hostnames, error codes)
+- [x] Hybrid search: idf-weighted Postgres FTS (stored `fts` column + GIN, substring match for identifiers) + direct pgvector cosine, merged with weighted RRF; keyword-only when Ollama is offline. Also replaced mem0 2.0.2 `Memory.search()` (0/30 on a semantic eval vs 16/30 for plain cosine). hit@5 on prod data: identifiers 2–12% → 82%, questions 0% → 47–60% — *done on branch `feat/hybrid-search`, not deployed*
+- [ ] pg_trgm index for the identifier substring match if search latency (~350 ms) becomes a problem
 - [ ] Relevance floor (min score) + context budget (max chars/tokens) in hooks; per-session cache so the same memory isn't injected on every prompt
 - [ ] DNS rebinding protection back on with `allowed_hosts` from config/Helm (`gatewayApi.host`) instead of disabled
 - [ ] Minimal pytest suite (auth, queue ack/retry/DLQ, hybrid merge) run in CI
