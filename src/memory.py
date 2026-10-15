@@ -307,17 +307,22 @@ def _row_to_result(row: dict) -> dict:
         "source": row.get("source") or "",
         "review_reason": row.get("review_reason") or "",
         "project": row.get("project") or "",
+        "kind": row.get("kind") or "",
     }
 
 
-def list_rows(agent_id: str = "", state: str = "") -> list[dict]:
-    """All memories for the configured user, without vectors."""
+def list_rows(agent_id: str = "", state: str = "", states=None, include_checkpoints: bool = True) -> list[dict]:
+    """All memories for the configured user, without vectors.
+
+    states=None and include_checkpoints=True list everything (UI/export inventory);
+    MCP get_all_memories passes the default eligibility instead."""
     sql = (f"SELECT id, payload->>'data' AS memory, payload->>'agent_id' AS agent_id, "
            f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
            f"{_META}->>'category' AS category, "
            f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
            f"payload->>'state' AS state, payload->>'source' AS source, "
-           f"payload->>'review_reason' AS review_reason, payload->>'project' AS project "
+           f"payload->>'review_reason' AS review_reason, payload->>'project' AS project, "
+           f"payload->>'kind' AS kind "
            f"FROM {_MEM_TABLE} WHERE payload->>'user_id' = %s")
     params: list = [settings.mem0_user_id]
     if agent_id:
@@ -325,6 +330,10 @@ def list_rows(agent_id: str = "", state: str = "") -> list[dict]:
         params.append(agent_id)
     if state in VALID_STATES:
         sql += " AND " + _state_sql([state])
+    elif states is not None:
+        sql += " AND " + _state_sql(states)
+    if not include_checkpoints:
+        sql += " AND " + _SEARCHABLE          # '%%' is right: this query binds parameters
     conn = _db_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -700,7 +709,8 @@ def _keyword_search(query: str, limit: int, include_checkpoints: bool = False, s
                 f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
                 f"{_META}->>'category' AS category, "
                 f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
-                f"payload->>'state' AS state, "
+                f"payload->>'state' AS state, payload->>'source' AS source, "
+                f"payload->>'review_reason' AS review_reason, payload->>'project' AS project, "
                 f"({' + '.join(score_sql)}) AS rank "
                 f"FROM {_MEM_TABLE} WHERE {user} AND ({any_sql}) "
                 f"ORDER BY rank DESC, length(payload->>'data') ASC LIMIT %s",
@@ -772,7 +782,8 @@ def search(query: str, limit: int = 5, agent_id: str = "", include_checkpoints: 
            f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
            f"{_META}->>'category' AS category, "
            f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
-           f"payload->>'state' AS state, "
+           f"payload->>'state' AS state, payload->>'source' AS source, "
+                f"payload->>'review_reason' AS review_reason, payload->>'project' AS project, "
            f"1 - (vector <=> %s::vector) AS score "
            f"FROM {_MEM_TABLE} WHERE payload->>'user_id' = %s "
            + f"AND {_population(include_checkpoints, states)} " +
@@ -833,7 +844,7 @@ def save_checkpoint(session_id: str, content: str, agent_id: str = "", project: 
     capture_id = capture_id or str(_uuid.uuid4())   # stable tie-breaker, kept across retries
     get_memory().add(
         redact(content), user_id=settings.mem0_user_id, agent_id=_agent_id(agent_id), infer=False,
-        metadata={"kind": "checkpoint", "session_id": session_id, "project": project,
+        metadata={"kind": "checkpoint", "source": "hook", "session_id": session_id, "project": project,
                   "category": "session", "captured_at": captured, "capture_id": capture_id,
                   "expires_at": expires})
     conn = _db_conn()
@@ -923,7 +934,8 @@ def update_tags(memory_id: str, tags: list) -> bool:
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT payload FROM mem0 WHERE id = %s", (memory_id,))
+                # FOR UPDATE: a review committing between read and write must not be undone
+                cur.execute("SELECT payload FROM mem0 WHERE id = %s FOR UPDATE", (memory_id,))
                 row = cur.fetchone()
                 if not row:
                     return False

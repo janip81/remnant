@@ -342,3 +342,79 @@ def test_dedup_ignores_candidates(mem):
 def json_dumps(o):
     import json
     return json.dumps(o)
+
+
+def test_list_rows_default_eligibility_for_mcp(mem):
+    _insert("cand row", {"state": "candidate"})
+    _insert("cp row", {"kind": "checkpoint", "session_id": "z"})
+    _insert("## Session State (session-end)\nold snapshot")
+    everything = texts(mem.list_rows())
+    assert "cand row" in everything and "cp row" in everything               # UI inventory
+    eligible = texts(mem.list_rows("", "", ["active"], False))
+    assert "cand row" not in eligible and "cp row" not in eligible
+    assert not any(t.startswith("## Session State") for t in eligible)
+    assert len(eligible) == len(DOCS)
+
+
+def test_tag_update_does_not_undo_concurrent_review(mem, monkeypatch):
+    import threading, uuid
+    cid = str(uuid.uuid4())
+    _insert_with_id(cid, {"data": "chatter", "state": "candidate"})
+    real_conn = mem._db_conn
+    gate = threading.Event(); release = threading.Event()
+
+    class SlowConn:                       # pause update_tags after its SELECT ... FOR UPDATE
+        def __init__(self): self.c = real_conn()
+        def __getattr__(self, n): return getattr(self.c, n)
+        def __enter__(self): return self.c.__enter__()
+        def __exit__(self, *a): return self.c.__exit__(*a)
+        def cursor(self, *a, **k):
+            return SlowCursor(self.c.cursor(*a, **k))
+
+    class SlowCursor:
+        def __init__(self, cur): self.cur = cur
+        def __getattr__(self, n): return getattr(self.cur, n)
+        def __enter__(self): self.cur.__enter__(); return self
+        def __exit__(self, *a): return self.cur.__exit__(*a)
+        def execute(self, sql, params=None):
+            r = self.cur.execute(sql, params)
+            if "FOR UPDATE" in sql:
+                gate.set(); release.wait(5)
+            return r
+    monkeypatch.setattr(mem, "_db_conn", lambda: SlowConn())
+    t = threading.Thread(target=mem.update_tags, args=(cid, ["x"])); t.start(); gate.wait(5)
+    monkeypatch.setattr(mem, "_db_conn", real_conn)
+    out = {}
+    r = threading.Thread(target=lambda: out.update(mem.review(cid, "promote"))); r.start()
+    time.sleep(0.5)
+    assert r.is_alive()                   # review waits for the tag update's row lock
+    release.set(); t.join(5); r.join(5)
+    assert out["ok"] is True
+    conn = psycopg2.connect(URL)
+    with conn.cursor() as cur:
+        cur.execute("SELECT payload->>'state', payload->>'reviewed_at' IS NOT NULL FROM mem0 WHERE id = %s", (cid,))
+        assert cur.fetchone() == ("active", True)        # review not undone by the tag write
+    conn.close()
+
+
+def _insert_with_id(mid, payload):
+    conn = psycopg2.connect(URL)
+    with conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO mem0 VALUES (%s, '[1,0,0]', %s)", (mid, json_dumps({"user_id": "u", **payload})))
+    conn.close()
+
+
+def test_keyword_hits_carry_provenance(mem):
+    _insert("prov row zeta-9", {"source": "hook", "project": "remnant", "review_reason": ""})
+    (hit,) = mem.keyword_search("zeta-9", 5)
+    assert hit["source"] == "hook" and hit["project"] == "remnant"
+
+
+def test_checkpoint_has_source(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    mem.save_checkpoint("src-s", "state")
+    conn = psycopg2.connect(URL)
+    with conn.cursor() as cur:
+        cur.execute("SELECT payload->>'source' FROM mem0 WHERE payload->>'session_id' = 'src-s'")
+        assert cur.fetchone()[0] == "hook"
+    conn.close()

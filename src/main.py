@@ -126,12 +126,19 @@ async def get_checkpoint(session_id: str) -> str:
 
 
 @mcp.tool()
-async def get_all_memories() -> str:
-    """List all stored memories."""
-    results = await asyncio.to_thread(mem_store.list_rows)
+async def get_all_memories(include_history: bool = False, include_candidates: bool = False,
+                           include_sessions: bool = False) -> str:
+    """List stored memories: active ones by default (same eligibility as search_memory);
+    include_history adds superseded, include_candidates adds unreviewed LLM output,
+    include_sessions adds session checkpoints. Non-active rows are labelled."""
+    states = ["active"] + (["superseded"] if include_history else []) + (["candidate"] if include_candidates else [])
+    results = await asyncio.to_thread(mem_store.list_rows, "", "", states, include_sessions)
     if not results:
         return "No memories stored."
-    lines = [r.get("memory", r.get("text", str(r))) for r in results]
+    lines = []
+    for r in results:
+        label = "" if (r.get("state") or "active") == "active" else f"[{r['state']}] "
+        lines.append(label + r.get("memory", r.get("text", str(r))))
     return "\n".join(f"{i+1}. {m}" for i, m in enumerate(lines))
 
 
@@ -276,6 +283,7 @@ def _memory_dict(r: dict) -> dict:
         "source": r.get("source") or meta.get("source") or "",
         "review_reason": r.get("review_reason") or meta.get("review_reason") or "",
         "project": r.get("project") or meta.get("project") or "",
+        "kind": r.get("kind") or meta.get("kind") or "",
     }
 
 
@@ -448,14 +456,21 @@ async def app(scope, receive, send):
             except Exception as e:
                 await _send_response(send, 400, [[b"content-type", b"text/plain"]], str(e).encode())
                 return
-            imported = 0
+            imported = skipped = 0
             for item in items:
                 content = item.get("memory") or item.get("text") or item.get("content", "")
                 src_agent = item.get("agent_id", "") or agent_id
-                if content.strip():
-                    await asyncio.to_thread(mem_store.add, content.strip(), agent_id=src_agent, source="import")
-                    imported += 1
-            await _send_response(send, *_json_response({"imported": imported}))
+                if not content.strip():
+                    continue
+                if item.get("kind") == "checkpoint":
+                    skipped += 1          # session checkpoints are not portable memories
+                    continue
+                # keep the lifecycle: an exported candidate/rejected row must not come back active
+                state = item.get("state") if item.get("state") in mem_store.VALID_STATES else ""
+                await asyncio.to_thread(mem_store.add, content.strip(), agent_id=src_agent, source="import",
+                                        project=str(item.get("project") or ""), state=state)
+                imported += 1
+            await _send_response(send, *_json_response({"imported": imported, "skipped_checkpoints": skipped}))
             return
 
         # GET /api/memories — list / search
