@@ -42,7 +42,10 @@
 - [ ] Updates/merges mark the old memory `superseded` (or archive with pointer) instead of overwriting in place; dedup job does the same
 - [x] Hybrid search: idf-weighted Postgres FTS (stored `fts` column + GIN, substring match for identifiers) + direct pgvector cosine, merged with weighted RRF; keyword-only when Ollama is offline. Also replaced mem0 2.0.2 `Memory.search()` (0/30 on a semantic eval vs 16/30 for plain cosine). hit@5 on prod data: identifiers 2–12% → 82%, questions 0% → 47–60% — *done on branch `feat/hybrid-search`, not deployed*
 - [ ] pg_trgm index for the identifier substring match if search latency (~350 ms) becomes a problem
-- [ ] Relevance floor (min score) + context budget (max chars/tokens) in hooks; per-session cache so the same memory isn't injected on every prompt
+- [x] Step A (Codex design input 2026-10-15): session checkpoints — one replaceable checkpoint per session_id, excluded from search, restored by exact id, 7-day expiry, Stop capture throttled to 15 min, dedup skips them + 30-min LLM budget + no transaction across LLM calls — *branch `feat/session-checkpoints`, not deployed*
+- [ ] Step B: injection gate — structured results, cosine ≥ 0.70 (calibrate on labelled related/unrelated prompts), max 3 facts / 3000 chars, per-session cache of injected ids in ~/.cache/remnant (reset after compaction)
+- [ ] Step C: latency budget — ~1 s embedding timeout, keyword-only fallback only for exact identifiers, 3 s hook cap
+- [ ] Step D: provenance + lifecycle — kind=fact|checkpoint, state=candidate|active|superseded|expired, source session/project, auto-extracted facts start as candidate
 - [ ] DNS rebinding protection back on with `allowed_hosts` from config/Helm (`gatewayApi.host`) instead of disabled
 - [ ] Minimal pytest suite (auth, queue ack/retry/DLQ, hybrid merge) run in CI
 
