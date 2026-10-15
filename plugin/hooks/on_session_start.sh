@@ -99,7 +99,7 @@ elif [ "$SOURCE" = "compact" ]; then
 ## Mem0 Post-Compaction Recovery
 
 Context was just compacted.
-${CHECKPOINT:+### This session's checkpoint (saved just before compaction)
+${CHECKPOINT:+### This session's latest checkpoint (see "captured" time — may predate the compaction)
 $CHECKPOINT
 }
 Related memories retrieved directly (HTTP fallback — MCP may not be connected yet):

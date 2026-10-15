@@ -161,8 +161,10 @@ async def _process_one(client, msg_id: str, fields: dict) -> None:
     try:
         if job.get("kind") == "checkpoint":
             # replace-by-session is idempotent, so a retry simply writes it again
+            # ordered by captured_at, so a late retry never replaces a newer capture
             await asyncio.to_thread(mem_store.save_checkpoint, job.get("session_id", ""), job["content"],
-                                    job.get("agent_id", ""), job.get("project", ""))
+                                    job.get("agent_id", ""), job.get("project", ""),
+                                    job.get("captured_at", ""))
             logger.info("Saved checkpoint for session %s (attempt %d)", job.get("session_id"), attempts)
         elif not infer and job_id and await asyncio.to_thread(mem_store.job_written, job_id):
             logger.info("Queue job %s already written; acking retry", job_id)

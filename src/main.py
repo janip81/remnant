@@ -72,19 +72,30 @@ async def search_memory(query: str, limit: int = 5, include_sessions: bool = Fal
 
 
 @mcp.tool()
-async def save_checkpoint(session_id: str, content: str, project: str = "", agent_id: str = "") -> str:
+async def save_checkpoint(session_id: str, content: str, project: str = "", agent_id: str = "",
+                          captured_at: str = "", sync: bool = False) -> str:
     """Save the replaceable working-state checkpoint of a session (used by hooks).
-    Replaces the previous checkpoint of the same session_id; never returned by
-    search_memory; expires after a few days. Not for durable facts — use add_memory."""
+    Keeps only the newest capture per session_id (captured_at, ISO 8601; defaults
+    to now); never returned by search_memory; expires after a few days.
+    sync=True writes before returning (use before compaction so a resume can read
+    it); otherwise it is queued. Not for durable facts — use add_memory."""
     if not session_id or not content.strip():
         return "session_id and content are required"
-    if settings.redis_url:
-        from queue_worker import enqueue
-        job_id = await enqueue(content, agent_id, False, "session", [],
-                               kind="checkpoint", session_id=session_id, project=project)
-        return json.dumps({"queued": True, "job_id": job_id})
-    result = await asyncio.to_thread(mem_store.save_checkpoint, session_id, content, agent_id, project)
-    return json.dumps(result)
+    import datetime as _dt
+    captured_at = captured_at or _dt.datetime.now(_dt.timezone.utc).isoformat()
+    if sync or not settings.redis_url:
+        try:
+            result = await asyncio.to_thread(mem_store.save_checkpoint, session_id, content, agent_id,
+                                             project, captured_at)
+            return json.dumps({"saved": True, **result})
+        except Exception as e:
+            if not settings.redis_url:
+                return f"checkpoint not saved: {type(e).__name__}"
+            logger.warning("Synchronous checkpoint failed (%s); queueing", type(e).__name__)
+    from queue_worker import enqueue
+    job_id = await enqueue(content, agent_id, False, "session", [], kind="checkpoint",
+                           session_id=session_id, project=project, captured_at=captured_at)
+    return json.dumps({"queued": True, "job_id": job_id})
 
 
 @mcp.tool()
@@ -93,7 +104,7 @@ async def get_checkpoint(session_id: str) -> str:
     row = await asyncio.to_thread(mem_store.get_checkpoint, session_id)
     if not row:
         return "No checkpoint for this session."
-    return f"[checkpoint {row['created_at']} project={row.get('project') or '-'}]\n{row['memory']}"
+    return f"[checkpoint captured {row['created_at']} project={row.get('project') or '-'}]\n{row['memory']}"
 
 
 @mcp.tool()

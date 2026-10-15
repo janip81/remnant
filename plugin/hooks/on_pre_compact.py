@@ -285,8 +285,11 @@ def store_memory(memory_url: str, token: str, content: str, source: str,
                  session_id: str = "", project: str = "") -> bool:
     """Store session state as the session's replaceable checkpoint (one per session_id)."""
     if session_id:
+        # PreCompact writes synchronously so SessionStart(compact) can read it back
         call = {"name": "save_checkpoint",
-                "arguments": {"session_id": session_id, "content": content, "project": project}}
+                "arguments": {"session_id": session_id, "content": content, "project": project,
+                              "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+                              "sync": source != "session-end"}}
     else:  # older Claude Code without session_id: fall back to a plain memory
         call = {"name": "add_memory", "arguments": {"content": content, "infer": False, "category": "session"}}
     payload = {

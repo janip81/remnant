@@ -256,9 +256,10 @@ _MEM_TABLE = "mem0"
 # '%%' because these fragments go into parameterised SQL.
 # coalesce: payload->>'kind' is NULL for normal memories, and NOT (NULL OR ...)
 # would be NULL, i.e. exclude every normal row.
+# '## Codex session state' is not listed yet: Codex's own hook still restores
+# its snapshot through search_memory until it moves to get_checkpoint.
 _CHECKPOINT = ("(coalesce(payload->>'kind', '') = 'checkpoint' "
                "OR coalesce(payload->>'data', '') LIKE '## Session State%%' "
-               "OR coalesce(payload->>'data', '') LIKE '## Codex session state%%' "
                "OR coalesce(payload->>'data', '') LIKE '%%### What the user was working on%%')")
 _SEARCHABLE = f"NOT {_CHECKPOINT}"
 CHECKPOINT_TTL_DAYS = int(os.environ.get("CHECKPOINT_TTL_DAYS", "7"))
@@ -728,33 +729,44 @@ def get_all(agent_id: str = "") -> list[dict]:
     return result if isinstance(result, list) else []
 
 
-def save_checkpoint(session_id: str, content: str, agent_id: str = "", project: str = "") -> dict:
+def save_checkpoint(session_id: str, content: str, agent_id: str = "", project: str = "",
+                    captured_at: str = "") -> dict:
     """Store the one replaceable checkpoint for a session (hook snapshot).
 
-    Writes the new row first, then deletes older checkpoints of the same
-    session, so there is never a moment without one. Excluded from search;
-    read back with get_checkpoint(session_id). Expires after CHECKPOINT_TTL_DAYS.
+    Ordered by capture time, not write time: after writing, only the newest
+    capture of the session is kept. Two concurrent saves therefore keep the
+    same row, and a stale retry (captured earlier than what is stored) removes
+    itself. There is never a moment without a checkpoint. Excluded from
+    search; read back with get_checkpoint(session_id).
     """
     if not session_id:
         raise ValueError("session_id required")
     import datetime as _dt
-    expires = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=CHECKPOINT_TTL_DAYS)).isoformat()
-    result = get_memory().add(
+    now = _dt.datetime.now(_dt.timezone.utc)
+    captured = captured_at or now.isoformat()
+    try:
+        base = _dt.datetime.fromisoformat(captured.replace("Z", "+00:00"))
+    except ValueError:
+        base, captured = now, now.isoformat()
+    expires = (base + _dt.timedelta(days=CHECKPOINT_TTL_DAYS)).isoformat()
+    get_memory().add(
         redact(content), user_id=settings.mem0_user_id, agent_id=_agent_id(agent_id), infer=False,
         metadata={"kind": "checkpoint", "session_id": session_id, "project": project,
-                  "category": "session", "expires_at": expires})
-    new_ids = {str(r.get("id")) for r in (result.get("results", []) if isinstance(result, dict) else result or [])}
+                  "category": "session", "captured_at": captured, "expires_at": expires})
     conn = _db_conn()
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute(f"DELETE FROM {_MEM_TABLE} WHERE payload->>'kind' = 'checkpoint' "
-                            f"AND payload->>'session_id' = %s AND NOT (id::text = ANY(%s))",
-                            (session_id, list(new_ids)))
-                replaced = cur.rowcount
+                cur.execute(
+                    f"DELETE FROM {_MEM_TABLE} WHERE payload->>'kind' = 'checkpoint' AND payload->>'session_id' = %s "
+                    f"AND id <> (SELECT id FROM {_MEM_TABLE} WHERE payload->>'kind' = 'checkpoint' "
+                    f"AND payload->>'session_id' = %s "
+                    f"ORDER BY coalesce(payload->>'captured_at', payload->>'created_at') DESC, id DESC LIMIT 1)",
+                    (session_id, session_id))
+                removed = cur.rowcount
     finally:
         conn.close()
-    return {"session_id": session_id, "ids": sorted(new_ids), "replaced": replaced}
+    return {"session_id": session_id, "captured_at": captured, "removed": removed}
 
 
 def get_checkpoint(session_id: str) -> Optional[dict]:
@@ -762,10 +774,12 @@ def get_checkpoint(session_id: str) -> Optional[dict]:
     conn = _db_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(f"SELECT id, payload->>'data' AS memory, payload->>'created_at' AS created_at, "
+            cur.execute(f"SELECT id, payload->>'data' AS memory, "
+                        f"coalesce(payload->>'captured_at', payload->>'created_at') AS created_at, "
                         f"payload->>'project' AS project FROM {_MEM_TABLE} "
                         f"WHERE payload->>'kind' = 'checkpoint' AND payload->>'session_id' = %s "
-                        f"AND payload->>'user_id' = %s ORDER BY payload->>'created_at' DESC LIMIT 1",
+                        f"AND payload->>'user_id' = %s "
+                        f"ORDER BY coalesce(payload->>'captured_at', payload->>'created_at') DESC, id DESC LIMIT 1",
                         (session_id, settings.mem0_user_id))
             row = cur.fetchone()
             return dict(row) if row else None

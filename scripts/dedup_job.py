@@ -55,6 +55,11 @@ CHECKPOINT_SQL = ("(coalesce(payload->>'kind', '') = 'checkpoint' "
                   "OR coalesce(payload->>'data', '') LIKE '## Session State%%' "
                   "OR coalesce(payload->>'data', '') LIKE '## Codex session state%%' "
                   "OR coalesce(payload->>'data', '') LIKE '%%### What the user was working on%%')")
+# Expiry is deliberately narrower than "skip": only real checkpoints and rows that
+# *start* with the hook heading. LLM-merged rows that merely contain the section
+# header may carry durable facts — they are skipped by dedup but never expired.
+EXPIRABLE_SQL = ("(coalesce(payload->>'kind', '') = 'checkpoint' "
+                 "OR coalesce(payload->>'data', '') LIKE '## Session State%%')")
 CHECKPOINT_TTL_DAYS = int(os.environ.get("CHECKPOINT_TTL_DAYS", "7"))
 # Stop starting new LLM merges after this many seconds (one merge can take ~20s
 # on the shared Ollama GPU and delays interactive search embeddings).
@@ -519,7 +524,7 @@ def phase_expire_checkpoints(conn, dry_run: bool) -> int:
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             ensure_archive_table(cur)
             cur.execute(
-                f"""SELECT id FROM {MEM_TABLE} WHERE {CHECKPOINT_SQL} AND (
+                f"""SELECT id FROM {MEM_TABLE} WHERE {EXPIRABLE_SQL} AND (
                         (payload ? 'expires_at' AND (payload->>'expires_at')::timestamptz < now())
                      OR (NOT payload ? 'expires_at'
                          AND (payload->>'created_at')::timestamptz < now() - make_interval(days => %s)))""",

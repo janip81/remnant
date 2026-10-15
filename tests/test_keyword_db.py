@@ -24,7 +24,7 @@ def mem(monkeypatch):
     conn = psycopg2.connect(URL)
     with conn, conn.cursor() as cur:
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        cur.execute("DROP TABLE IF EXISTS mem0")
+        cur.execute("DROP TABLE IF EXISTS mem0, mem0_archive")
         cur.execute("CREATE TABLE mem0 (id uuid PRIMARY KEY, vector vector(3), payload jsonb)")
         for d in DOCS:
             cur.execute("INSERT INTO mem0 VALUES (gen_random_uuid(), '[1,0,0]', jsonb_build_object('user_id','u','data',%s::text))", (d,))
@@ -144,7 +144,7 @@ def test_checkpoint_is_replaced_per_session_and_read_back_by_id(mem, monkeypatch
     mem.save_checkpoint("sess-1", "first state", project="remnant")
     r = mem.save_checkpoint("sess-1", "second state, REMNANT_TOKEN=" + "f" * 40, project="remnant")
     mem.save_checkpoint("sess-2", "other session")
-    assert r["replaced"] == 1
+    assert r["removed"] == 1
     cp = mem.get_checkpoint("sess-1")
     assert cp["memory"].startswith("second state") and "f" * 40 not in cp["memory"]
     assert cp["project"] == "remnant"
@@ -164,6 +164,8 @@ def test_dedup_expiry_archives_old_snapshots_and_expired_checkpoints(mem, monkey
     _insert(SNAP, {"created_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())})  # legacy, fresh
     _insert("cp old", {"kind": "checkpoint", "session_id": "a", "expires_at": "2026-01-01T00:00:00+00:00"})
     _insert("cp live", {"kind": "checkpoint", "session_id": "b", "expires_at": "2999-01-01T00:00:00+00:00"})
+    merged = "## Comprehensive Merged Memory\n\n### What the user was working on\n- durable fact"
+    _insert(merged, {"created_at": "2026-01-01T00:00:00+00:00"})               # old LLM-merged row
     import psycopg2.extras
     conn = psycopg2.connect(URL)
     psycopg2.extras.register_uuid(conn_or_curs=conn)   # as dedup_job.get_conn() does
@@ -172,10 +174,39 @@ def test_dedup_expiry_archives_old_snapshots_and_expired_checkpoints(mem, monkey
             started_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ, phase TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'running', memories_scanned INT DEFAULT 0, memories_changed INT DEFAULT 0,
             rules_added INT DEFAULT 0, duration_seconds FLOAT, error TEXT)""")
+    try:
+        _check_expiry(dedup_job, conn, merged)
+    finally:
+        conn.rollback(); conn.close()
+
+
+def _check_expiry(dedup_job, conn, merged):
     assert dedup_job.phase_expire_checkpoints(conn, dry_run=False) == 2
     with conn.cursor() as cur:
         cur.execute("SELECT payload->>'data' FROM mem0 WHERE " + dedup_job.CHECKPOINT_SQL.replace("%%", "%"))
-        assert sorted(r[0][:7] for r in cur.fetchall()) == ["## Sess", "cp live"]
+        assert sorted(r[0][:7] for r in cur.fetchall()) == ["## Comp", "## Sess", "cp live"]
         cur.execute("SELECT count(*) FROM mem0_archive WHERE archive_reason = 'checkpoint-expired'")
         assert cur.fetchone()[0] == 2
+        cur.execute("SELECT count(*) FROM mem0 WHERE payload->>'data' = %s", (merged,))
+        assert cur.fetchone()[0] == 1                     # hidden from search, never expired
+
+
+def test_stale_retry_does_not_replace_newer_capture(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    mem.save_checkpoint("s", "newer", captured_at="2026-10-15T10:05:00+00:00")
+    mem.save_checkpoint("s", "older retry", captured_at="2026-10-15T10:00:00+00:00")
+    assert mem.get_checkpoint("s")["memory"] == "newer"
+
+
+def test_concurrent_saves_keep_exactly_the_newest(mem, monkeypatch):
+    import threading
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    caps = [f"2026-10-15T10:0{i}:00+00:00" for i in range(6)]
+    threads = [threading.Thread(target=mem.save_checkpoint, args=("c", f"state {i}"), kwargs={"captured_at": c})
+               for i, c in enumerate(caps)]
+    [t.start() for t in threads]; [t.join() for t in threads]
+    conn = psycopg2.connect(URL)
+    with conn.cursor() as cur:
+        cur.execute("SELECT payload->>'data' FROM mem0 WHERE payload->>'session_id' = 'c'")
+        assert [r[0] for r in cur.fetchall()] == ["state 5"]
     conn.close()
