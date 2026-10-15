@@ -22,6 +22,9 @@ import json
 import logging
 import os
 import sys
+import uuid
+from datetime import datetime, timezone
+import time
 import urllib.request
 import urllib.error
 
@@ -248,15 +251,54 @@ def extract_memories_with_ollama(conversation: str, ollama_url: str) -> list[str
         return []
 
 
-def store_memory(memory_url: str, token: str, content: str, source: str) -> bool:
-    """Store session state via mem0 MCP JSON-RPC endpoint."""
+STOP_CAPTURE_INTERVAL = int(os.environ.get("REMNANT_STOP_CAPTURE_INTERVAL", "900"))  # seconds
+STATE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "remnant")
+
+
+def stop_capture_due(session_id: str, source: str) -> bool:
+    """Stop fires after every response; capture at most once per interval per session.
+
+    PreCompact always captures (context is about to be lost). The timestamp is
+    only advanced by a capture, so a quiet session still gets its last state
+    saved on the first Stop after the interval.
+    """
+    if source != "session-end" or not session_id:
+        return True
+    path = os.path.join(STATE_DIR, f"last-capture-{session_id}")
+    try:
+        return time.time() - os.path.getmtime(path) >= STOP_CAPTURE_INTERVAL
+    except OSError:
+        return True
+
+
+def mark_captured(session_id: str) -> None:
+    if not session_id:
+        return
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        path = os.path.join(STATE_DIR, f"last-capture-{session_id}")
+        with open(path, "a"):
+            os.utime(path, None)
+    except OSError as e:
+        log.debug("Could not record capture time: %s", e)
+
+
+def store_memory(memory_url: str, token: str, content: str, source: str,
+                 session_id: str = "", project: str = "") -> bool:
+    """Store session state as the session's replaceable checkpoint (one per session_id)."""
+    if session_id:
+        # PreCompact writes synchronously so SessionStart(compact) can read it back
+        call = {"name": "save_checkpoint",
+                "arguments": {"session_id": session_id, "content": content, "project": project,
+                              "captured_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                              "capture_id": str(uuid.uuid4()),
+                              "sync": source != "session-end"}}
+    else:  # older Claude Code without session_id: fall back to a plain memory
+        call = {"name": "add_memory", "arguments": {"content": content, "infer": False, "category": "session"}}
     payload = {
         "jsonrpc": "2.0",
         "method": "tools/call",
-        "params": {
-            "name": "add_memory",
-            "arguments": {"content": content, "infer": False, "category": "session"},
-        },
+        "params": call,
         "id": 1,
     }
 
@@ -328,6 +370,12 @@ def main():
         log.debug("Transcript empty or unreadable: %s", transcript_path)
         return
 
+    session_id = str(hook_input.get("session_id") or "")
+    project = os.path.basename(str(hook_input.get("cwd") or "").rstrip("/"))
+    if not stop_capture_due(session_id, source):
+        log.debug("Captured less than %ds ago; skipping", STOP_CAPTURE_INTERVAL)
+        return
+
     state = parse_transcript(lines)
     if not state["user_messages"] and not state["files_modified"]:
         log.debug("No meaningful session state to capture")
@@ -342,7 +390,8 @@ def main():
         len(state["bash_commands"]),
     )
 
-    store_memory(memory_url, token, content, source)
+    if store_memory(memory_url, token, content, source, session_id, project):
+        mark_captured(session_id)
 
     # For session-end (Stop / /clear): also extract discrete learnings via Ollama
     # and save each as a separate memory. Runs autonomously — no Claude response needed.

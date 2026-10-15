@@ -44,6 +44,8 @@ Browser  ────────────────►  remnant-ui (memory
 - Both lists are merged with reciprocal rank fusion. Keyword hits count fully when the query contains identifier-like terms, at `SEARCH_KEYWORD_WEIGHT_PLAIN` (default 0.3) otherwise. `score` is the fused 0..1 score; `vector_score` is the cosine similarity
 - If Ollama is offline, search returns keyword results instead of failing
 
+**Session checkpoints** — the hooks' working-state snapshots are stored as one replaceable checkpoint per Claude/Codex session (`save_checkpoint` / `get_checkpoint`), excluded from `search_memory` unless `include_sessions=true`, restored by exact `session_id` after resume/compaction, and expired after `CHECKPOINT_TTL_DAYS` (7) by the nightly job. On Stop the hook captures at most every 15 minutes per session.
+
 Measured on the prod memories (2026-10-14, hit@5): identifier queries 2–12% → 82%, plain-language questions 0% → 47–60%.
 
 **Nightly (03:30 daily CronJob):**
