@@ -62,7 +62,7 @@ def test_infer_false_is_a_single_raw_write(monkeypatch):
     fake = FakeMem0("swallowed")
     monkeypatch.setattr(memory, "get_memory", lambda: fake)
     memory.add("fact", infer=False, job_id="j1")
-    assert fake.calls == [{"infer": False, "metadata": {"job_id": "j1"}}]
+    assert fake.calls == [{"infer": False, "metadata": {"source": "agent", "job_id": "j1"}}]
 
 
 def test_fallback_failure_propagates(monkeypatch):
@@ -96,3 +96,15 @@ def test_embedding_input_is_capped_but_signature_kept():
     e.embed("x" * (memory.MAX_EMBED_CHARS + 500), "add")
     e.embed("short", "search")
     assert seen == [(memory.MAX_EMBED_CHARS, "add"), (5, "search")]
+
+
+def test_provenance_and_extraction_becomes_candidate(monkeypatch):
+    fake = FakeMem0("ok")
+    monkeypatch.setattr(memory, "get_memory", lambda: fake)
+    memory.add("fact", infer=False, source="hook", session_id="s1", project="remnant")
+    memory.add("extracted fact", infer=False, source="extraction", session_id="s1")
+    memory.add("weird source", infer=False, source="bogus")
+    a, b, c = (x["metadata"] for x in fake.calls)
+    assert a == {"source": "hook", "session_id": "s1", "project": "remnant"}
+    assert b["source"] == "extraction" and b["state"] == "candidate"
+    assert c["source"] == "agent" and "state" not in c

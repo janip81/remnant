@@ -222,3 +222,21 @@ def test_checkpoint_job_routes_to_save_checkpoint(env):
     run(qw._process(client, msg_id, fields))
     assert saved == [("s-1", "state", "remnant", "2026-10-15T10:00:00+00:00")] and mem.calls == []
     assert run(qw.queue_metrics())["pending"] == 0
+
+
+def test_queue_carries_provenance_and_version(env):
+    client, mem = env
+    run(qw.enqueue("fact", "codex", False, "", [], source="extraction", session_id="s9", project="remnant"))
+    (msg_id, fields), = run(_deliver(client))
+    assert json.loads(fields["job"])["v"] == 1
+    run(qw._process(client, msg_id, fields))
+    kw = mem.calls[0][1]
+    assert (kw["source"], kw["session_id"], kw["project"]) == ("extraction", "s9", "remnant")
+
+
+def test_old_jobs_without_provenance_still_work(env):
+    client, mem = env
+    run(client.xadd(qw.STREAM, {"job": json.dumps({"job_id": "old", "content": "x", "agent_id": "a", "infer": False})}))
+    (msg_id, fields), = run(_deliver(client))
+    run(qw._process(client, msg_id, fields))
+    assert mem.calls[0][1]["source"] == "agent"

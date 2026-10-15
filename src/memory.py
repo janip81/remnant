@@ -263,6 +263,30 @@ _CHECKPOINT = ("(coalesce(payload->>'kind', '') = 'checkpoint' "
                "OR coalesce(payload->>'data', '') LIKE '## Codex session state%%' "
                "OR coalesce(payload->>'data', '') LIKE '%%### What the user was working on%%')")
 _SEARCHABLE = f"NOT {_CHECKPOINT}"
+
+# Lifecycle. A missing state means active (all rows written before 2026-10-15).
+#   active      normal memory
+#   candidate   unreviewed LLM output — never auto-injected; only via explicit filters
+#   superseded  replaced by a newer memory (kept for history)
+#   rejected    candidate rejected in review
+# Checkpoints are orthogonal (kind=checkpoint) and handled by _SEARCHABLE.
+VALID_STATES = ("active", "candidate", "superseded", "rejected")
+VALID_SOURCES = ("agent", "hook", "extraction", "merge", "import", "ui")
+
+
+def _state_sql(states) -> str:
+    """SQL condition for the allowed states (values come from VALID_STATES only)."""
+    allowed = [st for st in states if st in VALID_STATES] or ["active"]
+    return "coalesce(payload->>'state', 'active') IN (" + ", ".join(f"'{st}'" for st in allowed) + ")"
+
+
+def _population(include_checkpoints: bool = False, states=("active",)) -> str:
+    """The one eligibility rule shared by vector search, keyword search (incl. idf
+    statistics) and the hooks; dedup uses the same definition in dedup_job.py."""
+    parts = [_state_sql(states)]
+    if not include_checkpoints:
+        parts.append(_SEARCHABLE)
+    return " AND ".join(parts)
 CHECKPOINT_TTL_DAYS = int(os.environ.get("CHECKPOINT_TTL_DAYS", "7"))
 _META = ("(CASE WHEN jsonb_typeof(payload->'metadata') = 'object' "
          "THEN payload->'metadata' ELSE payload END)")
@@ -280,21 +304,36 @@ def _row_to_result(row: dict) -> dict:
         "metadata": meta,
         # lifecycle: 'candidate' rows (unreviewed LLM output) are never auto-injected
         "state": row.get("state") or "active",
+        "source": row.get("source") or "",
+        "review_reason": row.get("review_reason") or "",
+        "project": row.get("project") or "",
+        "kind": row.get("kind") or "",
     }
 
 
-def list_rows(agent_id: str = "") -> list[dict]:
-    """All memories for the configured user, without vectors."""
+def list_rows(agent_id: str = "", state: str = "", states=None, include_checkpoints: bool = True) -> list[dict]:
+    """All memories for the configured user, without vectors.
+
+    states=None and include_checkpoints=True list everything (UI/export inventory);
+    MCP get_all_memories passes the default eligibility instead."""
     sql = (f"SELECT id, payload->>'data' AS memory, payload->>'agent_id' AS agent_id, "
            f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
            f"{_META}->>'category' AS category, "
            f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
-           f"payload->>'state' AS state "
+           f"payload->>'state' AS state, payload->>'source' AS source, "
+           f"payload->>'review_reason' AS review_reason, payload->>'project' AS project, "
+           f"payload->>'kind' AS kind "
            f"FROM {_MEM_TABLE} WHERE payload->>'user_id' = %s")
     params: list = [settings.mem0_user_id]
     if agent_id:
         sql += " AND payload->>'agent_id' = %s"
         params.append(agent_id)
+    if state in VALID_STATES:
+        sql += " AND " + _state_sql([state])
+    elif states is not None:
+        sql += " AND " + _state_sql(states)
+    if not include_checkpoints:
+        sql += " AND " + _SEARCHABLE          # '%%' is right: this query binds parameters
     conn = _db_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -438,10 +477,20 @@ VALID_CATEGORIES = {"project", "feedback", "reference", "user", "session", "inci
 
 
 def add(content: str, agent_id: str = "", infer: Optional[bool] = None, category: str = "",
-        tags: Optional[list] = None, job_id: str = "") -> dict:
+        tags: Optional[list] = None, job_id: str = "", source: str = "agent",
+        session_id: str = "", project: str = "", state: str = "") -> dict:
     m = get_memory()
     content = redact(content)
-    metadata: dict = {}
+    # provenance: where a memory came from (agent tool call, hook, extraction, merge, import, ui)
+    metadata: dict = {"source": source if source in VALID_SOURCES else "agent"}
+    if session_id:
+        metadata["session_id"] = session_id
+    if project:
+        metadata["project"] = project
+    if source == "extraction" and not state:
+        state = "candidate"          # LLM-extracted facts wait for review before they count
+    if state in VALID_STATES and state != "active":
+        metadata["state"] = state
     if category:
         metadata["category"] = category
     if job_id:
@@ -599,19 +648,20 @@ def _has_fts_column() -> bool:
         conn.close()
 
 
-def keyword_search(query: str, limit: int = _CANDIDATES, include_checkpoints: bool = False) -> list[dict]:
+def keyword_search(query: str, limit: int = _CANDIDATES, include_checkpoints: bool = False,
+                   states=("active",)) -> list[dict]:
     try:
-        return _keyword_search(query, limit, include_checkpoints)
+        return _keyword_search(query, limit, include_checkpoints, states)
     except psycopg2.errors.UndefinedColumn:
         ensure_fts_index()          # table was created after startup
-        return _keyword_search(query, limit, include_checkpoints)
+        return _keyword_search(query, limit, include_checkpoints, states)
 
 
 def _like(term: str) -> str:
     return "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
-def _keyword_search(query: str, limit: int, include_checkpoints: bool = False) -> list[dict]:
+def _keyword_search(query: str, limit: int, include_checkpoints: bool = False, states=("active",)) -> list[dict]:
     """Full-text search weighted by term rarity (BM25 idf, no term frequency).
 
     Each query term that occurs in a memory adds its idf, so one rare
@@ -632,7 +682,7 @@ def _keyword_search(query: str, limit: int, include_checkpoints: bool = False) -
         return sql, params
 
     # same population for the idf statistics and the results
-    user = "payload->>'user_id' = %s" + ("" if include_checkpoints else f" AND {_SEARCHABLE}")
+    user = "payload->>'user_id' = %s AND " + _population(include_checkpoints, states)
     conn = _db_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -659,7 +709,8 @@ def _keyword_search(query: str, limit: int, include_checkpoints: bool = False) -
                 f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
                 f"{_META}->>'category' AS category, "
                 f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
-                f"payload->>'state' AS state, "
+                f"payload->>'state' AS state, payload->>'source' AS source, "
+                f"payload->>'review_reason' AS review_reason, payload->>'project' AS project, "
                 f"({' + '.join(score_sql)}) AS rank "
                 f"FROM {_MEM_TABLE} WHERE {user} AND ({any_sql}) "
                 f"ORDER BY rank DESC, length(payload->>'data') ASC LIMIT %s",
@@ -677,7 +728,7 @@ def _keyword_search(query: str, limit: int, include_checkpoints: bool = False) -
     return out
 
 
-def hybrid_search(query: str, limit: int = 5, include_checkpoints: bool = False) -> list[dict]:
+def hybrid_search(query: str, limit: int = 5, include_checkpoints: bool = False, states=("active",)) -> list[dict]:
     """Merge keyword and vector results with reciprocal rank fusion.
 
     score is the fused score scaled to 0..1 (1.0 = ranked first by both).
@@ -685,9 +736,9 @@ def hybrid_search(query: str, limit: int = 5, include_checkpoints: bool = False)
     If the vector side fails (Ollama offline), keyword results are returned alone.
     """
     pool = max(_CANDIDATES, limit)
-    keyword = keyword_search(query, pool, include_checkpoints)
+    keyword = keyword_search(query, pool, include_checkpoints, states)
     try:
-        vector = search(query, limit=pool, include_checkpoints=include_checkpoints)
+        vector = search(query, limit=pool, include_checkpoints=include_checkpoints, states=states)
     except Exception as e:
         logger.warning("Vector search unavailable (%s); keyword results only", type(e).__name__)
         vector = []
@@ -716,7 +767,8 @@ def hybrid_search(query: str, limit: int = 5, include_checkpoints: bool = False)
     return results
 
 
-def search(query: str, limit: int = 5, agent_id: str = "", include_checkpoints: bool = False) -> list[dict]:
+def search(query: str, limit: int = 5, agent_id: str = "", include_checkpoints: bool = False,
+           states=("active",)) -> list[dict]:
     """Vector search: cosine similarity over the stored embeddings.
 
     Deliberately not mem0's Memory.search(): with mem0ai 2.0.2 its fused
@@ -730,10 +782,11 @@ def search(query: str, limit: int = 5, agent_id: str = "", include_checkpoints: 
            f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
            f"{_META}->>'category' AS category, "
            f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
-           f"payload->>'state' AS state, "
+           f"payload->>'state' AS state, payload->>'source' AS source, "
+                f"payload->>'review_reason' AS review_reason, payload->>'project' AS project, "
            f"1 - (vector <=> %s::vector) AS score "
            f"FROM {_MEM_TABLE} WHERE payload->>'user_id' = %s "
-           + ("" if include_checkpoints else f"AND {_SEARCHABLE} ") +
+           + f"AND {_population(include_checkpoints, states)} " +
            f"ORDER BY vector <=> %s::vector LIMIT %s")
     vec = str(list(embedding))
     conn = _db_conn()
@@ -791,7 +844,7 @@ def save_checkpoint(session_id: str, content: str, agent_id: str = "", project: 
     capture_id = capture_id or str(_uuid.uuid4())   # stable tie-breaker, kept across retries
     get_memory().add(
         redact(content), user_id=settings.mem0_user_id, agent_id=_agent_id(agent_id), infer=False,
-        metadata={"kind": "checkpoint", "session_id": session_id, "project": project,
+        metadata={"kind": "checkpoint", "source": "hook", "session_id": session_id, "project": project,
                   "category": "session", "captured_at": captured, "capture_id": capture_id,
                   "expires_at": expires})
     conn = _db_conn()
@@ -821,6 +874,7 @@ def get_checkpoint(session_id: str) -> Optional[dict]:
                         f"payload->>'project' AS project FROM {_MEM_TABLE} "
                         f"WHERE payload->>'kind' = 'checkpoint' AND payload->>'session_id' = %s "
                         f"AND payload->>'user_id' = %s "
+                        f"AND (NOT payload ? 'expires_at' OR (payload->>'expires_at')::timestamptz > now()) "
                         f"ORDER BY coalesce(payload->>'captured_at', payload->>'created_at') DESC, "
                         f"coalesce(payload->>'capture_id', '') DESC, id DESC LIMIT 1",
                         (session_id, settings.mem0_user_id))
@@ -830,6 +884,38 @@ def get_checkpoint(session_id: str) -> Optional[dict]:
         return None
     finally:
         conn.close()
+
+
+def review(memory_id: str, action: str, reviewer: str = "user", note: str = "") -> dict:
+    """Promote a candidate to active or reject it, with an audit trail.
+
+    Only candidates can be reviewed; anything else returns a conflict with the
+    current state. The transition is a single conditional UPDATE, so two
+    concurrent reviews cannot both apply.
+    """
+    target = {"promote": "active", "reject": "rejected"}.get(action)
+    if not target:
+        return {"ok": False, "error": "action must be promote or reject"}
+    import datetime as _dt
+    audit = {"state": target, "reviewed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+             "reviewed_by": reviewer[:64], "review_note": note[:500]}
+    conn = _db_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(f"UPDATE {_MEM_TABLE} SET payload = payload || %s::jsonb "
+                            f"WHERE id::text = %s AND payload->>'state' = 'candidate' RETURNING id",
+                            (json.dumps(audit), memory_id))
+                if cur.fetchone():
+                    return {"ok": True, "id": memory_id, "state": target}
+                cur.execute(f"SELECT coalesce(payload->>'state', 'active') FROM {_MEM_TABLE} WHERE id::text = %s",
+                            (memory_id,))
+                row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {"ok": False, "error": "not found"}
+    return {"ok": False, "error": "conflict", "state": row[0]}
 
 
 def update(memory_id: str, content: str) -> dict:
@@ -848,7 +934,8 @@ def update_tags(memory_id: str, tags: list) -> bool:
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT payload FROM mem0 WHERE id = %s", (memory_id,))
+                # FOR UPDATE: a review committing between read and write must not be undone
+                cur.execute("SELECT payload FROM mem0 WHERE id = %s FOR UPDATE", (memory_id,))
                 row = cur.fetchone()
                 if not row:
                     return False
