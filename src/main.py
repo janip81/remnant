@@ -3,6 +3,7 @@ import hmac
 import json
 import logging
 import urllib.parse
+from typing import Optional
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
@@ -30,11 +31,13 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def add_memory(content: str, agent_id: str = "", infer: bool = True, category: str = "", tags: list[str] = []) -> str:
-    """Store a fact or observation in memory.
+async def add_memory(content: str, agent_id: str = "", infer: Optional[bool] = None, category: str = "", tags: list[str] = []) -> str:
+    """Store a fact or observation in memory, as written (one self-contained fact per call works best).
     category: project|feedback|reference|user|session|incident
     tags: free-form list, e.g. ["prod-k8s", "remnant", "cnpg"] — use app names, cluster names, topics.
-    Set infer=False to store as-is."""
+    infer: omit to use the server default (stored as-is); True asks the LLM to extract facts first."""
+    if infer is None:
+        infer = settings.mem0_infer
     if category and category not in mem_store.VALID_CATEGORIES:
         return f"Invalid category '{category}'. Valid: {', '.join(sorted(mem_store.VALID_CATEGORIES) - {''})}"
     if settings.redis_url:
@@ -47,15 +50,19 @@ async def add_memory(content: str, agent_id: str = "", infer: bool = True, categ
 
 @mcp.tool()
 async def search_memory(query: str, limit: int = 5) -> str:
-    """Search memory semantically. Returns top matching facts."""
-    results = await asyncio.to_thread(mem_store.search, query, limit=limit)
+    """Search memory by meaning and exact terms (hostnames, versions, error codes, names).
+    Returns top matching facts with a 0..1 relevance score."""
+    results = await asyncio.to_thread(mem_store.hybrid_search, query, limit=limit)
     if not results:
         return "No memories found."
+    # rank = fused rank score (ordering only); cos = cosine similarity when the
+    # vector side found it — use that, not rank, to judge how relevant a hit is.
     lines = []
     for r in results:
-        score = r.get("score", "")
         text = r.get("memory", r.get("text", str(r)))
-        lines.append(f"[{score:.3f}] {text}" if score else text)
+        cos = r.get("vector_score")
+        evidence = f"cos {cos:.2f}" if cos is not None else "keyword only"
+        lines.append(f"[rank {r.get('score', 0):.2f} | {evidence} | {r.get('match', '')}] {text}")
     return "\n".join(lines)
 
 
@@ -396,7 +403,7 @@ async def app(scope, receive, send):
             filter_category = qs.get("category", "").strip()
 
             if q:
-                results = await asyncio.to_thread(mem_store.search, q, limit=200)
+                results = await asyncio.to_thread(mem_store.hybrid_search, q, limit=200)
                 if sort in ("newest", "oldest"):
                     reverse = sort == "newest"
                     results.sort(key=lambda r: r.get("created_at", ""), reverse=reverse)
@@ -426,7 +433,7 @@ async def app(scope, receive, send):
             if content:
                 if settings.redis_url:
                     from queue_worker import enqueue
-                    await enqueue(content, src_agent, True, "", [])
+                    await enqueue(content, src_agent, settings.mem0_infer, "", [])
                 else:
                     await asyncio.to_thread(mem_store.add, content, agent_id=src_agent)
             await _send_response(send, *_json_response({"ok": True}))

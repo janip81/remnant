@@ -1,4 +1,7 @@
 import json
+import os
+import math
+import re
 import logging
 import threading
 import time
@@ -459,13 +462,241 @@ def job_written(job_id: str) -> bool:
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Hybrid search: Postgres full-text (exact identifiers) + mem0 vectors (meaning),
+# merged with reciprocal rank fusion. The 'simple' text config does no stemming,
+# so prod-k8s, 0.2.6, remnant-mcp.prod.threshold.se or c46e6ae8 stay one term.
+# ---------------------------------------------------------------------------
+
+_FTS_EXPR = "to_tsvector('simple', coalesce(payload->>'data', ''))"
+_FTS_DOC = "fts"   # stored generated column; falls back to _FTS_EXPR if it cannot be added
+_RRF_K = 60
+_IDENTIFIER = re.compile(r"[\d\-._/:]")
+KEYWORD_WEIGHT_PLAIN = float(os.environ.get("SEARCH_KEYWORD_WEIGHT_PLAIN", "0.3"))
+_CANDIDATES = 25
+_TERM = re.compile(r"[\w][\w.\-/:]*[\w]|[\w]", re.UNICODE)
+_STOPWORDS = frozenset("""
+a about an and any anything are as at be by can did do does for from has have how i in
+info is it its know me my of on or our remember so tell that the this to was we were what
+when where which who why will with you your
+och att det en ett är för på som med av till den har inte om var jag vi de kan hur vad
+""".split())
+
+
+def _query_terms(query: str, max_terms: int = 12) -> list[str]:
+    terms = []
+    for t in _TERM.findall(query.lower()):
+        if len(t) < 2 or t in _STOPWORDS or t in terms:
+            continue
+        terms.append(t)
+    return terms[:max_terms]
+
+
+def ensure_fts_index() -> bool:
+    """Add a stored tsvector column + GIN index for keyword search (idempotent).
+
+    mem0 always names its columns (id, vector, payload), so an extra generated
+    column is invisible to it. Returns False when the table does not exist yet
+    (fresh install) or the database is read-only; keyword search then uses the
+    expression directly.
+    """
+    global _FTS_DOC
+    try:
+        conn = _db_conn()
+    except Exception as e:
+        logger.info("fts column check skipped, database unreachable (%s)", type(e).__name__)
+        return False
+    try:
+        if _has_fts_column():
+            # already migrated: skip the ALTER, which would take an ACCESS EXCLUSIVE lock again
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("SET LOCAL lock_timeout = '3s'")
+                    cur.execute(f"CREATE INDEX IF NOT EXISTS {_MEM_TABLE}_fts_idx ON {_MEM_TABLE} USING gin (fts)")
+            _FTS_DOC = "fts"
+            return True
+        with conn:
+            with conn.cursor() as cur:
+                # bounded: never block startup or writers behind a long transaction
+                cur.execute("SET LOCAL lock_timeout = '3s'")
+                cur.execute("SET LOCAL statement_timeout = '60s'")
+                cur.execute(f"ALTER TABLE {_MEM_TABLE} ADD COLUMN IF NOT EXISTS fts tsvector "
+                            f"GENERATED ALWAYS AS ({_FTS_EXPR}) STORED")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS {_MEM_TABLE}_fts_idx ON {_MEM_TABLE} USING gin (fts)")
+        _FTS_DOC = "fts"
+        return True
+    except Exception as e:
+        logger.info("fts column not added (%s); keyword search uses the expression", type(e).__name__)
+        _FTS_DOC = _has_fts_column() and "fts" or _FTS_EXPR
+        return False
+    finally:
+        conn.close()
+
+
+def _has_fts_column() -> bool:
+    try:
+        conn = _db_conn()
+    except Exception:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name = %s AND column_name = 'fts'",
+                        (_MEM_TABLE,))
+            return cur.fetchone() is not None
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def keyword_search(query: str, limit: int = _CANDIDATES) -> list[dict]:
+    try:
+        return _keyword_search(query, limit)
+    except psycopg2.errors.UndefinedColumn:
+        ensure_fts_index()          # table was created after startup
+        return _keyword_search(query, limit)
+
+
+def _like(term: str) -> str:
+    return "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _keyword_search(query: str, limit: int) -> list[dict]:
+    """Full-text search weighted by term rarity (BM25 idf, no term frequency).
+
+    Each query term that occurs in a memory adds its idf, so one rare
+    identifier (morbius.prod.threshold.se) outweighs several common words
+    (restart, pod). Identifier-like terms also match as a substring, because
+    Postgres indexes pg-main-rw-lb.postgres.svc as one token and would never
+    match the query term pg-main-rw. Terms found in more than 20% of memories
+    are dropped unless nothing rarer is left.
+    """
+    terms = _query_terms(query)
+    if not terms:
+        return []
+
+    def cond(term: str) -> tuple[str, list]:
+        sql, params = f"{_FTS_DOC} @@ plainto_tsquery('simple', %s)", [term]
+        if _IDENTIFIER.search(term):
+            sql, params = f"({sql} OR payload->>'data' ILIKE %s)", [term, _like(term)]
+        return sql, params
+
+    user = "payload->>'user_id' = %s"
+    conn = _db_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            conds = [cond(t) for t in terms]
+            # unique aliases: RealDictCursor keeps one value per column name
+            counts = ", ".join(f"count(*) FILTER (WHERE {c}) AS df{i}" for i, (c, _) in enumerate(conds))
+            cur.execute(f"SELECT count(*) AS n, {counts} FROM {_MEM_TABLE} WHERE {user}",
+                        [p for _, ps in conds for p in ps] + [settings.mem0_user_id])
+            row = cur.fetchone()
+            n, dfs = row["n"], [row[f"df{i}"] for i in range(len(conds))]
+            weighted = [(c, df) for c, df in zip(conds, dfs) if df]
+            if not weighted or not n:
+                return []
+            rare = [(c, df) for c, df in weighted if df <= 0.2 * n]
+            weighted = rare or sorted(weighted, key=lambda x: x[1])[:2]
+            score_sql, score_params = [], []
+            for (c, ps), df in weighted:
+                score_sql.append(f"CASE WHEN {c} THEN %s ELSE 0 END")
+                score_params += ps + [math.log((n - df + 0.5) / (df + 0.5) + 1)]
+            any_sql = " OR ".join(c for (c, _), _ in weighted)
+            any_params = [p for (_, ps), _ in weighted for p in ps]
+            cur.execute(
+                f"SELECT id, payload->>'data' AS memory, payload->>'agent_id' AS agent_id, "
+                f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
+                f"{_META}->>'category' AS category, "
+                f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
+                f"({' + '.join(score_sql)}) AS rank "
+                f"FROM {_MEM_TABLE} WHERE {user} AND ({any_sql}) "
+                f"ORDER BY rank DESC, length(payload->>'data') ASC LIMIT %s",
+                score_params + [settings.mem0_user_id] + any_params + [limit])
+            rows = cur.fetchall()
+    except psycopg2.errors.UndefinedTable:
+        return []
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        item = _row_to_result(r)
+        item["keyword_rank"] = float(r["rank"])
+        out.append(item)
+    return out
+
+
+def hybrid_search(query: str, limit: int = 5) -> list[dict]:
+    """Merge keyword and vector results with reciprocal rank fusion.
+
+    score is the fused score scaled to 0..1 (1.0 = ranked first by both).
+    vector_score is the cosine similarity when the vector side found the item.
+    If the vector side fails (Ollama offline), keyword results are returned alone.
+    """
+    pool = max(_CANDIDATES, limit)
+    keyword = keyword_search(query, pool)
+    try:
+        vector = search(query, limit=pool)
+    except Exception as e:
+        logger.warning("Vector search unavailable (%s); keyword results only", type(e).__name__)
+        vector = []
+    # Keyword matches are decisive for identifiers (prod-k8s, 0.2.6, c46e6ae8)
+    # but mostly noise for plain-language questions, where vectors do better.
+    kw_weight = 1.0 if any(_IDENTIFIER.search(t) for t in _query_terms(query)) else KEYWORD_WEIGHT_PLAIN
+    weights = {"vector": 1.0, "keyword": kw_weight}
+    fused: dict[str, dict] = {}
+    for source, items in (("vector", vector), ("keyword", keyword)):
+        for rank, item in enumerate(items, start=1):
+            mid = str(item.get("id", ""))
+            entry = fused.setdefault(mid, {"item": item, "rrf": 0.0, "sources": []})
+            entry["rrf"] += weights[source] / (_RRF_K + rank)
+            entry["sources"].append(source)
+            if source == "vector":
+                entry["vector_score"] = item.get("score")
+    best = (1.0 + kw_weight) / (_RRF_K + 1)
+    ranked = sorted(fused.values(), key=lambda e: e["rrf"], reverse=True)[:limit]
+    results = []
+    for e in ranked:
+        item = dict(e["item"])
+        item["score"] = round(e["rrf"] / best, 4)
+        item["vector_score"] = e.get("vector_score")
+        item["match"] = "+".join(e["sources"])
+        results.append(item)
+    return results
+
+
 def search(query: str, limit: int = 5, agent_id: str = "") -> list[dict]:
-    m = get_memory()
-    filters = {"user_id": settings.mem0_user_id}
-    result = m.search(query, filters=filters, top_k=limit)
-    if isinstance(result, dict) and "results" in result:
-        return result["results"]
-    return result if isinstance(result, list) else []
+    """Vector search: cosine similarity over the stored embeddings.
+
+    Deliberately not mem0's Memory.search(): with mem0ai 2.0.2 its fused
+    pipeline returned near-constant scores and found 0 of 30 test questions
+    whose answers plain cosine ranking found 16 of 30 (2026-10-14 eval on the
+    prod data). The query is embedded with mem0's own embedder, the same one
+    used when memories were written.
+    """
+    embedding = get_memory().embedding_model.embed(query, "search")
+    sql = (f"SELECT id, payload->>'data' AS memory, payload->>'agent_id' AS agent_id, "
+           f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
+           f"{_META}->>'category' AS category, "
+           f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
+           f"1 - (vector <=> %s::vector) AS score "
+           f"FROM {_MEM_TABLE} WHERE payload->>'user_id' = %s "
+           f"ORDER BY vector <=> %s::vector LIMIT %s")
+    vec = str(list(embedding))
+    conn = _db_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, [vec, settings.mem0_user_id, vec, limit])
+            rows = cur.fetchall()
+    except psycopg2.errors.UndefinedTable:
+        return []
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        item = _row_to_result(r)
+        item["score"] = round(float(r["score"]), 4)
+        out.append(item)
+    return out
 
 
 def get_all(agent_id: str = "") -> list[dict]:
@@ -517,3 +748,4 @@ def update_tags(memory_id: str, tags: list) -> bool:
 
 # Run schema setup at import time (non-fatal if DB not yet ready)
 _ensure_schema()
+ensure_fts_index()
