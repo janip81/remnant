@@ -53,6 +53,16 @@ async def proxy(path: str, request: Request) -> Response:
     )
 
 
+@app.middleware("http")
+async def no_cache_for_html(request: Request, call_next):
+    """index.html must be revalidated on every load, or browsers keep an old copy that
+    points at the previous bundle after a deploy. Hashed assets/* stay cacheable."""
+    response = await call_next(request)
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 # Serve React SPA — must come after API routes
 if DIST.exists():
     app.mount("/", StaticFiles(directory=str(DIST), html=True), name="static")
