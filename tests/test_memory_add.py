@@ -81,3 +81,18 @@ def test_handler_removed_after_call(monkeypatch):
     before = list(logging.getLogger("mem0.memory.main").handlers)
     memory.add("fact", infer=True)
     assert logging.getLogger("mem0.memory.main").handlers == before
+
+
+def test_embedding_input_is_capped_but_signature_kept():
+    seen = []
+
+    class Embedder:
+        def embed(self, text, memory_action=None):
+            seen.append((len(text), memory_action))
+            return [0.0]
+
+    e = Embedder()
+    memory._cap_embedding_input(e)
+    e.embed("x" * (memory.MAX_EMBED_CHARS + 500), "add")
+    e.embed("short", "search")
+    assert seen == [(memory.MAX_EMBED_CHARS, "add"), (5, "search")]
