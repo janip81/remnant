@@ -210,3 +210,19 @@ def test_concurrent_saves_keep_exactly_the_newest(mem, monkeypatch):
         cur.execute("SELECT payload->>'data' FROM mem0 WHERE payload->>'session_id' = 'c'")
         assert [r[0] for r in cur.fetchall()] == ["state 5"]
     conn.close()
+
+
+def test_mixed_timezone_offsets_order_by_real_time(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    mem.save_checkpoint("tz", "newer", captured_at="2026-10-15T09:30:00+00:00")      # 09:30 UTC
+    mem.save_checkpoint("tz", "older", captured_at="2026-10-15T10:00:00+01:00")      # 09:00 UTC
+    assert mem.get_checkpoint("tz")["memory"] == "newer"
+
+
+def test_same_instant_tie_broken_by_capture_id_not_row_id(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    t = "2026-10-15T10:00:00.123456+00:00"
+    mem.save_checkpoint("tie", "b-capture", captured_at=t, capture_id="bbbb")
+    mem.save_checkpoint("tie", "a-capture", captured_at=t, capture_id="aaaa")
+    mem.save_checkpoint("tie", "b-capture retry", captured_at=t, capture_id="bbbb")
+    assert mem.get_checkpoint("tie")["memory"].startswith("b-capture")

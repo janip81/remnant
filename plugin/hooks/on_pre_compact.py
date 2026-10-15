@@ -22,6 +22,8 @@ import json
 import logging
 import os
 import sys
+import uuid
+from datetime import datetime, timezone
 import time
 import urllib.request
 import urllib.error
@@ -288,7 +290,8 @@ def store_memory(memory_url: str, token: str, content: str, source: str,
         # PreCompact writes synchronously so SessionStart(compact) can read it back
         call = {"name": "save_checkpoint",
                 "arguments": {"session_id": session_id, "content": content, "project": project,
-                              "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+                              "captured_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                              "capture_id": str(uuid.uuid4()),
                               "sync": source != "session-end"}}
     else:  # older Claude Code without session_id: fall back to a plain memory
         call = {"name": "add_memory", "arguments": {"content": content, "infer": False, "category": "session"}}

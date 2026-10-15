@@ -730,7 +730,7 @@ def get_all(agent_id: str = "") -> list[dict]:
 
 
 def save_checkpoint(session_id: str, content: str, agent_id: str = "", project: str = "",
-                    captured_at: str = "") -> dict:
+                    captured_at: str = "", capture_id: str = "") -> dict:
     """Store the one replaceable checkpoint for a session (hook snapshot).
 
     Ordered by capture time, not write time: after writing, only the newest
@@ -743,16 +743,22 @@ def save_checkpoint(session_id: str, content: str, agent_id: str = "", project: 
         raise ValueError("session_id required")
     import datetime as _dt
     now = _dt.datetime.now(_dt.timezone.utc)
-    captured = captured_at or now.isoformat()
     try:
-        base = _dt.datetime.fromisoformat(captured.replace("Z", "+00:00"))
+        base = _dt.datetime.fromisoformat((captured_at or "").replace("Z", "+00:00")) if captured_at else now
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=_dt.timezone.utc)
     except ValueError:
-        base, captured = now, now.isoformat()
+        base = now
+    # one fixed format (UTC, microseconds) so the text ordering below is the time ordering
+    captured = base.astimezone(_dt.timezone.utc).isoformat(timespec="microseconds")
     expires = (base + _dt.timedelta(days=CHECKPOINT_TTL_DAYS)).isoformat()
+    import uuid as _uuid
+    capture_id = capture_id or str(_uuid.uuid4())   # stable tie-breaker, kept across retries
     get_memory().add(
         redact(content), user_id=settings.mem0_user_id, agent_id=_agent_id(agent_id), infer=False,
         metadata={"kind": "checkpoint", "session_id": session_id, "project": project,
-                  "category": "session", "captured_at": captured, "expires_at": expires})
+                  "category": "session", "captured_at": captured, "capture_id": capture_id,
+                  "expires_at": expires})
     conn = _db_conn()
     try:
         with conn:
@@ -761,7 +767,8 @@ def save_checkpoint(session_id: str, content: str, agent_id: str = "", project: 
                     f"DELETE FROM {_MEM_TABLE} WHERE payload->>'kind' = 'checkpoint' AND payload->>'session_id' = %s "
                     f"AND id <> (SELECT id FROM {_MEM_TABLE} WHERE payload->>'kind' = 'checkpoint' "
                     f"AND payload->>'session_id' = %s "
-                    f"ORDER BY coalesce(payload->>'captured_at', payload->>'created_at') DESC, id DESC LIMIT 1)",
+                    f"ORDER BY coalesce(payload->>'captured_at', payload->>'created_at') DESC, "
+                    f"coalesce(payload->>'capture_id', '') DESC, id DESC LIMIT 1)",
                     (session_id, session_id))
                 removed = cur.rowcount
     finally:
@@ -779,7 +786,8 @@ def get_checkpoint(session_id: str) -> Optional[dict]:
                         f"payload->>'project' AS project FROM {_MEM_TABLE} "
                         f"WHERE payload->>'kind' = 'checkpoint' AND payload->>'session_id' = %s "
                         f"AND payload->>'user_id' = %s "
-                        f"ORDER BY coalesce(payload->>'captured_at', payload->>'created_at') DESC, id DESC LIMIT 1",
+                        f"ORDER BY coalesce(payload->>'captured_at', payload->>'created_at') DESC, "
+                        f"coalesce(payload->>'capture_id', '') DESC, id DESC LIMIT 1",
                         (session_id, settings.mem0_user_id))
             row = cur.fetchone()
             return dict(row) if row else None

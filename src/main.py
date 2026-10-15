@@ -73,7 +73,7 @@ async def search_memory(query: str, limit: int = 5, include_sessions: bool = Fal
 
 @mcp.tool()
 async def save_checkpoint(session_id: str, content: str, project: str = "", agent_id: str = "",
-                          captured_at: str = "", sync: bool = False) -> str:
+                          captured_at: str = "", capture_id: str = "", sync: bool = False) -> str:
     """Save the replaceable working-state checkpoint of a session (used by hooks).
     Keeps only the newest capture per session_id (captured_at, ISO 8601; defaults
     to now); never returned by search_memory; expires after a few days.
@@ -82,11 +82,13 @@ async def save_checkpoint(session_id: str, content: str, project: str = "", agen
     if not session_id or not content.strip():
         return "session_id and content are required"
     import datetime as _dt
+    import uuid as _uuid
     captured_at = captured_at or _dt.datetime.now(_dt.timezone.utc).isoformat()
+    capture_id = capture_id or str(_uuid.uuid4())   # fixed now so a queued retry keeps it
     if sync or not settings.redis_url:
         try:
             result = await asyncio.to_thread(mem_store.save_checkpoint, session_id, content, agent_id,
-                                             project, captured_at)
+                                             project, captured_at, capture_id)
             return json.dumps({"saved": True, **result})
         except Exception as e:
             if not settings.redis_url:
@@ -94,7 +96,8 @@ async def save_checkpoint(session_id: str, content: str, project: str = "", agen
             logger.warning("Synchronous checkpoint failed (%s); queueing", type(e).__name__)
     from queue_worker import enqueue
     job_id = await enqueue(content, agent_id, False, "session", [], kind="checkpoint",
-                           session_id=session_id, project=project, captured_at=captured_at)
+                           session_id=session_id, project=project, captured_at=captured_at,
+                           capture_id=capture_id)
     return json.dumps({"queued": True, "job_id": job_id})
 
 
