@@ -17,7 +17,7 @@ import Typography from '@mui/material/Typography'
 import AddIcon from '@mui/icons-material/Add'
 import DownloadIcon from '@mui/icons-material/Download'
 import SearchIcon from '@mui/icons-material/Search'
-import { api, FetchParams } from '../api/memories'
+import { api, FetchParams, MemoryState } from '../api/memories'
 import MemoryCard from '../components/MemoryCard'
 import StatsBar from '../components/StatsBar'
 
@@ -30,6 +30,7 @@ export default function Memories() {
   const [sort, setSort] = useState<Sort>('newest')
   const [agentFilter, setAgentFilter] = useState('')
   const [categoryFilter, setCategoryFilter] = useState('')
+  const [stateFilter, setStateFilter] = useState<MemoryState | ''>('')
   const [addText, setAddText] = useState('')
   const [showAdd, setShowAdd] = useState(false)
 
@@ -40,6 +41,7 @@ export default function Memories() {
     sort: deferredSearch ? 'relevance' : sort,
     agent_id: agentFilter || undefined,
     category: categoryFilter || undefined,
+    state: stateFilter || undefined,
   }
 
   const { data: stats } = useQuery({
@@ -78,6 +80,11 @@ export default function Memories() {
 
   const deleteMutation = useMutation({
     mutationFn: (id: string) => api.delete(id),
+    onSuccess: invalidate,
+  })
+
+  const reviewMutation = useMutation({
+    mutationFn: ({ id, action }: { id: string; action: 'promote' | 'reject' }) => api.review(id, action),
     onSuccess: invalidate,
   })
 
@@ -134,6 +141,17 @@ export default function Memories() {
             </Select>
           </FormControl>
         )}
+
+        <FormControl size="small" sx={{ minWidth: 140 }}>
+          <InputLabel>State</InputLabel>
+          <Select value={stateFilter} label="State" onChange={(e) => setStateFilter(e.target.value as MemoryState | '')}>
+            <MenuItem value="">All</MenuItem>
+            <MenuItem value="active">active</MenuItem>
+            <MenuItem value="candidate">candidate (review)</MenuItem>
+            <MenuItem value="superseded">superseded</MenuItem>
+            <MenuItem value="rejected">rejected</MenuItem>
+          </Select>
+        </FormControl>
 
         <Button
           startIcon={<AddIcon />}
@@ -200,6 +218,7 @@ export default function Memories() {
               key={m.id}
               memory={m}
               onDelete={(id) => deleteMutation.mutate(id)}
+              onReview={(id, action) => reviewMutation.mutate({ id, action })}
               onUpdate={(id, content) => updateMutation.mutate({ id, content })}
               onUpdateTags={(id, tags) => updateTagsMutation.mutate({ id, tags })}
             />

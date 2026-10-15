@@ -1,5 +1,7 @@
 export type MemoryCategory = 'project' | 'feedback' | 'reference' | 'user' | 'session' | 'incident' | ''
 
+export type MemoryState = 'active' | 'candidate' | 'superseded' | 'rejected'
+
 export interface Memory {
   id: string
   memory: string
@@ -9,6 +11,10 @@ export interface Memory {
   created_at: string
   updated_at: string
   score: number | null
+  state: MemoryState
+  source: string
+  review_reason: string
+  project: string
 }
 
 export interface Stats {
@@ -25,6 +31,7 @@ export interface FetchParams {
   sort?: 'newest' | 'oldest' | 'relevance'
   agent_id?: string
   category?: string
+  state?: MemoryState | ''
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -43,6 +50,7 @@ export const api = {
     if (params.sort) qs.set('sort', params.sort)
     if (params.agent_id) qs.set('agent_id', params.agent_id)
     if (params.category) qs.set('category', params.category)
+    if (params.state) qs.set('state', params.state)
     return request(`/api/memories${qs.size ? `?${qs}` : ''}`)
   },
 
@@ -65,6 +73,13 @@ export const api = {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tags }),
+    }),
+
+  review: (id: string, action: 'promote' | 'reject', note = ''): Promise<{ ok: boolean; state?: string; error?: string }> =>
+    request(`/api/memories/${id}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, note }),
     }),
 
   delete: (id: string): Promise<{ ok: boolean }> =>
