@@ -226,3 +226,51 @@ def test_same_instant_tie_broken_by_capture_id_not_row_id(mem, monkeypatch):
     mem.save_checkpoint("tie", "a-capture", captured_at=t, capture_id="aaaa")
     mem.save_checkpoint("tie", "b-capture retry", captured_at=t, capture_id="bbbb")
     assert mem.get_checkpoint("tie")["memory"].startswith("b-capture")
+
+
+def test_semantic_dedup_keeps_originals_when_merge_not_confirmed(mem, monkeypatch):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import dedup_job
+    import psycopg2.extras
+    _insert("near duplicate fact A about pg-main-rw")
+    _insert("near duplicate fact A about pg-main-rw!")
+    monkeypatch.setattr(dedup_job, "ollama_merge", lambda texts: "- merged fact")
+    monkeypatch.setattr(dedup_job, "store_memory_direct", lambda c, category="": ("queued", "job-never-lands"))
+    monkeypatch.setattr(dedup_job, "MERGE_CONFIRM_SECONDS", 1)
+    conn = psycopg2.connect(URL)
+    psycopg2.extras.register_uuid(conn_or_curs=conn)
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS job_runs (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                started_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ, phase TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running', memories_scanned INT DEFAULT 0, memories_changed INT DEFAULT 0,
+                rules_added INT DEFAULT 0, duration_seconds FLOAT, error TEXT)""")
+        n_before = _count(conn)
+        dedup_job.phase2_semantic_dedup(conn, threshold=0.5, dry_run=False)   # all vectors equal -> one cluster
+        assert _count(conn) == n_before                                       # nothing deleted
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM mem0_archive WHERE archive_reason = 'semantic-dedup'")
+            assert cur.fetchone()[0] == 0
+    finally:
+        conn.rollback(); conn.close()
+
+
+def test_confirm_stored_finds_queued_row_by_job_id(mem):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import dedup_job
+    _insert("merged", {"job_id": "job-42"})
+    conn = psycopg2.connect(URL)
+    try:
+        assert dedup_job.confirm_stored(conn, ("queued", "job-42"), timeout=1) is not None
+        assert dedup_job.confirm_stored(conn, ("queued", "missing"), timeout=1) is None
+        assert dedup_job.confirm_stored(conn, None) is None
+    finally:
+        conn.close()
+
+
+def _count(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM mem0")
+        n = cur.fetchone()[0]
+    conn.commit()
+    return n
