@@ -91,6 +91,8 @@ Continue where you left off. If the memories above look stale, call \`search_mem
 EOF
 
 elif [ "$SOURCE" = "compact" ]; then
+  # The context no longer contains earlier injections: allow them again.
+  [ -n "$SESSION_ID" ] && rm -f "${XDG_CACHE_HOME:-$HOME/.cache}/remnant/injected-${SESSION_ID//[^A-Za-z0-9_-]/}.json"
   # Context was just lost — fetch the pre-compaction summary and recent session state directly.
   # Do NOT rely on Claude calling search_memory; MCP may not be connected yet.
   CHECKPOINT=$(checkpoint_direct)
