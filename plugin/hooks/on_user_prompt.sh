@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Hook: UserPromptSubmit
 #
-# Fires on every user message. Searches mem0 for relevant memories
-# and injects them into Claude's context before processing.
+# Fires on every user message. Injects memories only when the prompt names an
+# identifier that literally appears in them (on_user_prompt.py).
 #
 # Input:  JSON on stdin with prompt, session_id, cwd, transcript_path
 # Output: Matching memories as context text (exit 0)
@@ -29,46 +29,7 @@ if echo "$PROMPT" | grep -qE '^\s*/clear\s*$'; then
   exit 0
 fi
 
-if [ ${#PROMPT} -lt 20 ]; then
-  exit 0
-fi
-
-if [ -z "$MEMORY_URL" ] || [ -z "$MEMORY_TOKEN" ]; then
-  exit 0
-fi
-
-CWD=$(echo "$INPUT" | jq -r '.cwd // ""' 2>/dev/null || echo "")
-PROJECT=$(basename "$CWD")
-
-# Prepend project name so semantic search surfaces project-specific memories
-# even for short/vague prompts like "ok how to fix it?"
-QUERY_BASE=$(echo "$PROMPT" | head -c 900)
-if [ -n "$PROJECT" ] && [ "$PROJECT" != "." ]; then
-  QUERY="${PROJECT} ${QUERY_BASE}"
-else
-  QUERY="$QUERY_BASE"
-fi
-
-PAYLOAD=$(jq -cn --arg q "$QUERY" \
-  '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search_memory","arguments":{"query":$q,"limit":3}},"id":1}')
-
-RESPONSE=$(curl -sf --max-time 8 \
-  -X POST "${MEMORY_URL}/mcp" \
-  -H "Authorization: Bearer ${MEMORY_TOKEN}" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d "$PAYLOAD" 2>/dev/null || echo "")
-
-if [ -z "$RESPONSE" ]; then
-  exit 0
-fi
-
-TEXT=$(echo "$RESPONSE" | grep '^data:' | sed 's/^data: //' | \
-  jq -r '.result.content[0].text // ""' 2>/dev/null || echo "")
-
-if [ -z "$TEXT" ] || [ "$TEXT" = "No memories found." ]; then
-  exit 0
-fi
-
-printf '<memory>\n%s\n</memory>\n' "$TEXT"
+# Injection decision (identifier gate, budget, per-session cache) lives in
+# on_user_prompt.py — see its docstring for the calibration behind it.
+echo "$INPUT" | python3 "$SCRIPT_DIR/on_user_prompt.py" 2>/dev/null
 exit 0

@@ -49,15 +49,20 @@ async def add_memory(content: str, agent_id: str = "", infer: Optional[bool] = N
 
 
 @mcp.tool()
-async def search_memory(query: str, limit: int = 5, include_sessions: bool = False) -> str:
+async def search_memory(query: str, limit: int = 5, include_sessions: bool = False, format: str = "text") -> str:
     """Search memory by meaning and exact terms (hostnames, versions, error codes, names).
     Each hit shows rank (fused ordering, 0..1), cos (cosine similarity, when the
     vector side matched) and which side matched. Neither is a calibrated
     probability: treat low-cos or keyword-only hits as weaker evidence.
     Session checkpoints are excluded unless include_sessions=True; to restore a
-    session use get_checkpoint(session_id)."""
+    session use get_checkpoint(session_id).
+    format="json" returns [{id, memory, rank, cos, match, state}] for hooks/tools."""
     results = await asyncio.to_thread(mem_store.hybrid_search, query, limit=limit,
                                       include_checkpoints=include_sessions)
+    if format == "json":
+        return json.dumps([{"id": r.get("id"), "memory": r.get("memory", ""), "rank": r.get("score"),
+                            "cos": r.get("vector_score"), "match": r.get("match", ""),
+                            "state": r.get("state") or "active"} for r in results])
     if not results:
         return "No memories found."
     # rank = fused rank score (ordering only); cos = cosine similarity when the
