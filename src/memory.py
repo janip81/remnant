@@ -277,6 +277,8 @@ def _row_to_result(row: dict) -> dict:
         "created_at": row["created_at"] or "",
         "updated_at": row["updated_at"] or "",
         "metadata": meta,
+        # lifecycle: 'candidate' rows (unreviewed LLM output) are never auto-injected
+        "state": row.get("state") or "active",
     }
 
 
@@ -285,7 +287,8 @@ def list_rows(agent_id: str = "") -> list[dict]:
     sql = (f"SELECT id, payload->>'data' AS memory, payload->>'agent_id' AS agent_id, "
            f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
            f"{_META}->>'category' AS category, "
-           f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags "
+           f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
+           f"payload->>'state' AS state "
            f"FROM {_MEM_TABLE} WHERE payload->>'user_id' = %s")
     params: list = [settings.mem0_user_id]
     if agent_id:
@@ -655,6 +658,7 @@ def _keyword_search(query: str, limit: int, include_checkpoints: bool = False) -
                 f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
                 f"{_META}->>'category' AS category, "
                 f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
+                f"payload->>'state' AS state, "
                 f"({' + '.join(score_sql)}) AS rank "
                 f"FROM {_MEM_TABLE} WHERE {user} AND ({any_sql}) "
                 f"ORDER BY rank DESC, length(payload->>'data') ASC LIMIT %s",
@@ -725,6 +729,7 @@ def search(query: str, limit: int = 5, agent_id: str = "", include_checkpoints: 
            f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
            f"{_META}->>'category' AS category, "
            f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
+           f"payload->>'state' AS state, "
            f"1 - (vector <=> %s::vector) AS score "
            f"FROM {_MEM_TABLE} WHERE payload->>'user_id' = %s "
            + ("" if include_checkpoints else f"AND {_SEARCHABLE} ") +
