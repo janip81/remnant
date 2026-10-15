@@ -294,7 +294,8 @@ def store_memory(memory_url: str, token: str, content: str, source: str,
                               "capture_id": str(uuid.uuid4()),
                               "sync": source != "session-end"}}
     else:  # older Claude Code without session_id: fall back to a plain memory
-        call = {"name": "add_memory", "arguments": {"content": content, "infer": False, "category": "session"}}
+        call = {"name": "add_memory", "arguments": {"content": content, "infer": False, "category": "session",
+                                                    "source": "hook", "project": project}}
     payload = {
         "jsonrpc": "2.0",
         "method": "tools/call",
@@ -412,6 +413,10 @@ def main():
                             "infer": False,
                             "category": "feedback",
                             "tags": ["auto-extracted"],
+                            # stored as state=candidate by the server until reviewed
+                            "source": "extraction",
+                            "session_id": session_id,
+                            "project": project,
                         },
                     },
                     "id": i + 10,
