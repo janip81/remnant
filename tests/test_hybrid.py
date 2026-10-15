@@ -22,8 +22,8 @@ def _item(i, score=None):
 
 
 def _patch(monkeypatch, vector, keyword):
-    monkeypatch.setattr(memory, "search", lambda q, limit: vector)
-    monkeypatch.setattr(memory, "keyword_search", lambda q, limit: keyword)
+    monkeypatch.setattr(memory, "search", lambda q, limit, **kw: vector)
+    monkeypatch.setattr(memory, "keyword_search", lambda q, limit, *a, **kw: keyword)
 
 
 def test_identifier_query_lets_keyword_hit_win(monkeypatch):
@@ -41,9 +41,9 @@ def test_plain_query_prefers_vector_order(monkeypatch):
 
 
 def test_vector_outage_falls_back_to_keyword(monkeypatch):
-    def down(q, limit):
+    def down(q, limit, **kw):
         raise ConnectionError("ollama offline")
     monkeypatch.setattr(memory, "search", down)
-    monkeypatch.setattr(memory, "keyword_search", lambda q, limit: [_item("k")])
+    monkeypatch.setattr(memory, "keyword_search", lambda q, limit, *a, **kw: [_item("k")])
     out = memory.hybrid_search("morbius.prod.threshold.se")
     assert [r["id"] for r in out] == ["k"] and out[0]["match"] == "keyword"

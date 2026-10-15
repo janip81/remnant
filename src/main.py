@@ -49,12 +49,15 @@ async def add_memory(content: str, agent_id: str = "", infer: Optional[bool] = N
 
 
 @mcp.tool()
-async def search_memory(query: str, limit: int = 5) -> str:
+async def search_memory(query: str, limit: int = 5, include_sessions: bool = False) -> str:
     """Search memory by meaning and exact terms (hostnames, versions, error codes, names).
     Each hit shows rank (fused ordering, 0..1), cos (cosine similarity, when the
     vector side matched) and which side matched. Neither is a calibrated
-    probability: treat low-cos or keyword-only hits as weaker evidence."""
-    results = await asyncio.to_thread(mem_store.hybrid_search, query, limit=limit)
+    probability: treat low-cos or keyword-only hits as weaker evidence.
+    Session checkpoints are excluded unless include_sessions=True; to restore a
+    session use get_checkpoint(session_id)."""
+    results = await asyncio.to_thread(mem_store.hybrid_search, query, limit=limit,
+                                      include_checkpoints=include_sessions)
     if not results:
         return "No memories found."
     # rank = fused rank score (ordering only); cos = cosine similarity when the
@@ -66,6 +69,31 @@ async def search_memory(query: str, limit: int = 5) -> str:
         evidence = f"cos {cos:.2f}" if cos is not None else "keyword only"
         lines.append(f"[rank {r.get('score', 0):.2f} | {evidence} | {r.get('match', '')}] {text}")
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def save_checkpoint(session_id: str, content: str, project: str = "", agent_id: str = "") -> str:
+    """Save the replaceable working-state checkpoint of a session (used by hooks).
+    Replaces the previous checkpoint of the same session_id; never returned by
+    search_memory; expires after a few days. Not for durable facts — use add_memory."""
+    if not session_id or not content.strip():
+        return "session_id and content are required"
+    if settings.redis_url:
+        from queue_worker import enqueue
+        job_id = await enqueue(content, agent_id, False, "session", [],
+                               kind="checkpoint", session_id=session_id, project=project)
+        return json.dumps({"queued": True, "job_id": job_id})
+    result = await asyncio.to_thread(mem_store.save_checkpoint, session_id, content, agent_id, project)
+    return json.dumps(result)
+
+
+@mcp.tool()
+async def get_checkpoint(session_id: str) -> str:
+    """Return the latest checkpoint of a session by exact session_id (for resume/compaction)."""
+    row = await asyncio.to_thread(mem_store.get_checkpoint, session_id)
+    if not row:
+        return "No checkpoint for this session."
+    return f"[checkpoint {row['created_at']} project={row.get('project') or '-'}]\n{row['memory']}"
 
 
 @mcp.tool()
@@ -405,7 +433,8 @@ async def app(scope, receive, send):
             filter_category = qs.get("category", "").strip()
 
             if q:
-                results = await asyncio.to_thread(mem_store.hybrid_search, q, limit=200)
+                results = await asyncio.to_thread(mem_store.hybrid_search, q, limit=200,
+                                                  include_checkpoints=True)  # UI browses everything
                 if sort in ("newest", "oldest"):
                     reverse = sort == "newest"
                     results.sort(key=lambda r: r.get("created_at", ""), reverse=reverse)

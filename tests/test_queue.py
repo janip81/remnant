@@ -210,3 +210,15 @@ def test_worker_reported_alive_while_busy(monkeypatch):
     assert qw.worker_alive()
     monkeypatch.setattr(qw, "_busy", False)
     assert not qw.worker_alive()
+
+
+def test_checkpoint_job_routes_to_save_checkpoint(env):
+    client, mem = env
+    saved = []
+    mem.save_checkpoint = lambda sid, content, agent, project: saved.append((sid, content, project))
+    run(qw.enqueue("state", "claude-starbase", False, "session", [], kind="checkpoint",
+                   session_id="s-1", project="remnant"))
+    (msg_id, fields), = run(_deliver(client))
+    run(qw._process(client, msg_id, fields))
+    assert saved == [("s-1", "state", "remnant")] and mem.calls == []
+    assert run(qw.queue_metrics())["pending"] == 0

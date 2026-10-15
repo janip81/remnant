@@ -247,6 +247,21 @@ def get_job_run(run_id: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 _MEM_TABLE = "mem0"
+
+# Session checkpoints (hook snapshots) are for recovering a session by its id,
+# not for semantic search: they mention everything, rank high for any prompt
+# and echo the current conversation back. Legacy snapshots have no 'kind'
+# but a fixed heading — or, after the nightly LLM merge rewrote the heading
+# ('## Comprehensive Merged Memory'), the snapshot's section header.
+# '%%' because these fragments go into parameterised SQL.
+# coalesce: payload->>'kind' is NULL for normal memories, and NOT (NULL OR ...)
+# would be NULL, i.e. exclude every normal row.
+_CHECKPOINT = ("(coalesce(payload->>'kind', '') = 'checkpoint' "
+               "OR coalesce(payload->>'data', '') LIKE '## Session State%%' "
+               "OR coalesce(payload->>'data', '') LIKE '## Codex session state%%' "
+               "OR coalesce(payload->>'data', '') LIKE '%%### What the user was working on%%')")
+_SEARCHABLE = f"NOT {_CHECKPOINT}"
+CHECKPOINT_TTL_DAYS = int(os.environ.get("CHECKPOINT_TTL_DAYS", "7"))
 _META = ("(CASE WHEN jsonb_typeof(payload->'metadata') = 'object' "
          "THEN payload->'metadata' ELSE payload END)")
 
@@ -550,19 +565,19 @@ def _has_fts_column() -> bool:
         conn.close()
 
 
-def keyword_search(query: str, limit: int = _CANDIDATES) -> list[dict]:
+def keyword_search(query: str, limit: int = _CANDIDATES, include_checkpoints: bool = False) -> list[dict]:
     try:
-        return _keyword_search(query, limit)
+        return _keyword_search(query, limit, include_checkpoints)
     except psycopg2.errors.UndefinedColumn:
         ensure_fts_index()          # table was created after startup
-        return _keyword_search(query, limit)
+        return _keyword_search(query, limit, include_checkpoints)
 
 
 def _like(term: str) -> str:
     return "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
-def _keyword_search(query: str, limit: int) -> list[dict]:
+def _keyword_search(query: str, limit: int, include_checkpoints: bool = False) -> list[dict]:
     """Full-text search weighted by term rarity (BM25 idf, no term frequency).
 
     Each query term that occurs in a memory adds its idf, so one rare
@@ -582,7 +597,8 @@ def _keyword_search(query: str, limit: int) -> list[dict]:
             sql, params = f"({sql} OR payload->>'data' ILIKE %s)", [term, _like(term)]
         return sql, params
 
-    user = "payload->>'user_id' = %s"
+    # same population for the idf statistics and the results
+    user = "payload->>'user_id' = %s" + ("" if include_checkpoints else f" AND {_SEARCHABLE}")
     conn = _db_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -626,7 +642,7 @@ def _keyword_search(query: str, limit: int) -> list[dict]:
     return out
 
 
-def hybrid_search(query: str, limit: int = 5) -> list[dict]:
+def hybrid_search(query: str, limit: int = 5, include_checkpoints: bool = False) -> list[dict]:
     """Merge keyword and vector results with reciprocal rank fusion.
 
     score is the fused score scaled to 0..1 (1.0 = ranked first by both).
@@ -634,9 +650,9 @@ def hybrid_search(query: str, limit: int = 5) -> list[dict]:
     If the vector side fails (Ollama offline), keyword results are returned alone.
     """
     pool = max(_CANDIDATES, limit)
-    keyword = keyword_search(query, pool)
+    keyword = keyword_search(query, pool, include_checkpoints)
     try:
-        vector = search(query, limit=pool)
+        vector = search(query, limit=pool, include_checkpoints=include_checkpoints)
     except Exception as e:
         logger.warning("Vector search unavailable (%s); keyword results only", type(e).__name__)
         vector = []
@@ -665,7 +681,7 @@ def hybrid_search(query: str, limit: int = 5) -> list[dict]:
     return results
 
 
-def search(query: str, limit: int = 5, agent_id: str = "") -> list[dict]:
+def search(query: str, limit: int = 5, agent_id: str = "", include_checkpoints: bool = False) -> list[dict]:
     """Vector search: cosine similarity over the stored embeddings.
 
     Deliberately not mem0's Memory.search(): with mem0ai 2.0.2 its fused
@@ -681,6 +697,7 @@ def search(query: str, limit: int = 5, agent_id: str = "") -> list[dict]:
            f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
            f"1 - (vector <=> %s::vector) AS score "
            f"FROM {_MEM_TABLE} WHERE payload->>'user_id' = %s "
+           + ("" if include_checkpoints else f"AND {_SEARCHABLE} ") +
            f"ORDER BY vector <=> %s::vector LIMIT %s")
     vec = str(list(embedding))
     conn = _db_conn()
@@ -709,6 +726,53 @@ def get_all(agent_id: str = "") -> list[dict]:
     if isinstance(result, dict) and "results" in result:
         return result["results"]
     return result if isinstance(result, list) else []
+
+
+def save_checkpoint(session_id: str, content: str, agent_id: str = "", project: str = "") -> dict:
+    """Store the one replaceable checkpoint for a session (hook snapshot).
+
+    Writes the new row first, then deletes older checkpoints of the same
+    session, so there is never a moment without one. Excluded from search;
+    read back with get_checkpoint(session_id). Expires after CHECKPOINT_TTL_DAYS.
+    """
+    if not session_id:
+        raise ValueError("session_id required")
+    import datetime as _dt
+    expires = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=CHECKPOINT_TTL_DAYS)).isoformat()
+    result = get_memory().add(
+        redact(content), user_id=settings.mem0_user_id, agent_id=_agent_id(agent_id), infer=False,
+        metadata={"kind": "checkpoint", "session_id": session_id, "project": project,
+                  "category": "session", "expires_at": expires})
+    new_ids = {str(r.get("id")) for r in (result.get("results", []) if isinstance(result, dict) else result or [])}
+    conn = _db_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(f"DELETE FROM {_MEM_TABLE} WHERE payload->>'kind' = 'checkpoint' "
+                            f"AND payload->>'session_id' = %s AND NOT (id::text = ANY(%s))",
+                            (session_id, list(new_ids)))
+                replaced = cur.rowcount
+    finally:
+        conn.close()
+    return {"session_id": session_id, "ids": sorted(new_ids), "replaced": replaced}
+
+
+def get_checkpoint(session_id: str) -> Optional[dict]:
+    """Latest checkpoint of a session, by exact id (never by similarity)."""
+    conn = _db_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(f"SELECT id, payload->>'data' AS memory, payload->>'created_at' AS created_at, "
+                        f"payload->>'project' AS project FROM {_MEM_TABLE} "
+                        f"WHERE payload->>'kind' = 'checkpoint' AND payload->>'session_id' = %s "
+                        f"AND payload->>'user_id' = %s ORDER BY payload->>'created_at' DESC LIMIT 1",
+                        (session_id, settings.mem0_user_id))
+            row = cur.fetchone()
+            return dict(row) if row else None
+    except psycopg2.errors.UndefinedTable:
+        return None
+    finally:
+        conn.close()
 
 
 def update(memory_id: str, content: str) -> dict:
