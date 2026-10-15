@@ -126,9 +126,10 @@ def _insert(data, extra=None):
 def test_snapshots_excluded_from_keyword_search_unless_asked(mem):
     _insert(SNAP)
     _insert("## Comprehensive Merged Memory\n\n### What the user was working on\n- morbius.prod.threshold.se")
+    _insert("## Codex session state (session-end)\nmorbius.prod.threshold.se checked")
     _insert("checkpoint text about morbius.prod.threshold.se", {"kind": "checkpoint", "session_id": "s1"})
     assert texts(mem.keyword_search("morbius.prod.threshold.se", 5)) == [DOCS[0]]
-    assert len(mem.keyword_search("morbius.prod.threshold.se", 5, include_checkpoints=True)) == 4
+    assert len(mem.keyword_search("morbius.prod.threshold.se", 5, include_checkpoints=True)) == 5
 
 
 def test_snapshots_excluded_from_vector_search(mem, monkeypatch):
