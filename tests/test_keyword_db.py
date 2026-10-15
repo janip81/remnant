@@ -72,3 +72,17 @@ def test_migration_gives_up_quickly_when_table_is_locked(mem):
         assert texts(mem.keyword_search("alpha", 5)) == [DOCS[0]]  # still works via expression
     finally:
         holder.rollback(); holder.close()
+
+
+def test_existing_column_missing_index_is_recreated(mem):
+    assert mem.ensure_fts_index()
+    conn = psycopg2.connect(URL)
+    with conn, conn.cursor() as cur:
+        cur.execute("DROP INDEX mem0_fts_idx")
+    conn.close()
+    assert mem.ensure_fts_index()
+    conn = psycopg2.connect(URL)
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_indexes WHERE indexname = 'mem0_fts_idx'")
+        assert cur.fetchone()
+    conn.close()

@@ -512,6 +512,7 @@ def ensure_fts_index() -> bool:
             with conn:
                 with conn.cursor() as cur:
                     cur.execute("SET LOCAL lock_timeout = '3s'")
+                    cur.execute("SET LOCAL statement_timeout = '60s'")
                     cur.execute(f"CREATE INDEX IF NOT EXISTS {_MEM_TABLE}_fts_idx ON {_MEM_TABLE} USING gin (fts)")
             _FTS_DOC = "fts"
             return True
