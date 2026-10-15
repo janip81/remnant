@@ -467,8 +467,9 @@ async def app(scope, receive, send):
                     continue
                 # keep the lifecycle: an exported candidate/rejected row must not come back active
                 state = item.get("state") if item.get("state") in mem_store.VALID_STATES else ""
-                await asyncio.to_thread(mem_store.add, content.strip(), agent_id=src_agent, source="import",
-                                        project=str(item.get("project") or ""), state=state)
+                # infer=False: an import restores memories as they were, never re-extracted by the LLM
+                await asyncio.to_thread(mem_store.add, content.strip(), agent_id=src_agent, infer=False,
+                                        source="import", project=str(item.get("project") or ""), state=state)
                 imported += 1
             await _send_response(send, *_json_response({"imported": imported, "skipped_checkpoints": skipped}))
             return
