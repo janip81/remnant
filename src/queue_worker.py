@@ -74,7 +74,9 @@ async def _get_client():
 async def enqueue(content: str, agent_id: str, infer: bool, category: str, tags: list, **extra) -> str:
     """extra: kind="checkpoint" with session_id/project routes to save_checkpoint."""
     job_id = str(uuid.uuid4())
-    job = {"job_id": job_id, "content": redact(content), "agent_id": agent_id,
+    # v1: provenance (source, session_id, project) travels with the job, so it
+    # survives retries; jobs without "v" (older format) are still processed.
+    job = {"v": 1, "job_id": job_id, "content": redact(content), "agent_id": agent_id,
            "infer": infer, "category": category, "tags": tags, **extra}
     client = await _get_client()
     await client.xadd(STREAM, {"job": json.dumps(job)})
@@ -177,6 +179,9 @@ async def _process_one(client, msg_id: str, fields: dict) -> None:
                 category=job.get("category", ""),
                 tags=job.get("tags", []),
                 job_id=job_id,
+                source=job.get("source", "agent"),
+                session_id=job.get("session_id", ""),
+                project=job.get("project", ""),
             )
             if infer and not _has_results(result) and not await asyncio.to_thread(mem_store.ollama_up):
                 raise DependencyDown("empty infer result while Ollama is unreachable")

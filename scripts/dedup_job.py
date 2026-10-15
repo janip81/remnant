@@ -59,6 +59,9 @@ CHECKPOINT_SQL = ("(coalesce(payload->>'kind', '') = 'checkpoint' "
 # Expiry is deliberately narrower than "skip": only real checkpoints and rows that
 # *start* with the hook heading. LLM-merged rows that merely contain the section
 # header may carry durable facts — they are skipped by dedup but never expired.
+# Dedup/tagging input: only active, non-checkpoint memories (same rule as
+# src/memory.py _population): candidates, history and checkpoints are never merged.
+ELIGIBLE_SQL = ("(coalesce(payload->>'state', 'active') = 'active' AND NOT " + CHECKPOINT_SQL + ")")
 EXPIRABLE_SQL = ("(coalesce(payload->>'kind', '') = 'checkpoint' "
                  "OR coalesce(payload->>'data', '') LIKE '## Session State%%' "
                  "OR coalesce(payload->>'data', '') LIKE '## Codex session state%%')")
@@ -297,7 +300,7 @@ def phase0_llm_tagging(conn, dry_run: bool) -> int:
                 finish_job_phase(conn, run_id, "completed", 0, 0)
                 return 0
 
-            cur.execute(f"SELECT id, payload FROM {MEM_TABLE} WHERE NOT {CHECKPOINT_SQL}")
+            cur.execute(f"SELECT id, payload FROM {MEM_TABLE} WHERE {ELIGIBLE_SQL}")
             rows = cur.fetchall()
 
         # Process any memory not yet reviewed by LLM — includes keyword-tagged ones
@@ -360,7 +363,7 @@ def phase1_hash_dedup(conn, dry_run: bool) -> int:
                 SELECT payload->>'hash' AS hash,
                        array_agg(id ORDER BY (payload->>'created_at') ASC) AS ids
                 FROM {MEM_TABLE}
-                WHERE payload->>'hash' IS NOT NULL
+                WHERE payload->>'hash' IS NOT NULL AND {ELIGIBLE_SQL}
                   AND payload->>'hash' != ''
                 GROUP BY payload->>'hash'
                 HAVING COUNT(*) > 1
@@ -405,8 +408,8 @@ def find_semantic_clusters(
         FROM {MEM_TABLE} a
         JOIN {MEM_TABLE} b ON a.id < b.id
         WHERE (a.vector <=> b.vector) < %s
-          AND NOT {CHECKPOINT_SQL.replace("payload", "a.payload")}
-          AND NOT {CHECKPOINT_SQL.replace("payload", "b.payload")}
+          AND {ELIGIBLE_SQL.replace("payload", "a.payload")}
+          AND {ELIGIBLE_SQL.replace("payload", "b.payload")}
         ORDER BY similarity DESC
         """,
         (cosine_distance,),
@@ -517,7 +520,7 @@ def ollama_merge(texts: list[str]) -> Optional[str]:
 
 def store_memory_direct(content: str, category: str = "") -> Optional[tuple[str, str]]:
     """Write via the MCP server. Returns ("id", memory_id), ("queued", job_id) or None."""
-    args: dict = {"content": content, "infer": False}
+    args: dict = {"content": content, "infer": False, "source": "merge"}
     if category:
         args["category"] = category
     payload = {

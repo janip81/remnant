@@ -31,34 +31,42 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def add_memory(content: str, agent_id: str = "", infer: Optional[bool] = None, category: str = "", tags: list[str] = []) -> str:
+async def add_memory(content: str, agent_id: str = "", infer: Optional[bool] = None, category: str = "",
+                     tags: list[str] = [], source: str = "agent", session_id: str = "", project: str = "") -> str:
     """Store a fact or observation in memory, as written (one self-contained fact per call works best).
     category: project|feedback|reference|user|session|incident
     tags: free-form list, e.g. ["prod-k8s", "remnant", "cnpg"] — use app names, cluster names, topics.
-    infer: omit to use the server default (stored as-is); True asks the LLM to extract facts first."""
+    infer: omit to use the server default (stored as-is); True asks the LLM to extract facts first.
+    source/session_id/project: provenance (hooks set source="hook" or "extraction")."""
     if infer is None:
         infer = settings.mem0_infer
     if category and category not in mem_store.VALID_CATEGORIES:
         return f"Invalid category '{category}'. Valid: {', '.join(sorted(mem_store.VALID_CATEGORIES) - {''})}"
     if settings.redis_url:
         from queue_worker import enqueue
-        job_id = await enqueue(content, agent_id, infer, category, tags)
+        job_id = await enqueue(content, agent_id, infer, category, tags,
+                               source=source, session_id=session_id, project=project)
         return json.dumps({"queued": True, "job_id": job_id})
-    result = await asyncio.to_thread(mem_store.add, content, agent_id=agent_id, infer=infer, category=category, tags=tags)
+    result = await asyncio.to_thread(mem_store.add, content, agent_id=agent_id, infer=infer, category=category,
+                                     tags=tags, source=source, session_id=session_id, project=project)
     return json.dumps(result)
 
 
 @mcp.tool()
-async def search_memory(query: str, limit: int = 5, include_sessions: bool = False, format: str = "text") -> str:
+async def search_memory(query: str, limit: int = 5, include_sessions: bool = False, format: str = "text",
+                        include_history: bool = False, include_candidates: bool = False) -> str:
     """Search memory by meaning and exact terms (hostnames, versions, error codes, names).
     Each hit shows rank (fused ordering, 0..1), cos (cosine similarity, when the
     vector side matched) and which side matched. Neither is a calibrated
     probability: treat low-cos or keyword-only hits as weaker evidence.
     Session checkpoints are excluded unless include_sessions=True; to restore a
     session use get_checkpoint(session_id).
-    format="json" returns [{id, memory, rank, cos, match, state}] for hooks/tools."""
+    format="json" returns [{id, memory, rank, cos, match, state}] for hooks/tools.
+    Only active memories by default; include_history adds superseded ones,
+    include_candidates adds unreviewed LLM output (state shown either way)."""
+    states = ["active"] + (["superseded"] if include_history else []) + (["candidate"] if include_candidates else [])
     results = await asyncio.to_thread(mem_store.hybrid_search, query, limit=limit,
-                                      include_checkpoints=include_sessions)
+                                      include_checkpoints=include_sessions, states=states)
     if format == "json":
         return json.dumps([{"id": r.get("id"), "memory": r.get("memory", ""), "rank": r.get("score"),
                             "cos": r.get("vector_score"), "match": r.get("match", ""),
@@ -72,7 +80,9 @@ async def search_memory(query: str, limit: int = 5, include_sessions: bool = Fal
         text = r.get("memory", r.get("text", str(r)))
         cos = r.get("vector_score")
         evidence = f"cos {cos:.2f}" if cos is not None else "keyword only"
-        lines.append(f"[rank {r.get('score', 0):.2f} | {evidence} | {r.get('match', '')}] {text}")
+        state = r.get("state") or "active"
+        flag = "" if state == "active" else f" | {state}"
+        lines.append(f"[rank {r.get('score', 0):.2f} | {evidence} | {r.get('match', '')}{flag}] {text}")
     return "\n".join(lines)
 
 
@@ -116,12 +126,19 @@ async def get_checkpoint(session_id: str) -> str:
 
 
 @mcp.tool()
-async def get_all_memories() -> str:
-    """List all stored memories."""
-    results = await asyncio.to_thread(mem_store.list_rows)
+async def get_all_memories(include_history: bool = False, include_candidates: bool = False,
+                           include_sessions: bool = False) -> str:
+    """List stored memories: active ones by default (same eligibility as search_memory);
+    include_history adds superseded, include_candidates adds unreviewed LLM output,
+    include_sessions adds session checkpoints. Non-active rows are labelled."""
+    states = ["active"] + (["superseded"] if include_history else []) + (["candidate"] if include_candidates else [])
+    results = await asyncio.to_thread(mem_store.list_rows, "", "", states, include_sessions)
     if not results:
         return "No memories stored."
-    lines = [r.get("memory", r.get("text", str(r))) for r in results]
+    lines = []
+    for r in results:
+        label = "" if (r.get("state") or "active") == "active" else f"[{r['state']}] "
+        lines.append(label + r.get("memory", r.get("text", str(r))))
     return "\n".join(f"{i+1}. {m}" for i, m in enumerate(lines))
 
 
@@ -262,6 +279,11 @@ def _memory_dict(r: dict) -> dict:
         "created_at": r.get("created_at", ""),
         "updated_at": r.get("updated_at", ""),
         "score": r.get("score"),
+        "state": r.get("state") or meta.get("state") or "active",
+        "source": r.get("source") or meta.get("source") or "",
+        "review_reason": r.get("review_reason") or meta.get("review_reason") or "",
+        "project": r.get("project") or meta.get("project") or "",
+        "kind": r.get("kind") or meta.get("kind") or "",
     }
 
 
@@ -434,14 +456,22 @@ async def app(scope, receive, send):
             except Exception as e:
                 await _send_response(send, 400, [[b"content-type", b"text/plain"]], str(e).encode())
                 return
-            imported = 0
+            imported = skipped = 0
             for item in items:
                 content = item.get("memory") or item.get("text") or item.get("content", "")
                 src_agent = item.get("agent_id", "") or agent_id
-                if content.strip():
-                    await asyncio.to_thread(mem_store.add, content.strip(), agent_id=src_agent)
-                    imported += 1
-            await _send_response(send, *_json_response({"imported": imported}))
+                if not content.strip():
+                    continue
+                if item.get("kind") == "checkpoint":
+                    skipped += 1          # session checkpoints are not portable memories
+                    continue
+                # keep the lifecycle: an exported candidate/rejected row must not come back active
+                state = item.get("state") if item.get("state") in mem_store.VALID_STATES else ""
+                # infer=False: an import restores memories as they were, never re-extracted by the LLM
+                await asyncio.to_thread(mem_store.add, content.strip(), agent_id=src_agent, infer=False,
+                                        source="import", project=str(item.get("project") or ""), state=state)
+                imported += 1
+            await _send_response(send, *_json_response({"imported": imported, "skipped_checkpoints": skipped}))
             return
 
         # GET /api/memories — list / search
@@ -450,15 +480,18 @@ async def app(scope, receive, send):
             sort = qs.get("sort", "newest")  # newest | oldest | relevance
             filter_agent = qs.get("agent_id", "").strip()
             filter_category = qs.get("category", "").strip()
+            filter_state = qs.get("state", "").strip()
 
             if q:
+                # the UI browses everything (all states, checkpoints) unless a state filter is set
+                states = [filter_state] if filter_state in mem_store.VALID_STATES else list(mem_store.VALID_STATES)
                 results = await asyncio.to_thread(mem_store.hybrid_search, q, limit=200,
-                                                  include_checkpoints=True)  # UI browses everything
+                                                  include_checkpoints=True, states=states)
                 if sort in ("newest", "oldest"):
                     reverse = sort == "newest"
                     results.sort(key=lambda r: r.get("created_at", ""), reverse=reverse)
             else:
-                results = await asyncio.to_thread(mem_store.list_rows, filter_agent)
+                results = await asyncio.to_thread(mem_store.list_rows, filter_agent, filter_state)
                 reverse = sort != "oldest"
                 results.sort(key=lambda r: r.get("created_at", ""), reverse=reverse)
 
@@ -483,15 +516,29 @@ async def app(scope, receive, send):
             if content:
                 if settings.redis_url:
                     from queue_worker import enqueue
-                    await enqueue(content, src_agent, settings.mem0_infer, "", [])
+                    await enqueue(content, src_agent, settings.mem0_infer, "", [], source="ui")
                 else:
-                    await asyncio.to_thread(mem_store.add, content, agent_id=src_agent)
+                    await asyncio.to_thread(mem_store.add, content, agent_id=src_agent, source="ui")
             await _send_response(send, *_json_response({"ok": True}))
             return
 
         # Routes with memory ID suffix
         if path.startswith("/api/memories/"):
             memory_id = path[len("/api/memories/"):]
+
+            # POST /api/memories/{id}/review — {"action": "promote"|"reject", "note": "..."}
+            if method == "POST" and memory_id.endswith("/review"):
+                real_id = memory_id[: -len("/review")]
+                try:
+                    body = json.loads(await _read_body(receive) or b"{}")
+                except ValueError:
+                    body = {}
+                result = await asyncio.to_thread(mem_store.review, real_id, str(body.get("action", "")),
+                                                 _get_agent_id(headers) or "user", str(body.get("note", "")))
+                status = 200 if result.get("ok") else (404 if result.get("error") == "not found"
+                                                       else 409 if result.get("error") == "conflict" else 400)
+                await _send_response(send, *_json_response(result, status))
+                return
 
             # PUT /api/memories/{id} — edit content
             if method == "PUT":

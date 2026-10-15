@@ -12,6 +12,8 @@ import EditIcon from '@mui/icons-material/EditOutlined'
 import LabelIcon from '@mui/icons-material/LabelOutlined'
 import CheckIcon from '@mui/icons-material/Check'
 import CloseIcon from '@mui/icons-material/Close'
+import ThumbUpIcon from '@mui/icons-material/ThumbUpOutlined'
+import BlockIcon from '@mui/icons-material/Block'
 import { Memory } from '../api/memories'
 
 function fmtDate(iso: string): string {
@@ -23,11 +25,12 @@ function fmtDate(iso: string): string {
 interface Props {
   memory: Memory
   onDelete: (id: string) => void
+  onReview?: (id: string, action: 'promote' | 'reject') => void
   onUpdate: (id: string, content: string) => void
   onUpdateTags: (id: string, tags: string[]) => void
 }
 
-export default function MemoryCard({ memory, onDelete, onUpdate, onUpdateTags }: Props) {
+export default function MemoryCard({ memory, onDelete, onUpdate, onUpdateTags, onReview }: Props) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(memory.memory)
 
@@ -122,6 +125,16 @@ export default function MemoryCard({ memory, onDelete, onUpdate, onUpdateTags }:
             {/* Chips row */}
             <Box sx={{ display: 'flex', gap: 0.5, mt: 1, flexWrap: 'wrap', alignItems: 'center' }}>
               <Chip label={fmtDate(memory.created_at)} size="small" variant="outlined" sx={{ fontSize: 11 }} />
+              {memory.state && memory.state !== 'active' && (
+                <Tooltip title={memory.review_reason ? `reason: ${memory.review_reason}` : memory.state}>
+                  <Chip label={memory.state} size="small"
+                        color={memory.state === 'candidate' ? 'warning' : memory.state === 'rejected' ? 'error' : 'default'}
+                        sx={{ fontSize: 11 }} />
+                </Tooltip>
+              )}
+              {memory.source && (
+                <Chip label={memory.source} size="small" variant="outlined" sx={{ fontSize: 11, opacity: 0.7 }} />
+              )}
               {memory.category && (
                 <Chip label={memory.category} size="small" color="secondary" variant="outlined" sx={{ fontSize: 11 }} />
               )}
@@ -190,6 +203,12 @@ export default function MemoryCard({ memory, onDelete, onUpdate, onUpdateTags }:
               </>
             ) : (
               <>
+                {memory.state === 'candidate' && onReview && (
+                  <>
+                    <Tooltip title="Promote to active"><IconButton size="small" color="success" onClick={() => onReview(memory.id, 'promote')}><ThumbUpIcon fontSize="small" /></IconButton></Tooltip>
+                    <Tooltip title="Reject"><IconButton size="small" color="warning" onClick={() => onReview(memory.id, 'reject')}><BlockIcon fontSize="small" /></IconButton></Tooltip>
+                  </>
+                )}
                 <Tooltip title="Edit content"><IconButton size="small" onClick={() => setEditing(true)}><EditIcon fontSize="small" /></IconButton></Tooltip>
                 <Tooltip title="Edit tags"><IconButton size="small" onClick={handleTagsEdit} color="success"><LabelIcon fontSize="small" /></IconButton></Tooltip>
                 <Tooltip title="Delete"><IconButton size="small" onClick={() => onDelete(memory.id)} color="error"><DeleteIcon fontSize="small" /></IconButton></Tooltip>
