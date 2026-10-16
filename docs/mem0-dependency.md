@@ -1,8 +1,14 @@
 # How Remnant uses Mem0, and what an upgrade or replacement would mean
 
 Status: investigation, 2026-10-16. Nothing was upgraded or replaced. The comparison
-is based on the published wheels of `mem0ai` 2.0.2 (pinned in
-`requirements-mcp.txt`) and 2.2.1 (the latest at the time of writing).
+is based on the published PyPI wheels (`pip download mem0ai==<v> --no-deps`):
+
+| Version | Wheel sha256 |
+|---------|--------------|
+| 2.0.2 (pinned in `requirements-mcp.txt`) | `6fda32549c213fb63b393f4b1920f54961ea75c51d95b6492096108609accf3b` |
+| 2.2.1 (latest at the time of writing) | `fe91bb91ac8926231993a4aa58df00a60c6c74c709e6a338fe399500776eef4d` |
+
+The line numbers below refer to files inside those wheels.
 
 ## What Remnant actually calls
 
@@ -16,7 +22,18 @@ is based on the published wheels of `mem0ai` 2.0.2 (pinned in
 | `Memory.get_all` | `get_all` | **no callers**: dead code |
 
 Everything else goes through direct SQL against mem0's table (`mem0`: `id UUID`,
-`vector`, `payload JSONB`, with the metadata keys at the top level of `payload`):
+`vector`, `payload JSONB`). The payload has more than one shape. mem0 2.0.2 writes the
+caller's metadata keys at the top level of `payload`, but older rows and some
+pgvector write paths nest them as `payload.metadata` or even
+`payload.metadata.metadata`. Remnant's code has to handle all three:
+
+- the SQL readers use `_META` (`src/memory.py`), which picks `payload->'metadata'`
+  when it's an object and falls back to the top level;
+- `update_tags` (`src/memory.py`) and the dedup job's tag/metadata writers
+  (`scripts/dedup_job.py`, the tagging phase) write into the innermost existing
+  level.
+
+Direct SQL handles:
 
 - reads, lists and stats;
 - keyword search (its own stored `fts` column);
@@ -29,18 +46,20 @@ Remnant deliberately does not use `Memory.search()`. With 2.0.2 it ranked far wo
 than plain cosine on the author's data.
 
 So the coupling to mem0 is narrow: **the write path (embedding + insert), delete,
-and the table/payload layout.** The layout is the real contract, because so much
-SQL depends on it.
+and the table/payload layout, including the nested metadata shapes.** The layout is
+the real contract, because so much SQL depends on it.
 
 ## 2.0.2 → 2.2.1: what changed that matters here
 
 - **Table and payload layout: unchanged.** Both versions create `id UUID PRIMARY KEY,
-  vector vector(n), payload JSONB`. `_create_memory` writes the same top-level keys:
-  `data`, `hash`, `created_at`, `updated_at`, `text_lemmatized`, plus the caller's
-  metadata. Remnant's SQL should keep working.
+  vector vector(n), payload JSONB` (`vector_stores/pgvector.py`: 2.0.2 line 162,
+  2.2.1 line 271). `_create_memory` writes the same top-level keys: `data`, `hash`,
+  `created_at`, `updated_at`, `text_lemmatized`, plus the caller's metadata
+  (`memory/main.py`: 2.0.2 line 1594, 2.2.1 line 1983). Remnant's SQL should keep
+  working, but the contract test below has to prove it, nested shapes included.
 - **pgvector reads:** `get`/`list` no longer select the vector column, and search
   scores are now `1 - distance`. Remnant does neither through mem0, so this has no
-  effect.
+  effect. The new score is at 2.2.1 `pgvector.py` line 367.
 - **Richer filters** (`eq/ne/in/contains/...`) in the pgvector provider. They only
   apply to `Memory.search/get_all`, which Remnant doesn't use.
 - **Optional rerankers** (`cohere`, `huggingface`, `sentence_transformer`, `llm`,
@@ -49,20 +68,24 @@ SQL depends on it.
   dependency. Rerankers apply to mem0's search, not to Remnant's hybrid search.
 - **`expiration_date`** (OSS) hides expired memories from mem0's search and
   `get_all`. Remnant's checkpoint TTL already works in SQL, so this adds nothing.
-- **`timestamp`** is documented as platform-only, not supported in OSS. Observation
-  time (see `contracts/`) therefore has to stay Remnant metadata.
+- **`timestamp`** (in `add`) and **`reference_date`** (in `search`) are documented as
+  platform-only, not supported in OSS (2.2.1 `memory/main.py` lines 787 and 1435).
+  Observation time (see `contracts/`) therefore has to stay Remnant metadata.
 - **`memory/main.py` changed substantially** (about 1,100 changed lines). It holds
   the `infer=True` pipeline that Remnant wraps with fallbacks. An upgrade has to
   re-test that path, and the workarounds may become unnecessary or wrong.
 
 ## Recommendation
 
-1. **Keep `mem0ai==2.0.2` for now.** Nothing in 2.2.1 improves a path Remnant
-   uses. The new features are behind `Memory.search`, which Remnant has replaced.
+1. **Keep `mem0ai==2.0.2` for now.** 2.2.1 shows no demonstrated benefit for
+   Remnant's current paths. Its new features sit behind `Memory.search`, which
+   Remnant has replaced. The heavily changed `infer=True` pipeline is used, but only
+   opt-in, and how it behaves now is unknown (see Unknowns).
 2. **Make the coupling explicit before any upgrade.** Collect the four calls
    (construct, add, embed, delete) behind one small section of `memory.py` with a
    docstring naming the table/payload contract. Add a test that writes through mem0
-   and asserts the payload keys Remnant's SQL relies on. This test is what makes a
+   and asserts the payload keys Remnant's SQL relies on, including reading and
+   tag-writing every nested metadata shape. This test is what makes a
    later upgrade safe. Only do this once it simplifies the code; it doesn't need a
    framework.
 3. **Remove the dead `get_all()`.**
