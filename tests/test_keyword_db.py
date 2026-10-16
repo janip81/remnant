@@ -229,44 +229,53 @@ def test_same_instant_tie_broken_by_capture_id_not_row_id(mem, monkeypatch):
     assert mem.get_checkpoint("tie")["memory"].startswith("b-capture")
 
 
-def test_semantic_dedup_keeps_originals_when_merge_not_confirmed(mem, monkeypatch):
+def _job_runs(conn):
+    with conn, conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS job_runs (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            started_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ, phase TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'running', memories_scanned INT DEFAULT 0, memories_changed INT DEFAULT 0,
+            rules_added INT DEFAULT 0, duration_seconds FLOAT, error TEXT)""")
+
+
+def test_semantic_dedup_only_proposes_and_never_deletes(mem, monkeypatch):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
     import dedup_job
     import psycopg2.extras
-    _insert("near duplicate fact A about pg-main-rw")
-    _insert("near duplicate fact A about pg-main-rw!")
+    calls = []
     monkeypatch.setattr(dedup_job, "ollama_merge", lambda texts: "- merged fact")
-    monkeypatch.setattr(dedup_job, "store_memory_direct", lambda c, category="": ("queued", "job-never-lands"))
-    monkeypatch.setattr(dedup_job, "MERGE_CONFIRM_SECONDS", 1)
+    monkeypatch.setattr(dedup_job, "propose_merge_direct",
+                        lambda ids, text, key: calls.append((sorted(map(str, ids)), key)) or {"ok": True})
     conn = psycopg2.connect(URL)
     psycopg2.extras.register_uuid(conn_or_curs=conn)
     try:
-        with conn, conn.cursor() as cur:
-            cur.execute("""CREATE TABLE IF NOT EXISTS job_runs (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                started_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ, phase TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'running', memories_scanned INT DEFAULT 0, memories_changed INT DEFAULT 0,
-                rules_added INT DEFAULT 0, duration_seconds FLOAT, error TEXT)""")
+        _job_runs(conn)
         n_before = _count(conn)
         dedup_job.phase2_semantic_dedup(conn, threshold=0.5, dry_run=False)   # all vectors equal -> one cluster
-        assert _count(conn) == n_before                                       # nothing deleted
-        with conn.cursor() as cur:
-            cur.execute("SELECT count(*) FROM mem0_archive WHERE archive_reason = 'semantic-dedup'")
-            assert cur.fetchone()[0] == 0
+        assert _count(conn) == n_before and len(calls) == 1                    # proposed, nothing deleted
+        _insert("the proposal", {"idempotency_key": calls[0][1], "state": "candidate"})
+        dedup_job.phase2_semantic_dedup(conn, threshold=0.5, dry_run=False)
+        assert len(calls) == 1                                                 # same cluster not proposed again
     finally:
         conn.rollback(); conn.close()
 
 
-def test_confirm_stored_finds_queued_row_by_job_id(mem):
+def test_hash_dedup_supersedes_instead_of_deleting(mem):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
     import dedup_job
-    _insert("merged", {"job_id": "job-42"})
+    import psycopg2.extras
+    _insert("dup", {"hash": "hx", "created_at": "2026-01-01"})
+    _insert("dup", {"hash": "hx", "created_at": "2026-01-02"})
     conn = psycopg2.connect(URL)
+    psycopg2.extras.register_uuid(conn_or_curs=conn)
     try:
-        assert dedup_job.confirm_stored(conn, ("queued", "job-42"), timeout=1) is not None
-        assert dedup_job.confirm_stored(conn, ("queued", "missing"), timeout=1) is None
-        assert dedup_job.confirm_stored(conn, None) is None
+        _job_runs(conn)
+        dedup_job.phase1_hash_dedup(conn, dry_run=False)
+        with conn.cursor() as cur:
+            cur.execute("SELECT coalesce(payload->>'state','active'), payload->>'superseded_by' IS NOT NULL "
+                        "FROM mem0 WHERE payload->>'hash' = 'hx' ORDER BY payload->>'created_at'")
+            assert cur.fetchall() == [("active", False), ("superseded", True)]
     finally:
-        conn.close()
+        conn.rollback(); conn.close()
 
 
 def _count(conn):
@@ -418,3 +427,108 @@ def test_checkpoint_has_source(mem, monkeypatch):
         cur.execute("SELECT payload->>'source' FROM mem0 WHERE payload->>'session_id' = 'src-s'")
         assert cur.fetchone()[0] == "hook"
     conn.close()
+
+
+# --- Lifecycle slice 2: supersede ----------------------------------------------
+
+def _ids(conn_rows):
+    return [str(r[0]) for r in conn_rows]
+
+
+def _row(mid):
+    conn = psycopg2.connect(URL)
+    with conn.cursor() as cur:
+        cur.execute("SELECT payload FROM mem0 WHERE id::text = %s", (mid,))
+        r = cur.fetchone()
+    conn.close()
+    return r[0] if r else None
+
+
+def _new_active(mem, text):
+    import uuid
+    mid = str(uuid.uuid4())
+    _insert_with_id(mid, {"data": text})
+    return mid
+
+
+def test_supersede_keeps_old_linked_and_hidden(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    old = _new_active(mem, "laptop is XPS 9502 with RTX 2070 qx-laptop")
+    r = mem.supersede([old], "laptop is XPS 15 9510 with RTX 3050 Ti qx-laptop", "user corrected the model",
+                      expected_hashes={old: mem.content_hash("laptop is XPS 9502 with RTX 2070 qx-laptop")})
+    assert r["ok"] and r["state"] == "active"
+    o, n = _row(old), _row(r["id"])
+    assert o["state"] == "superseded" and o["superseded_by"] == r["id"] and n["supersedes_ids"] == [old]
+    assert texts(mem.keyword_search("qx-laptop", 5)) == ["laptop is XPS 15 9510 with RTX 3050 Ti qx-laptop"]
+    assert len(mem.keyword_search("qx-laptop", 5, states=("active", "superseded"))) == 2
+    assert mem.get_memory_detail(old)["superseded_by"] == r["id"]
+
+
+def test_supersede_conflicts(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    old = _new_active(mem, "v1 text")
+    stale = mem.supersede([old], "v2", "edit", expected_hashes={old: mem.content_hash("something else")})
+    assert stale["ok"] is False and stale["changed"] == [old] and _row(old).get("state") is None
+    ok = mem.supersede([old], "v2", "edit")
+    again = mem.supersede([old], "v3", "edit")
+    assert ok["ok"] and again["error"] == "conflict" and again["superseded_by"][old] == ok["id"]
+    assert mem.supersede([old], "v3", "")["error"] == "reason is required"
+
+
+def test_supersede_idempotent_retry(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    old = _new_active(mem, "retry me")
+    a = mem.supersede([old], "new", "fix", idempotency_key="k-1")
+    b = mem.supersede([old], "new", "fix", idempotency_key="k-1")
+    assert a["ok"] and b == {"ok": True, "id": a["id"], "state": "active", "replayed": True}
+
+
+def test_concurrent_supersede_only_one_wins(mem, monkeypatch):
+    import threading
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    old = _new_active(mem, "contested")
+    out = []
+    ts = [threading.Thread(target=lambda i=i: out.append(mem.supersede([old], f"winner {i}", "race"))) for i in range(4)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    assert sum(1 for r in out if r.get("ok")) == 1
+    conn = psycopg2.connect(URL)
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM mem0 WHERE payload->'supersedes_ids' ? %s AND payload->>'state' = 'active'", (old,))
+        assert cur.fetchone()[0] == 1
+    conn.close()
+
+
+def test_merge_proposal_review(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    a, b = _new_active(mem, "fact a"), _new_active(mem, "fact b")
+    p = mem.supersede([a, b], "fact a and b", "merge", as_candidate=True)
+    assert p["state"] == "candidate" and _row(a).get("state") is None          # originals still active
+    assert mem.review(p["id"], "promote")["superseded"] == sorted([a, b])
+    assert _row(a)["state"] == "superseded" and _row(b)["superseded_by"] == p["id"]
+    c, d = _new_active(mem, "fact c"), _new_active(mem, "fact d")
+    q = mem.supersede([c, d], "fact c and d", "merge", as_candidate=True)
+    mem.review(q["id"], "reject")
+    assert _row(c).get("state") is None and _row(d).get("state") is None       # rejection changes nothing
+
+
+def test_edit_is_supersede_with_conflict_check(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    old = _new_active(mem, "ui text")
+    assert mem.update(old, "ui text v2", original="not what is stored")["error"] == "conflict"
+    r = mem.update(old, "ui text v2", original="ui text")
+    assert r["ok"] and _row(old)["state"] == "superseded" and _row(r["id"])["source"] == "ui"
+
+
+def test_orphaned_pending_rows_are_expired(mem):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import dedup_job
+    import psycopg2.extras
+    _insert("orphan", {"state": "pending", "created_at": "2026-01-01T00:00:00+00:00"})
+    _insert("fresh pending", {"state": "pending", "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())})
+    conn = psycopg2.connect(URL)
+    psycopg2.extras.register_uuid(conn_or_curs=conn)
+    try:
+        _job_runs(conn)
+        assert dedup_job.phase_expire_checkpoints(conn, dry_run=False) == 1
+    finally:
+        conn.rollback(); conn.close()

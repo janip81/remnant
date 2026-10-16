@@ -376,8 +376,14 @@ def phase1_hash_dedup(conn, dry_run: bool) -> int:
                 drop_ids = [uuid.UUID(str(i)) for i in row["ids"][1:]]
                 log.info("Hash dedup: keeping %s, dropping %d", keep_id, len(drop_ids))
                 if not dry_run:
-                    archive_rows(cur, drop_ids, "hash-dedup")
-                    delete_rows(cur, drop_ids)
+                    # exact duplicates: no LLM involved, so supersede them directly (kept, hidden)
+                    cur.execute(
+                        f"UPDATE {MEM_TABLE} SET payload = payload || %s::jsonb WHERE id = ANY(%s)",
+                        (json.dumps({"state": "superseded", "superseded_by": str(keep_id),
+                                     "supersede_reason": "exact duplicate (hash)",
+                                     "superseded_by_actor": "dedup",
+                                     "superseded_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())}),
+                         drop_ids))
                 removed += len(drop_ids)
 
             if not dry_run:
@@ -457,7 +463,6 @@ def find_semantic_clusters(
 _CHATTER = re.compile(
     r"^\s*(sure|great|certainly|of course|okay|ok,|here('s| is| are)|based on|it seems|it sounds|"
     r"let's|let me|i can|i will|i'll|would you|feel free|if you need|hope this)\b", re.I)
-MERGE_CONFIRM_SECONDS = int(os.environ.get("MERGE_CONFIRM_SECONDS", "90"))
 # Long notes are kept as they are: qwen2.5:7b expanded two notes of 3125 chars
 # into 123 "facts" (3576 chars) instead of merging them.
 MERGE_MAX_CHARS = int(os.environ.get("MERGE_MAX_CHARS", "1500"))
@@ -518,72 +523,44 @@ def ollama_merge(texts: list[str]) -> Optional[str]:
     return merged
 
 
-def store_memory_direct(content: str, category: str = "") -> Optional[tuple[str, str]]:
-    """Write via the MCP server. Returns ("id", memory_id), ("queued", job_id) or None."""
-    args: dict = {"content": content, "infer": False, "source": "merge"}
-    if category:
-        args["category"] = category
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "tools/call",
-        "params": {"name": "add_memory", "arguments": args},
-        "id": 1,
-    }
+def merge_key(cluster_ids) -> str:
+    """Stable id of a cluster: the same set of originals always gets the same proposal."""
+    import hashlib
+    return "merge:" + hashlib.md5(",".join(sorted(str(i) for i in cluster_ids)).encode()).hexdigest()
+
+
+def proposal_exists(conn, key: str) -> Optional[str]:
+    """State of an earlier proposal for this cluster (candidate, active, rejected...), if any."""
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT coalesce(payload->>'state', 'active') FROM {MEM_TABLE} "
+                    f"WHERE payload->>'idempotency_key' = %s LIMIT 1", (key,))
+        row = cur.fetchone()
+    conn.commit()
+    return row[0] if row else None
+
+
+def propose_merge_direct(cluster_ids, merged_text: str, key: str) -> Optional[dict]:
+    """Ask the MCP server to store the merge as a review candidate (originals stay active)."""
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": "propose_merge",
+                          "arguments": {"old_ids": [str(i) for i in cluster_ids], "merged_content": merged_text,
+                                        "idempotency_key": key, "agent_id": "dedup"}}}
     try:
-        resp = requests.post(
-            f"{MEMORY_URL}/mcp",
-            headers={
-                "Authorization": f"Bearer {MEMORY_TOKEN}",
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream",
-            },
-            json=payload,
-            timeout=30,
-            stream=True,
-        )
+        resp = requests.post(f"{MEMORY_URL}/mcp", json=payload, timeout=60, stream=True,
+                             headers={"Authorization": f"Bearer {MEMORY_TOKEN}", "Content-Type": "application/json",
+                                      "Accept": "application/json, text/event-stream"})
         resp.raise_for_status()
         for line in resp.iter_lines():
             decoded = line.decode() if isinstance(line, bytes) else line
             if decoded.startswith("data:"):
-                obj = json.loads(decoded[5:].strip())
-                result = obj.get("result", {})
+                result = json.loads(decoded[5:].strip()).get("result", {})
                 if result.get("isError"):
-                    log.warning("store error: %s", result)
+                    log.warning("propose_merge error: %s", str(result)[:200])
                     return None
-                text = (result.get("content") or [{}])[0].get("text", "")
-                data = json.loads(text)
-                if data.get("queued") and data.get("job_id"):
-                    return ("queued", data["job_id"])
-                results = data.get("results", [])
-                if results and results[0].get("id"):
-                    return ("id", results[0]["id"])
-                log.warning("store returned no id: %s", text[:200])
-                return None
+                return json.loads((result.get("content") or [{}])[0].get("text", "{}"))
     except Exception as e:
-        log.warning("store_memory_direct failed: %s", e)
+        log.warning("propose_merge failed: %s", e)
     return None
-
-
-def confirm_stored(conn, stored: Optional[tuple[str, str]], timeout: Optional[int] = None) -> Optional[uuid.UUID]:
-    """Id of the merged row once it really exists, else None (originals must then stay)."""
-    if not stored:
-        return None
-    timeout = MERGE_CONFIRM_SECONDS if timeout is None else timeout
-    kind, value = stored
-    deadline = time.monotonic() + timeout
-    while True:
-        with conn.cursor() as cur:
-            if kind == "id":
-                cur.execute(f"SELECT id FROM {MEM_TABLE} WHERE id = %s", (value,))
-            else:
-                cur.execute(f"SELECT id FROM {MEM_TABLE} WHERE payload->>'job_id' = %s LIMIT 1", (value,))
-            row = cur.fetchone()
-        conn.commit()          # no transaction held while waiting
-        if row:
-            return uuid.UUID(str(row[0]))
-        if time.monotonic() >= deadline:
-            return None
-        time.sleep(2)
 
 
 def phase_expire_checkpoints(conn, dry_run: bool) -> int:
@@ -601,7 +578,11 @@ def phase_expire_checkpoints(conn, dry_run: bool) -> int:
                          AND (payload->>'created_at')::timestamptz < now() - make_interval(days => %s)))""",
                 (CHECKPOINT_TTL_DAYS,))
             ids = [uuid.UUID(str(r["id"])) for r in cur.fetchall()]
-            log.info("Found %d expired checkpoints/snapshots", len(ids))
+            # replacements left 'pending' by a crash inside supersede() (never searchable)
+            cur.execute(f"""SELECT id FROM {MEM_TABLE} WHERE payload->>'state' = 'pending'
+                            AND (payload->>'created_at')::timestamptz < now() - interval '1 day'""")
+            ids += [uuid.UUID(str(r["id"])) for r in cur.fetchall()]
+            log.info("Found %d expired checkpoints/snapshots/orphaned pending rows", len(ids))
             if ids and not dry_run:
                 for i in range(0, len(ids), 200):
                     batch = ids[i:i + 200]
@@ -659,6 +640,11 @@ def phase2_semantic_dedup(conn, threshold: float, dry_run: bool) -> int:
                     log.info("Skipping cluster of %d: %d chars > MERGE_MAX_CHARS", len(texts), sum(len(t) for t in texts))
                     continue
 
+                key = merge_key(cluster_ids)
+                earlier = proposal_exists(conn, key)
+                if earlier:
+                    log.info("Cluster already proposed (state=%s); skipping", earlier)
+                    continue
                 log.info("Merging cluster of %d (category=%r)", len(texts), cluster_category)
 
                 if dry_run:
@@ -670,15 +656,13 @@ def phase2_semantic_dedup(conn, threshold: float, dry_run: bool) -> int:
                     log.warning("Merge failed for cluster — skipping")
                     continue
 
-                log.info("  → merged: %s", merged_text[:120])
-                merged_into = confirm_stored(conn, store_memory_direct(merged_text, category=cluster_category))
-                if merged_into is None:
-                    log.warning("Merged memory not confirmed within %ds; originals left untouched",
-                                MERGE_CONFIRM_SECONDS)
+                log.info("  → proposed: %s", merged_text[:120])
+                # Unreviewed LLM output never replaces active facts: the merge becomes a
+                # candidate; promoting it in review supersedes the originals atomically.
+                result = propose_merge_direct(cluster_ids, merged_text, key)
+                if not result or not result.get("ok"):
+                    log.warning("Merge proposal not stored (%s); originals untouched", (result or {}).get("error"))
                     continue
-                archive_rows(cur, cluster_ids, "semantic-dedup", merged_into_id=merged_into)
-                delete_rows(cur, cluster_ids)
-                conn.commit()
                 merged += len(cluster_ids)
 
         finish_job_phase(conn, run_id, "completed", scanned=merged, changed=merged)
@@ -687,7 +671,7 @@ def phase2_semantic_dedup(conn, threshold: float, dry_run: bool) -> int:
         log.error("Phase 2 failed: %s", e)
 
     log.info(
-        "Phase 2 done: processed %d%s",
+        "Phase 2 done: %d memories in new merge proposals%s",
         merged, " (dry run)" if dry_run else "",
     )
     return merged
