@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     # (agents decide what to save); True = mem0 LLM extraction first.
     mem0_infer: bool = False
     app_port: int = 8080
+    app_host: str = "0.0.0.0"   # the benchmark harness binds 127.0.0.1
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5:7b"
     ollama_embed_model: str = "nomic-embed-text"
