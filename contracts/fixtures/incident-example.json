@@ -1,12 +1,63 @@
-{"schema": "remnant.incident/1", "incident_id": "inc-example-7", "title": "UI returns 502 after node reboot",
- "started_at": "2026-10-10T06:00:00+00:00", "resolved_at": "2026-10-10T07:10:00+00:00",
- "scope": {"project": "example", "environment": "prod"},
+{
+ "schema": "remnant.incident/1",
+ "incident_id": "inc-example-7",
+ "title": "UI returns 502 after node reboot",
+ "started_at": "2026-10-10T06:00:00+00:00",
+ "resolved_at": "2026-10-10T07:10:00+00:00",
+ "scope": {
+  "project": "example",
+  "environment": "prod"
+ },
  "timeline": [
-   {"at": "2026-10-10T06:00:00+00:00", "kind": "observation", "text": "UI 502, API pod Ready"},
-   {"at": "2026-10-10T06:10:00+00:00", "kind": "hypothesis", "text": "Gateway route lost its backend"},
-   {"at": "2026-10-10T06:20:00+00:00", "kind": "attempt", "text": "Restarted the gateway", "result": "failed"},
-   {"at": "2026-10-10T06:50:00+00:00", "kind": "attempt", "text": "Recreated the endpoint slice", "result": "worked",
-    "evidence": [{"kind": "tool_output", "ref": "curl -sf https://ui.example/health -> 200"}]},
-   {"at": "2026-10-10T07:10:00+00:00", "kind": "outcome", "text": "Stable for 20 minutes"}],
- "root_cause": {"text": "Stale endpoint slice after the node reboot", "verification": "tool_verified",
-                "evidence": [{"kind": "tool_output", "ref": "kubectl get endpointslices (stale address)"}]}}
+  {
+   "at": "2026-10-10T06:00:00+00:00",
+   "kind": "observation",
+   "text": "UI 502, API pod Ready"
+  },
+  {
+   "at": "2026-10-10T06:10:00+00:00",
+   "kind": "hypothesis",
+   "text": "Gateway route lost its backend"
+  },
+  {
+   "at": "2026-10-10T06:20:00+00:00",
+   "kind": "attempt",
+   "text": "Restarted the gateway",
+   "result": "failed"
+  },
+  {
+   "at": "2026-10-10T06:50:00+00:00",
+   "kind": "attempt",
+   "text": "Recreated the endpoint slice",
+   "result": "worked",
+   "evidence": [
+    {
+     "kind": "tool_output",
+     "ref": "curl -sf https://ui.example/health -> 200"
+    }
+   ]
+  },
+  {
+   "at": "2026-10-10T07:10:00+00:00",
+   "kind": "outcome",
+   "text": "Stable for 20 minutes",
+   "verification": "tool_verified",
+   "evidence": [
+    {
+     "kind": "tool_output",
+     "ref": "health check 200 every minute for 20 minutes"
+    }
+   ]
+  }
+ ],
+ "root_cause": {
+  "text": "Stale endpoint slice after the node reboot",
+  "verification": "tool_verified",
+  "evidence": [
+   {
+    "kind": "tool_output",
+    "ref": "kubectl get endpointslices (stale address)"
+   }
+  ]
+ }
+}

@@ -10,6 +10,7 @@ from datetime import datetime
 EVIDENCE_KINDS = {"tool_output", "file", "commit", "url", "user_statement", "agent_inference"}
 VERIFICATIONS = {"unverified", "tool_verified", "user_confirmed"}
 VERIFIED_BY = {"tool_verified": {"tool_output", "file", "commit"}, "user_confirmed": {"user_statement"}}
+QUALIFYING = {"tool_output", "file", "commit", "url", "user_statement"}     # anything but agent_inference
 HANDOFF_STATES = {"open", "blocked", "done"}
 HYPOTHESIS_STATES = {"untested", "supported", "refuted"}
 TIMELINE_KINDS = {"observation", "hypothesis", "attempt", "outcome"}
@@ -31,6 +32,7 @@ def _check_time(rec: dict, key: str, problems: list, required: bool = False):
     t = _time(rec[key])
     if t is None or t.tzinfo is None:
         problems.append(f"{key} must be an ISO-8601 time with a timezone")
+        return None                       # never compare an invalid or naive time
     return t
 
 
@@ -40,7 +42,8 @@ def check_evidence(items, problems: list, where: str = "evidence") -> set:
         problems.append(f"{where} must be a list")
         return kinds
     for i, e in enumerate(items):
-        if not isinstance(e, dict) or e.get("kind") not in EVIDENCE_KINDS or not str(e.get("ref", "")).strip():
+        ref = e.get("ref") if isinstance(e, dict) else None
+        if not isinstance(e, dict) or e.get("kind") not in EVIDENCE_KINDS or not isinstance(ref, str) or not ref.strip():
             problems.append(f"{where}[{i}] needs kind in {sorted(EVIDENCE_KINDS)} and a non-empty ref")
             continue
         _check_time(e, "observed_at", problems)
@@ -55,9 +58,27 @@ def _check_verification(level: str, kinds: set, problems: list, where: str):
         problems.append(f"{where}: {level} needs evidence of kind {sorted(VERIFIED_BY[level])}")
 
 
+def _records(value, where: str, problems: list) -> list[dict]:
+    """The dict entries of a list field; anything malformed is reported, not raised."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        problems.append(f"{where} must be a list")
+        return []
+    out = []
+    for i, e in enumerate(value):
+        if isinstance(e, dict):
+            out.append((i, e))
+        else:
+            problems.append(f"{where}[{i}] must be an object")
+    return out
+
+
 def validate_fact(meta: dict) -> list[str]:
     """Temporal/evidence metadata of one memory. Every field is optional."""
     p: list[str] = []
+    if not isinstance(meta, dict):
+        return ["fact metadata must be an object"]
     if "confidence" in meta:
         p.append("confidence is not accepted: use evidence + verification")
     _check_time(meta, "observed_at", p)
@@ -69,7 +90,7 @@ def validate_fact(meta: dict) -> list[str]:
         p.append("scope may only contain project and environment")
     if bool(meta.get("subject")) != bool(meta.get("property")):
         p.append("subject and property go together")
-    kinds = check_evidence(meta.get("evidence", []), p)
+    kinds = check_evidence(meta.get("evidence") or [], p)
     _check_verification(meta.get("verification", "unverified"), kinds, p, "fact")
     return p
 
@@ -98,6 +119,8 @@ def conflict_proposal(a: dict, b: dict) -> dict | None:
 
 
 def validate_handoff(h: dict) -> list[str]:
+    if not isinstance(h, dict):
+        return ["handoff must be an object"]
     p: list[str] = []
     if h.get("schema") != "remnant.handoff/1":
         p.append("schema must be remnant.handoff/1")
@@ -112,16 +135,20 @@ def validate_handoff(h: dict) -> list[str]:
             p.append(f"{k} must be a list of non-empty strings")
     if h.get("state") == "open" and not h.get("next"):
         p.append("an open handoff needs at least one next step")
-    check_evidence(h.get("evidence", []), p)
-    for i, hy in enumerate(h.get("hypotheses", [])):
-        if hy.get("status") not in HYPOTHESIS_STATES or not str(hy.get("text", "")).strip():
+    check_evidence(h.get("evidence") or [], p)
+    for i, hy in _records(h.get("hypotheses"), "hypotheses", p):
+        if hy.get("status") not in HYPOTHESIS_STATES or not isinstance(hy.get("text"), str) or not hy["text"].strip():
             p.append(f"hypotheses[{i}] needs text and status in {sorted(HYPOTHESIS_STATES)}")
-        elif hy["status"] == "supported" and not check_evidence(hy.get("evidence", []), p, f"hypotheses[{i}].evidence"):
-            p.append(f"hypotheses[{i}]: supported needs evidence")
+            continue
+        kinds = check_evidence(hy.get("evidence") or [], p, f"hypotheses[{i}].evidence")
+        if hy["status"] == "supported" and not kinds & QUALIFYING:
+            p.append(f"hypotheses[{i}]: supported needs evidence other than agent_inference")
     return p
 
 
 def validate_incident(inc: dict) -> list[str]:
+    if not isinstance(inc, dict):
+        return ["incident must be an object"]
     p: list[str] = []
     if inc.get("schema") != "remnant.incident/1":
         p.append("schema must be remnant.incident/1")
@@ -130,9 +157,9 @@ def validate_incident(inc: dict) -> list[str]:
             p.append(f"{k} is required")
     started = _check_time(inc, "started_at", p, required=True)
     resolved = _check_time(inc, "resolved_at", p)
-    timeline = inc.get("timeline", [])
+    timeline = [e for _, e in _records(inc.get("timeline"), "timeline", p)]
     last = None
-    for i, e in enumerate(timeline):
+    for i, e in _records(inc.get("timeline"), "timeline", []):
         t = _check_time(e, "at", p, required=True)
         if e.get("kind") not in TIMELINE_KINDS or not str(e.get("text", "")).strip():
             p.append(f"timeline[{i}] needs text and kind in {sorted(TIMELINE_KINDS)}")
@@ -142,17 +169,21 @@ def validate_incident(inc: dict) -> list[str]:
         if t and started and t < started:
             p.append(f"timeline[{i}] is before started_at")
         last = t or last
-        kinds = check_evidence(e.get("evidence", []), p, f"timeline[{i}].evidence")
+        kinds = check_evidence(e.get("evidence") or [], p, f"timeline[{i}].evidence")
         if e["kind"] == "attempt":
             if e.get("result") not in ATTEMPT_RESULTS:
                 p.append(f"timeline[{i}]: attempt needs result in {sorted(ATTEMPT_RESULTS)}")
-            elif e["result"] == "worked" and not kinds:
-                p.append(f"timeline[{i}]: a worked attempt needs evidence")
+            elif e["result"] == "worked" and not kinds & QUALIFYING:
+                p.append(f"timeline[{i}]: a worked attempt needs evidence other than agent_inference")
+        if e["kind"] == "outcome":            # outcomes may be unverified, but say so
+            _check_verification(e.get("verification", "unverified"), kinds, p, f"timeline[{i}]")
     if resolved and not any(e.get("kind") == "outcome" for e in timeline):
         p.append("resolved_at needs an outcome entry")
     rc = inc.get("root_cause")
-    if rc is not None:
-        kinds = check_evidence(rc.get("evidence", []), p, "root_cause.evidence")
+    if rc is not None and not isinstance(rc, dict):
+        p.append("root_cause must be an object")
+    elif rc is not None:
+        kinds = check_evidence(rc.get("evidence") or [], p, "root_cause.evidence")
         _check_verification(rc.get("verification", "unverified"), kinds, p, "root_cause")
     return p
 
@@ -189,5 +220,7 @@ def render_incident(inc: dict, limit: int = 1500) -> str:
         lines.append(f"Root cause [{rc.get('verification', 'unverified')}]: {rc['text']}")
     for e in inc.get("timeline", []):
         tag = e["kind"] + (f":{e['result']}" if e["kind"] == "attempt" else "")
+        if e["kind"] == "outcome":
+            tag += f" [{e.get('verification', 'unverified')}]"
         lines.append(f"{e['at']} {tag} — {e['text']}")
     return _clip(lines, limit)

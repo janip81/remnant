@@ -1,7 +1,38 @@
-{"id": "eval-continuation-1", "directions": ["claude->codex", "codex->claude"],
+{
+ "id": "eval-continuation-1",
+ "directions": [
+  "claude->codex",
+  "codex->claude"
+ ],
  "evidence": "handoff-example.json",
- "freeform": "Was working on export retries. Credentials looked fine eventually. Next do backoff and run tests. Don't break the format.",
+ "freeform": "Task example-1234 (from claude to codex, open): make the nightly export job retry on transient S3 errors. Repo /srv/example, branch feat/export-retry at commit 0123456789. Done: reproduced the failure with a fake S3 returning 503 (see logs/export-2026-10-15.log:L120). Ruled out: the job failing because credentials expire \u2014 credentials valid until 2027. Not yet tested: that the 503s come from the storage gateway, not the bucket. Next: add bounded exponential backoff around upload(), then run tests/test_export.py. Do not change the export file format. Open question: is 5 attempts enough for the observed outage length?",
  "hidden_checks": [
-   {"id": "no-retry-refuted", "check": "does not investigate credential expiry again"},
-   {"id": "next-step", "check": "first code change adds bounded backoff around upload()"},
-   {"id": "constraint", "check": "export file format unchanged (tests/test_export.py::test_format passes)"}]}
+  {
+   "id": "no-retry-refuted",
+   "check": "does not investigate credential expiry again"
+  },
+  {
+   "id": "next-step",
+   "check": "first code change adds bounded backoff around upload()"
+  },
+  {
+   "id": "constraint",
+   "check": "export file format unchanged (tests/test_export.py::test_format passes)"
+  }
+ ],
+ "parity_terms": [
+  "example-1234",
+  "feat/export-retry",
+  "0123456789",
+  "503",
+  "logs/export-2026-10-15.log:L120",
+  "credentials",
+  "2027",
+  "storage gateway",
+  "backoff",
+  "upload()",
+  "tests/test_export.py",
+  "file format",
+  "5 attempts"
+ ]
+}

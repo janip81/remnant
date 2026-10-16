@@ -47,8 +47,8 @@ Required fields are `schema`, `task_id`, `from_agent`, `created_at`, `goal` and
 - `evidence[]`;
 - `hypotheses[{text, status}]`, where `status` ∈ `untested | supported | refuted`.
 
-`supported` needs evidence. `refuted` keeps the failed idea visible, so the next agent
-doesn't retry it blindly.
+`supported` needs evidence other than `agent_inference`. `refuted` keeps the failed idea
+visible, so the next agent doesn't retry it blindly.
 
 ## 3. Incident episode (`remnant.incident/1`)
 
@@ -56,9 +56,14 @@ This is a timeline that keeps observations, hypotheses, attempts and outcomes ap
 Every timeline entry has `at`, `kind` and `text`, where `kind` ∈
 `observation | hypothesis | attempt | outcome`:
 
-- an `attempt` has `result` ∈ `failed | partial | worked`, and `worked` needs evidence;
-- a `root_cause` with `verification` other than `unverified` needs evidence;
+- an `attempt` has `result` ∈ `failed | partial | worked`, and `worked` needs evidence
+  other than `agent_inference`;
+- an `outcome` may stay unverified, but it is then rendered as `[unverified]`;
+  claiming `tool_verified`/`user_confirmed` needs matching evidence, as for root causes;
 - `resolved_at` needs an `outcome` entry.
+
+Malformed records (null or non-object entries, naive timestamps, a non-string `ref`)
+are reported as problems; the validators never raise on them.
 
 ## 4. Rendering
 
@@ -71,6 +76,9 @@ than presenting them as truth.
 This compares the same evidence as a freeform note and as a `remnant.handoff/1`
 record, for Claude → Codex and Codex → Claude.
 
+- Both arms carry the same facts and evidence references. The case lists
+  `parity_terms`, and a test checks that each term appears in both arms, so only the
+  format differs.
 - Each synthetic case (`fixtures/eval-*.json`) holds the task state, plus hidden
   acceptance checks that the receiving agent never sees. Examples: "does not retry
   the refuted hypothesis", "continues from the stated next step", "keeps the

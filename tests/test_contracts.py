@@ -56,7 +56,7 @@ def test_handoff_rules():
     h = FIX["handoff-example"]
     bad = copy.deepcopy(h)
     bad["hypotheses"][1] = {"text": "it is DNS", "status": "supported"}            # no evidence
-    assert c.validate_handoff(bad) == ["hypotheses[1]: supported needs evidence"]
+    assert c.validate_handoff(bad) == ["hypotheses[1]: supported needs evidence other than agent_inference"]
     assert c.validate_handoff({**h, "next": []}) == ["an open handoff needs at least one next step"]
     assert c.validate_handoff({**h, "state": "done", "next": []}) == []
     assert c.validate_handoff({**h, "schema": "x", "task_id": ""})
@@ -66,7 +66,7 @@ def test_incident_rules():
     inc = FIX["incident-example"]
     bad = copy.deepcopy(inc)
     del bad["timeline"][3]["evidence"]
-    assert c.validate_incident(bad) == ["timeline[3]: a worked attempt needs evidence"]
+    assert c.validate_incident(bad) == ["timeline[3]: a worked attempt needs evidence other than agent_inference"]
     bad = copy.deepcopy(inc)
     bad["timeline"] = bad["timeline"][:4]
     assert c.validate_incident(bad) == ["resolved_at needs an outcome entry"]
@@ -91,3 +91,45 @@ def test_renderers_are_bounded_and_flag_refuted_and_unverified():
 def test_eval_case_references_existing_evidence():
     case = FIX["eval-continuation-1"]
     assert (ROOT / "fixtures" / case["evidence"]).exists() and len(case["hidden_checks"]) >= 3
+
+
+def test_inference_alone_never_verifies_success():
+    inc = copy.deepcopy(FIX["incident-example"])
+    inc["timeline"][3]["evidence"] = [{"kind": "agent_inference", "ref": "looks fixed"}]
+    assert c.validate_incident(inc) == ["timeline[3]: a worked attempt needs evidence other than agent_inference"]
+    inc = copy.deepcopy(FIX["incident-example"])
+    inc["timeline"][4] = {"at": inc["timeline"][4]["at"], "kind": "outcome", "text": "seems fine"}
+    assert c.validate_incident(inc) == []                                    # unverified outcome is allowed ...
+    assert "outcome [unverified] — seems fine" in c.render_incident(inc)      # ... and shown as such
+    inc["timeline"][4]["verification"] = "tool_verified"
+    assert c.validate_incident(inc)                                          # but can't claim verification
+    h = copy.deepcopy(FIX["handoff-example"])
+    h["hypotheses"][1].update(status="supported", evidence=[{"kind": "agent_inference", "ref": "probably"}])
+    assert c.validate_handoff(h) == ["hypotheses[1]: supported needs evidence other than agent_inference"]
+
+
+def test_malformed_records_report_problems_instead_of_crashing():
+    assert c.validate_fact({"valid_from": "2026-10-01T00:00:00", "valid_until": "2026-10-02T00:00:00+00:00"})
+    assert c.validate_fact(None) == ["fact metadata must be an object"]
+    assert c.validate_fact({"evidence": None}) == []
+    h = {**FIX["handoff-example"], "hypotheses": [None, "x", {"status": "untested", "text": None}]}
+    probs = c.validate_handoff(h)
+    assert "hypotheses[0] must be an object" in probs and "hypotheses[1] must be an object" in probs
+    assert any(x.startswith("hypotheses[2] needs text") for x in probs)
+    assert c.validate_incident({**FIX["incident-example"], "timeline": [None]}) == \
+        ["timeline[0] must be an object", "resolved_at needs an outcome entry"]
+    assert c.validate_incident({**FIX["incident-example"], "root_cause": "dns"}) == ["root_cause must be an object"]
+    assert c.validate_handoff(None) == ["handoff must be an object"]
+
+
+def test_evidence_ref_must_be_a_real_string():
+    for ref in (None, 5, {"a": 1}, "  "):
+        assert c.validate_fact({"verification": "tool_verified", "evidence": [{"kind": "tool_output", "ref": ref}]})
+
+
+def test_eval_arms_carry_the_same_facts():
+    case = FIX["eval-continuation-1"]
+    structured = c.render_handoff(FIX[case["evidence"][:-5]], limit=10_000) + json.dumps(FIX[case["evidence"][:-5]])
+    for term in case["parity_terms"]:
+        assert term in case["freeform"], term
+        assert term in structured, term
