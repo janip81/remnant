@@ -69,8 +69,13 @@ export default function Memories() {
   })
 
   const updateMutation = useMutation({
-    mutationFn: ({ id, content }: { id: string; content: string }) => api.update(id, content),
+    mutationFn: ({ id, content, original }: { id: string; content: string; original: string }) =>
+      api.update(id, content, original),
     onSuccess: invalidate,
+    onError: (e: Error) => {
+      if (e.message.startsWith('409')) window.alert('This memory was changed meanwhile — reloaded, please edit again.')
+      invalidate()
+    },
   })
 
   const updateTagsMutation = useMutation({
@@ -219,7 +224,7 @@ export default function Memories() {
               memory={m}
               onDelete={(id) => deleteMutation.mutate(id)}
               onReview={(id, action) => reviewMutation.mutate({ id, action })}
-              onUpdate={(id, content) => updateMutation.mutate({ id, content })}
+              onUpdate={(id, content, original) => updateMutation.mutate({ id, content, original })}
               onUpdateTags={(id, tags) => updateTagsMutation.mutate({ id, tags })}
             />
           ))}

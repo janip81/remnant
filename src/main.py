@@ -82,8 +82,47 @@ async def search_memory(query: str, limit: int = 5, include_sessions: bool = Fal
         evidence = f"cos {cos:.2f}" if cos is not None else "keyword only"
         state = r.get("state") or "active"
         flag = "" if state == "active" else f" | {state}"
+        if state == "superseded" and r.get("superseded_by"):
+            flag += f" by {str(r['superseded_by'])[:8]}"
         lines.append(f"[rank {r.get('score', 0):.2f} | {evidence} | {r.get('match', '')}{flag}] {text}")
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_memory(memory_id: str) -> str:
+    """One memory by exact id: text, state, content hash (pass it to supersede_memory as
+    expected_hash) and lifecycle links (superseded_by, supersedes_ids)."""
+    row = await asyncio.to_thread(mem_store.get_memory_detail, memory_id)
+    return json.dumps(row) if row else "Not found."
+
+
+@mcp.tool()
+async def supersede_memory(old_id: str, new_content: str, reason: str, expected_hash: str = "",
+                           idempotency_key: str = "", agent_id: str = "") -> str:
+    """Replace an outdated or wrong memory with a corrected one. The old memory is kept
+    (state=superseded, linked via superseded_by) instead of being overwritten, and search
+    shows only the new one. Use it for explicit corrections, not because two memories are
+    merely similar: search, read the exact row with get_memory, then supersede it.
+    expected_hash: the hash from get_memory — if the memory changed since, you get a
+    conflict with its current state instead of overwriting someone else's change.
+    idempotency_key: any unique string; retrying with it never creates a second copy."""
+    result = await asyncio.to_thread(
+        mem_store.supersede, [old_id], new_content, reason, actor=agent_id or "agent",
+        expected_hashes={old_id: expected_hash} if expected_hash else None,
+        idempotency_key=idempotency_key, agent_id=agent_id)
+    return json.dumps(result)
+
+
+@mcp.tool()
+async def propose_merge(old_ids: list[str], merged_content: str, reason: str = "merge of near-duplicates",
+                        idempotency_key: str = "", agent_id: str = "") -> str:
+    """Propose one memory that replaces several near-duplicates. Stored as a candidate
+    (state=candidate, supersedes_ids=old_ids); the originals stay active until the
+    proposal is promoted in review, which then supersedes them atomically."""
+    result = await asyncio.to_thread(mem_store.supersede, old_ids, merged_content, reason,
+                                     actor=agent_id or "merge", idempotency_key=idempotency_key,
+                                     as_candidate=True, agent_id=agent_id, source="merge")
+    return json.dumps(result)
 
 
 @mcp.tool()
@@ -284,6 +323,7 @@ def _memory_dict(r: dict) -> dict:
         "review_reason": r.get("review_reason") or meta.get("review_reason") or "",
         "project": r.get("project") or meta.get("project") or "",
         "kind": r.get("kind") or meta.get("kind") or "",
+        "superseded_by": r.get("superseded_by") or "",
     }
 
 
@@ -543,15 +583,21 @@ async def app(scope, receive, send):
             # PUT /api/memories/{id} — edit content
             if method == "PUT":
                 raw = await _read_body(receive)
+                original = None
                 try:
                     body_data = json.loads(raw)
                     content = body_data.get("memory", body_data.get("content", "")).strip()
+                    original = body_data.get("original")
                 except Exception:
                     params = dict(p.split("=", 1) for p in raw.decode().split("&") if "=" in p)
                     content = urllib.parse.unquote_plus(params.get("content", "")).strip()
-                if content:
-                    await asyncio.to_thread(mem_store.update, memory_id, content)
-                await _send_response(send, *_json_response({"ok": True}))
+                if not content:
+                    await _send_response(send, 400, [[b"content-type", b"text/plain"]], b"content required")
+                    return
+                result = await asyncio.to_thread(mem_store.update, memory_id, content, original,
+                                                 _get_agent_id(headers) or "ui")
+                status = 200 if result.get("ok") else 409 if result.get("error") == "conflict" else 400
+                await _send_response(send, *_json_response(result, status))
                 return
 
             # PATCH /api/memories/{id}/tags — update tags only

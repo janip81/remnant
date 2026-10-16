@@ -26,7 +26,7 @@ interface Props {
   memory: Memory
   onDelete: (id: string) => void
   onReview?: (id: string, action: 'promote' | 'reject') => void
-  onUpdate: (id: string, content: string) => void
+  onUpdate: (id: string, content: string, original: string) => void
   onUpdateTags: (id: string, tags: string[]) => void
 }
 
@@ -40,7 +40,7 @@ export default function MemoryCard({ memory, onDelete, onUpdate, onUpdateTags, o
   const tagInputRef = useRef<HTMLInputElement>(null)
 
   function handleSave() {
-    if (draft.trim() && draft !== memory.memory) onUpdate(memory.id, draft.trim())
+    if (draft.trim() && draft !== memory.memory) onUpdate(memory.id, draft.trim(), memory.memory)
     setEditing(false)
   }
 
@@ -126,7 +126,8 @@ export default function MemoryCard({ memory, onDelete, onUpdate, onUpdateTags, o
             <Box sx={{ display: 'flex', gap: 0.5, mt: 1, flexWrap: 'wrap', alignItems: 'center' }}>
               <Chip label={fmtDate(memory.created_at)} size="small" variant="outlined" sx={{ fontSize: 11 }} />
               {memory.state && memory.state !== 'active' && (
-                <Tooltip title={memory.review_reason ? `reason: ${memory.review_reason}` : memory.state}>
+                <Tooltip title={memory.superseded_by ? `replaced by ${memory.superseded_by.slice(0, 8)}`
+                                : memory.review_reason ? `reason: ${memory.review_reason}` : memory.state}>
                   <Chip label={memory.state} size="small"
                         color={memory.state === 'candidate' ? 'warning' : memory.state === 'rejected' ? 'error' : 'default'}
                         sx={{ fontSize: 11 }} />
