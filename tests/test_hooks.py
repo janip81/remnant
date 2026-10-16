@@ -121,3 +121,34 @@ def test_search_has_total_deadline(tmp_path, monkeypatch):
     t0 = time.time()
     assert h.search("http://x", "t", "q") == []
     assert time.time() - t0 < 1.5
+
+
+def test_session_start_resume_and_compact_render(tmp_path):
+    """Regression: an apostrophe inside ${VAR:+...} in the heredoc made bash abort the
+    resume/compact output entirely (no checkpoint, no memories)."""
+    import json, subprocess, threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Fake(BaseHTTPRequestHandler):
+        def do_POST(self):
+            name = json.loads(self.rfile.read(int(self.headers["Content-Length"])))["params"]["name"]
+            text = "checkpoint: was fixing pg" if name == "get_checkpoint" else "1. memory hit"
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(f"data: {json.dumps({'result': {'content': [{'text': text}]}})}\n\n".encode())
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Fake)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path),
+           "REMNANT_URL": f"http://127.0.0.1:{srv.server_port}", "REMNANT_TOKEN": "t"}
+    try:
+        for source, title in (("resume", "Session Resumed"), ("compact", "Post-Compaction Recovery")):
+            r = subprocess.run(["bash", str(HOOK.parent / "on_session_start.sh")], env=env, text=True,
+                               capture_output=True, input=json.dumps({"source": source, "session_id": "s1", "cwd": "/x/p"}))
+            assert "bad substitution" not in r.stderr
+            assert title in r.stdout and "was fixing pg" in r.stdout and "memory hit" in r.stdout
+    finally:
+        srv.shutdown()
