@@ -65,20 +65,39 @@ def write_events(path, run_id, events):
     path.write_text("".join(json.dumps({"run_id": run_id, **e}) + "\n" for e in events))
 
 
-def test_event_check_needs_every_prompt_and_session_start(tmp_path):
+def test_event_check_matches_order_multiplicity_policy_and_session(tmp_path):
     log = tmp_path / "hooks.jsonl"
-    segs = [["what about pg-main-rw?", "and then?"], ["after resume"]]
+    segs = [["what about pg-main-rw?", "what about pg-main-rw?"], ["after resume"]]   # repeated prompt
     h = bench_log.prompt_hash
-    full = [{"event": "SessionStart", "source": "startup"}, {"event": "SessionStart", "source": "resume"}] + \
-           [{"event": "UserPromptSubmit", "prompt_hash": h(p)} for s in segs for p in s]
-    write_events(log, "r1", full)
-    assert bench.check_events(log, "r1", segs) == []
-    assert bench.check_events(log, "other-run", segs)                  # events of other runs don't count
-    write_events(log, "r1", full[:1] + full[2:])
-    assert bench.check_events(log, "r1", segs) == ["SessionStart resume: expected 1, got 0"]
-    write_events(log, "r1", full[:-1])
-    assert bench.check_events(log, "r1", segs) == ["turn 2: no UserPromptSubmit event"]
-    assert bench.check_events(log, "r1", [["x is fine here", "/compact"]])[-1] == "SessionStart compact: expected 1, got 0"
+    ev = lambda **e: {"policy": "selective", "session_id": "s1", **e}
+    full = [ev(event="SessionStart", source="startup"),
+            ev(event="UserPromptSubmit", prompt_hash=h(segs[0][0])),
+            ev(event="UserPromptSubmit", prompt_hash=h(segs[0][1])),
+            ev(event="SessionStart", source="resume"),
+            ev(event="UserPromptSubmit", prompt_hash=h("after resume"))]
+    check = lambda events, **kw: (write_events(log, "r1", events),
+                                  bench.check_events(log, "r1", segs, "selective", {"s1"}, **kw))[1]
+    assert check(full) == []
+    assert bench.check_events(log, "other-run", segs)                                  # other runs don't count
+    # one event can't cover a prompt that was sent twice
+    assert check(full[:2] + full[3:]) == ["missing or out of order: UserPromptSubmit " + h(segs[0][0])]
+    assert check([full[0], full[3], full[1], full[2], full[4]])                       # reordered
+    assert check(full + [full[-1]]) == ["unexpected extra hook events"]
+    assert check([{**full[0], "policy": "broad"}] + full[1:]) == ["event with policy 'broad', expected 'selective'"]
+    assert check([{**full[0], "session_id": "live"}] + full[1:]) == ["event from a session outside this run"]
+
+
+def test_compact_turn_needs_compact_start_and_slash_event_is_optional(tmp_path):
+    log = tmp_path / "hooks.jsonl"
+    h = bench_log.prompt_hash
+    segs = [["tell me about the backups please", "/compact", "and now?"]]
+    base = [{"event": "SessionStart", "source": "startup"}, {"event": "UserPromptSubmit", "prompt_hash": h(segs[0][0])}]
+    tail = [{"event": "SessionStart", "source": "compact"}, {"event": "UserPromptSubmit", "prompt_hash": h("and now?")}]
+    for middle in ([], [{"event": "UserPromptSubmit", "prompt_hash": h("/compact")}]):
+        write_events(log, "r1", base + middle + tail)
+        assert bench.check_events(log, "r1", segs) == []
+    write_events(log, "r1", base + tail[1:])
+    assert bench.check_events(log, "r1", segs) == ["missing or out of order: SessionStart compact"]
 
 
 def scen_file(tmp_path, accept):
@@ -183,3 +202,29 @@ def test_real_cli_needs_explicit_confirmation(tmp_path, monkeypatch):
     monkeypatch.setattr(bench.shutil, "which", lambda name: "/usr/bin/claude")
     with pytest.raises(SystemExit, match="confirm-model-calls"):
         bench.cmd_execute(A)
+
+
+def test_project_settings_are_removed_from_the_run_copy(tmp_path):
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text('{"hooks": {"Stop": [{"hooks": [{"command": "sentinel"}]}]}}')
+    (tmp_path / ".mcp.json").write_text("{}")
+    (tmp_path / ".claude" / "commands").mkdir()
+    assert bench.sanitize_project(tmp_path) == [".claude/settings.json", ".mcp.json"]
+    assert not (tmp_path / ".claude" / "settings.json").exists() and (tmp_path / ".claude" / "commands").exists()
+
+
+def test_private_destinations(tmp_path):
+    d = bench.private_dir(tmp_path / "w")
+    assert d.stat().st_mode & 0o777 == 0o700
+    open_dir = tmp_path / "open"
+    open_dir.mkdir(mode=0o755)
+    open_dir.chmod(0o755)
+    with pytest.raises(SystemExit):
+        bench.private_dir(open_dir)
+    f = tmp_path / "res.jsonl"
+    f.write_text("")
+    f.chmod(0o644)
+    with pytest.raises(SystemExit):
+        bench.private_file(f)
+    with pytest.raises(SystemExit):
+        bench.private_dir(ROOT / "bench-work")                     # in the repo and not ignored

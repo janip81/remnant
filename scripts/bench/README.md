@@ -23,7 +23,15 @@ search on resume/compact.
   a generated `--settings`, and MCP from `--strict-mcp-config`.
 - Runs are read-only: `--tools Read,Grep,Glob` plus Remnant `search_memory`/`get_memory`,
   under `--permission-mode dontAsk`.
-- Each run gets a fresh `git archive` copy of the target repo.
+- Each run gets a fresh `git archive` copy of the target repo. The copy's own
+  `.claude/settings*.json` and `.mcp.json` are removed, and recorded in
+  `sanitized_project_files`, so the target repo can't add hooks, env or MCP servers.
+- Remaining limitation: the real `HOME` is kept, because CLI login needs it. User
+  settings are excluded, but other per-user CLI state still applies, identically in
+  every arm.
+- Each run has its own server log, so MCP request counts don't accumulate across runs.
+- The hooks keep their state per session (`$XDG_CACHE_HOME/remnant/`), so benchmark
+  sessions and live sessions don't share flags.
 
 ## Use
 
@@ -81,8 +89,9 @@ SessionStart.
 ## Three separate outcomes per run
 
 - `harness_valid` means the run measured what it claims:
-  - every prompt has its `UserPromptSubmit` event;
-  - every process start has its `SessionStart` event (startup, then resume, plus compact);
+  - the hook events match the script exactly: the same order and count (a repeated
+    prompt needs two events), startup/resume/compact starts, the arm's policy, and
+    only this run's sessions;
   - all scripted turns ran.
 - `cli_ok` means every turn returned a result, without a CLI error, timeout, crash
   or non-zero exit.
@@ -95,9 +104,9 @@ memory text.
 
 ## Privacy
 
-- `execute` runs with umask 077, so run directories, streams and answers are
-  owner-only.
-- It refuses a results path inside the repo unless that path is git-ignored.
+- `execute`, `preflight` and `snapshot` run with umask 077.
+- They refuse a work directory, results file or snapshot inside the repo unless that
+  path is git-ignored. They also refuse an existing one that group/others can read.
 - `export` writes only labels, flags, timings, counts and token/cost numbers.
 
 ## Codex adapter (pending)

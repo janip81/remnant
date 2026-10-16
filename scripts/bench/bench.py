@@ -76,7 +76,8 @@ def git_rev(path: Path) -> str:
 # ---------------------------------------------------------------- environment
 
 def cmd_snapshot(a):
-    out = Path(a.out)
+    os.umask(0o077)
+    out = private_file(Path(a.out))
     with open(out, "wb") as f:
         os.chmod(out, 0o600)
         subprocess.run(["kubectl", "-n", "remnant", "exec", a.pod, "-c", "postgres", "--", "pg_dump", "-U", "postgres",
@@ -139,10 +140,11 @@ class Server:
                 "REMNANT_USER_ID": os.environ.get("BENCH_USER_ID", "jani"), "REMNANT_AGENT_ID": "bench",
                 "TAGGING_MODE": "rules"}
 
-    def start(self):
+    def start(self, log_path: Path | None = None):
         self.workdir.mkdir(parents=True, exist_ok=True)
         assert not (self.workdir / ".env").exists()          # config.py would load it
-        log = open(self.workdir / "server.log", "a")
+        self.log_path = log_path or self.workdir / "server.log"      # per run: request counts don't accumulate
+        log = open(self.log_path, "a")
         self.proc = subprocess.Popen([self.python, str(REPO / "src" / "main.py")], cwd=self.workdir, env=self.env(),
                                      stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         for _ in range(90):
@@ -298,28 +300,48 @@ def run_segment(cmd: list[str], cwd: Path, env: dict, prompts: list[str], out_pa
     return session_id, recs
 
 
-def check_events(log: Path, run_id: str, segments: list[list[str]]) -> list[str]:
-    """Every submitted prompt needs its UserPromptSubmit event; every process start its
-    SessionStart (startup, then resume per later segment); every /compact a compact."""
+def expected_events(segments: list[list[str]]) -> list[tuple]:
+    """The hook events a run must produce, in order. A slash command may or may not
+    reach UserPromptSubmit (optional); /compact must be followed by a compact start."""
+    sys.path.insert(0, str(PLUGIN / "hooks"))
+    import bench_log
+    out = []
+    for n, seg in enumerate(segments):
+        out.append(("SessionStart", "resume" if n else "startup", True))
+        for prompt in seg:
+            out.append(("UserPromptSubmit", bench_log.prompt_hash(prompt), not prompt.startswith("/")))
+            if prompt.strip() == "/compact":
+                out.append(("SessionStart", "compact", True))
+    return out
+
+
+def check_events(log: Path, run_id: str, segments: list[list[str]], policy: str = "",
+                 session_ids: set | None = None) -> list[str]:
+    """Hook events must match the scripted run exactly: same order and multiplicity
+    (a repeated prompt needs two events), the arm's policy, and this run's sessions."""
     try:
         events = [json.loads(l) for l in log.read_text().splitlines()]
     except OSError:
         events = []
-    events = [e for e in events if e.get("run_id") == run_id]
-    sys.path.insert(0, str(PLUGIN / "hooks"))
-    import bench_log
+    events = [e for e in events if e.get("run_id") == run_id and e.get("event") in ("SessionStart", "UserPromptSubmit")]
     problems = []
-    hashes = [e.get("prompt_hash") for e in events if e["event"] == "UserPromptSubmit"]
-    for i, prompt in enumerate(t for seg in segments for t in seg):
-        if not prompt.startswith("/") and bench_log.prompt_hash(prompt) not in hashes:
-            problems.append(f"turn {i}: no UserPromptSubmit event")
-    got = [e.get("source") for e in events if e["event"] == "SessionStart"]
-    want = {"startup": 1, "resume": len(segments) - 1,
-            "compact": sum(t.strip() == "/compact" for seg in segments for t in seg)}
-    for src, n in want.items():
-        if got.count(src) < n:
-            problems.append(f"SessionStart {src}: expected {n}, got {got.count(src)}")
-    return problems
+    for e in events:
+        if policy and e.get("policy") != policy:
+            problems.append(f"event with policy {e.get('policy')!r}, expected {policy!r}")
+        if session_ids is not None and e.get("session_id") not in session_ids:
+            problems.append("event from a session outside this run")
+    got = iter(events)
+    pending = next(got, None)
+    for kind, key, required in expected_events(segments):
+        if pending is not None and pending["event"] == kind and \
+                key == (pending.get("source") if kind == "SessionStart" else pending.get("prompt_hash")):
+            pending = next(got, None)
+        elif required:
+            label = f"SessionStart {key}" if kind == "SessionStart" else f"UserPromptSubmit {key}"
+            problems.append(f"missing or out of order: {label}")
+    if pending is not None:
+        problems.append("unexpected extra hook events")
+    return sorted(set(problems), key=problems.index)
 
 
 def accept(answer: str, patterns: list[str]) -> bool:
@@ -370,13 +392,14 @@ def run_one(spec: dict, scen: dict, sfile: dict, a, server: Server, token: str, 
     archive = subprocess.Popen(["git", "-C", sfile["repo"], "archive", sfile["repo_commit"]], stdout=subprocess.PIPE)
     subprocess.run(["tar", "-x", "-C", str(wt)], stdin=archive.stdout, check=True)
     archive.wait()
+    sanitized = sanitize_project(wt)
     server.reset()
-    server.start()
+    server.start(run_dir / "server.log")
     proc_env, flags = run_config(run_dir, run_id, spec["arm"], token)
     assert_isolated(run_dir, proc_env)
     assert not any((run_dir / "cache").iterdir()), "hook cache not fresh"
     segments = scen.get("segments") or [scen["turns"]]
-    turns, session_id, n_expected = [], None, sum(map(len, segments))
+    turns, session_id, n_expected, sids = [], None, sum(map(len, segments)), set()
     sys.path.insert(0, str(PLUGIN / "hooks"))
     import bench_log
     for seg_no, prompts in enumerate(segments):
@@ -384,6 +407,7 @@ def run_one(spec: dict, scen: dict, sfile: dict, a, server: Server, token: str, 
                "--include-partial-messages", "--model", a.model, *flags] + (["--resume", session_id] if seg_no else [])
         sid, recs = run_segment(cmd, wt, proc_env, prompts, run_dir / "stream.jsonl", a.turn_timeout)
         session_id = session_id or sid
+        sids.add(sid)
         for prompt, rec in zip(prompts, recs):
             i = len(turns)
             res = rec.get("result") or {}
@@ -402,8 +426,8 @@ def run_one(spec: dict, scen: dict, sfile: dict, a, server: Server, token: str, 
         if len(recs) < len(prompts) or not session_id:
             break
     server.stop()
-    problems = check_events(run_dir / "hooks.jsonl", run_id, segments)
-    hits = sum(1 for l in (server.workdir / "server.log").read_text().splitlines() if "POST /mcp" in l)
+    problems = check_events(run_dir / "hooks.jsonl", run_id, segments, ARMS[spec["arm"]], sids)
+    hits = sum(1 for l in (run_dir / "server.log").read_text().splitlines() if "POST /mcp" in l)
     complete = len(turns) == n_expected
     checked = [t["accepted"] for t in turns if t["accepted"] is not None]
     row = {"run_id": run_id, **spec, "model": a.model, "plugin_rev": git_rev(REPO), "repo_commit": sfile["repo_commit"],
@@ -411,6 +435,7 @@ def run_one(spec: dict, scen: dict, sfile: dict, a, server: Server, token: str, 
            # three separate questions: did the harness measure what it claims, did the
            # CLI/model work, did the answers pass their objective checks
            "harness_valid": not problems and complete, "hook_problems": problems, "local_mcp_requests": hits,
+           "sanitized_project_files": sanitized,
            "cli_ok": complete and all(t["has_result"] and not t["timeout"] and not t["is_error"] and t["exit"] == 0
                                       for t in turns),
            "accepted": (all(checked) if complete and len(checked) == len(scen["accept"]) else False),
@@ -457,6 +482,8 @@ def read_token(a) -> str:
 
 
 def cmd_preflight(a):
+    os.umask(0o077)
+    private_dir(Path(a.workdir))
     token = read_token(a)
     server = Server(Path(a.workdir) / "server", token, a.python)
     server.reset()
@@ -487,6 +514,36 @@ def mcp_call_prod_url() -> str:
     return urls[0]
 
 
+PROJECT_CONFIG = (".claude/settings.json", ".claude/settings.local.json", ".mcp.json")
+
+
+def sanitize_project(wt: Path) -> list[str]:
+    """Remove the target repo's own Claude settings/MCP config from the run copy: with
+    --setting-sources project they could add hooks, env or servers outside isolation."""
+    removed = []
+    for rel in PROJECT_CONFIG:
+        f = wt / rel
+        if f.exists():
+            f.unlink()
+            removed.append(rel)
+    return removed
+
+
+def private_dir(path: Path) -> Path:
+    assert_private_output(path)
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.stat().st_mode & 0o077:
+        sys.exit(f"{path} is accessible to group/others: chmod 700 it first")
+    return path
+
+
+def private_file(path: Path) -> Path:
+    assert_private_output(path)
+    if path.exists() and path.stat().st_mode & 0o077:
+        sys.exit(f"{path} is accessible to group/others: chmod 600 it first")
+    return path
+
+
 def assert_private_output(path: Path):
     """Results hold model output: never inside the repo unless git-ignored."""
     path = path.resolve()
@@ -501,9 +558,9 @@ def cmd_execute(a):
                  "once the user has agreed to this phase, or --claude <fake> for harness tests")
     if not shutil.which(a.claude):
         sys.exit(f"{a.claude}: not found or not executable (note: /tmp is mounted noexec here)")
-    os.umask(0o077)                                   # run dirs, streams, answers: owner only
-    results = Path(a.results)
-    assert_private_output(results)
+    os.umask(0o077)                                   # new run dirs, streams, answers: owner only
+    private_dir(Path(a.workdir))                      # raw streams, answers, server logs live here
+    results = private_file(Path(a.results))
     plan = json.loads(Path(a.plan).read_text())
     sfile = load_scenarios(plan["scenarios"])
     by_id = {s["id"]: s for s in sfile["scenarios"]}
