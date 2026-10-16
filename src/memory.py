@@ -850,17 +850,6 @@ def search(query: str, limit: int = 5, agent_id: str = "", include_checkpoints: 
     return out
 
 
-def get_all(agent_id: str = "") -> list[dict]:
-    m = get_memory()
-    filters = {"user_id": settings.mem0_user_id}
-    if agent_id:
-        filters["agent_id"] = agent_id
-    result = m.get_all(filters=filters, top_k=10000)
-    if isinstance(result, dict) and "results" in result:
-        return result["results"]
-    return result if isinstance(result, list) else []
-
-
 def save_checkpoint(session_id: str, content: str, agent_id: str = "", project: str = "",
                     captured_at: str = "", capture_id: str = "") -> dict:
     """Store the one replaceable checkpoint for a session (hook snapshot).
