@@ -15,6 +15,7 @@ export interface Memory {
   source: string
   review_reason: string
   project: string
+  superseded_by?: string
 }
 
 export interface Stats {
@@ -61,11 +62,13 @@ export const api = {
       body: JSON.stringify({ content }),
     }),
 
-  update: (id: string, content: string): Promise<{ ok: boolean }> =>
+  // Edits supersede: the old text is kept (state superseded) and a new memory id is
+  // returned. `original` is the text the edit started from — a concurrent change is a 409.
+  update: (id: string, content: string, original?: string): Promise<{ ok: boolean; id?: string }> =>
     request(`/api/memories/${id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ memory: content }),
+      body: JSON.stringify({ memory: content, original }),
     }),
 
   updateTags: (id: string, tags: string[]): Promise<{ ok: boolean }> =>
