@@ -5,6 +5,7 @@ import re
 import logging
 import threading
 import time
+import uuid
 from typing import Optional
 import psycopg2
 import psycopg2.extras
@@ -95,6 +96,8 @@ def _ensure_schema() -> None:
                             created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
                         )
                     """)
+                    # attempt = which call currently owns the reservation (changes on takeover)
+                    cur.execute("ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS attempt TEXT")
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS tag_rules (
                             tag     TEXT NOT NULL,
@@ -951,9 +954,11 @@ def _request_hash(old_ids, new_content, as_candidate) -> str:
 IDEMPOTENCY_STALE_SECONDS = 300
 
 
-def _reserve_key(key: str, request_hash: str) -> Optional[dict]:
-    """Reserve an idempotency key. None = reserved for this call; otherwise the
-    result to return (replay, key reused for another request, or still in progress).
+def _reserve_key(key: str, request_hash: str) -> tuple[str, Optional[dict]]:
+    """Reserve an idempotency key. Returns (attempt, None) when this call owns the
+    reservation, or ("", result) to return instead (replay, key reused for another
+    request, or still in progress). Only the owning attempt may finalise or record
+    a result, so a slow original caller cannot act after a takeover.
 
     Crash recovery: a reservation without a result older than
     IDEMPOTENCY_STALE_SECONDS was abandoned. If its replacement was finalised (a row
@@ -965,19 +970,20 @@ def _reserve_key(key: str, request_hash: str) -> Optional[dict]:
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute("INSERT INTO idempotency_keys (key, request_hash) VALUES (%s, %s) "
-                            "ON CONFLICT (key) DO NOTHING RETURNING key", (key, request_hash))
+                attempt = str(uuid.uuid4())
+                cur.execute("INSERT INTO idempotency_keys (key, request_hash, attempt) VALUES (%s, %s, %s) "
+                            "ON CONFLICT (key) DO NOTHING RETURNING key", (key, request_hash, attempt))
                 if cur.fetchone():
-                    return None
+                    return attempt, None
                 cur.execute("SELECT request_hash, result, now() - created_at > make_interval(secs => %s) "
                             "FROM idempotency_keys WHERE key = %s FOR UPDATE", (IDEMPOTENCY_STALE_SECONDS, key))
                 stored_hash, result, abandoned = cur.fetchone()
                 if stored_hash != request_hash:
-                    return {"ok": False, "error": "idempotency key already used for a different request"}
+                    return "", {"ok": False, "error": "idempotency key already used for a different request"}
                 if result is not None:
-                    return {**result, "replayed": True}
+                    return "", {**result, "replayed": True}
                 if not abandoned:
-                    return {"ok": False, "error": "in progress", "retry": True}
+                    return "", {"ok": False, "error": "in progress", "retry": True}
                 cur.execute(f"SELECT id::text, payload->>'state', payload->'supersedes_ids' FROM {_MEM_TABLE} "
                             f"WHERE payload->>'idempotency_key' = %s AND payload->>'state' IN ('active', 'candidate') "
                             f"LIMIT 1", (key,))
@@ -990,17 +996,20 @@ def _reserve_key(key: str, request_hash: str) -> Optional[dict]:
                         recovered["superseded"] = done[2]
                     cur.execute("UPDATE idempotency_keys SET result = %s, memory_id = %s WHERE key = %s",
                                 (json.dumps(recovered), done[0], key))
-                    return {**recovered, "replayed": True}
+                    return "", {**recovered, "replayed": True}
                 cur.execute(f"UPDATE {_MEM_TABLE} SET payload = payload || %s::jsonb "
                             f"WHERE payload->>'idempotency_key' = %s AND payload->>'state' = 'pending'",
                             (json.dumps({"state": "rejected", "review_note": "abandoned supersede"}), key))
-                cur.execute("UPDATE idempotency_keys SET created_at = now() WHERE key = %s", (key,))
-                return None                                  # taken over by this call
+                cur.execute("UPDATE idempotency_keys SET created_at = now(), attempt = %s WHERE key = %s",
+                            (attempt, key))
+                return attempt, None                         # taken over by this call
     finally:
         conn.close()
 
 
-def _finish_key(key: str, result: dict) -> None:
+def _finish_key(key: str, attempt: str, result: dict) -> None:
+    """Record the outcome of a call that did not finalise (conflict, failure). Only the
+    owning attempt may, and never over a result that is already recorded."""
     if not key:
         return
     conn = _db_conn()
@@ -1008,10 +1017,12 @@ def _finish_key(key: str, result: dict) -> None:
         with conn:
             with conn.cursor() as cur:
                 if result.get("error") == "replacement not stored":
-                    cur.execute("DELETE FROM idempotency_keys WHERE key = %s", (key,))   # allow a real retry
+                    cur.execute("DELETE FROM idempotency_keys WHERE key = %s AND attempt = %s AND result IS NULL",
+                                (key, attempt))                        # allow a real retry
                 else:
-                    cur.execute("UPDATE idempotency_keys SET result = %s, memory_id = %s WHERE key = %s",
-                                (json.dumps(result), result.get("id"), key))
+                    cur.execute("UPDATE idempotency_keys SET result = %s, memory_id = %s "
+                                "WHERE key = %s AND attempt = %s AND result IS NULL",
+                                (json.dumps(result), result.get("id"), key, attempt))
     finally:
         conn.close()
 
@@ -1053,21 +1064,22 @@ def supersede(old_ids: list[str], new_content: str, reason: str, actor: str = "a
         return {"ok": False, "error": "old id(s) and new content are required"}
     if not reason.strip():
         return {"ok": False, "error": "reason is required"}
+    attempt = ""
     if idempotency_key:
-        earlier = _reserve_key(idempotency_key, _request_hash(old_ids, new_content, as_candidate))
+        attempt, earlier = _reserve_key(idempotency_key, _request_hash(old_ids, new_content, as_candidate))
         if earlier is not None:
             return earlier
     try:
         result = _supersede(old_ids, new_content, reason, actor, expected_hashes, idempotency_key,
-                            as_candidate, agent_id, source)
+                            attempt, as_candidate, agent_id, source)
     except Exception:
-        _finish_key(idempotency_key, {"error": "replacement not stored"})   # release the key for a retry
+        _finish_key(idempotency_key, attempt, {"error": "replacement not stored"})   # release the key for a retry
         raise
-    _finish_key(idempotency_key, result)
+    _finish_key(idempotency_key, attempt, result)
     return result
 
 
-def _supersede(old_ids, new_content, reason, actor, expected_hashes, idempotency_key,
+def _supersede(old_ids, new_content, reason, actor, expected_hashes, idempotency_key, attempt,
                as_candidate, agent_id, source) -> dict:
     before = {i: get_memory_detail(i) for i in old_ids}
     bad = {i: (d or {}).get("state", "missing") for i, d in before.items() if not d or d["state"] != "active"}
@@ -1088,6 +1100,15 @@ def _supersede(old_ids, new_content, reason, actor, expected_hashes, idempotency
     try:
         with conn:
             with conn.cursor() as cur:
+                if idempotency_key:
+                    # lock order as in _reserve_key: key row first, then memory rows
+                    cur.execute("SELECT attempt FROM idempotency_keys WHERE key = %s FOR UPDATE", (idempotency_key,))
+                    owner = cur.fetchone()
+                    if not owner or owner[0] != attempt:
+                        cur.execute(f"UPDATE {_MEM_TABLE} SET payload = payload || %s::jsonb "
+                                    f"WHERE id::text = %s AND payload->>'state' = 'pending'",
+                                    (json.dumps({"state": "rejected", "review_note": "superseded by a retry"}), new_id))
+                        return {"ok": False, "error": "idempotency key was taken over by a retry", "id": new_id}
                 cur.execute(f"SELECT 1 FROM {_MEM_TABLE} WHERE id::text = %s AND payload->>'state' = 'pending' "
                             f"FOR UPDATE", (new_id,))
                 if not cur.fetchone():
@@ -1114,8 +1135,8 @@ def _supersede(old_ids, new_content, reason, actor, expected_hashes, idempotency
                     out = {"ok": True, "id": new_id, "state": "active", "superseded": old_ids}
                 if idempotency_key:
                     # same transaction as the finalisation: success and the key's result commit together
-                    cur.execute("UPDATE idempotency_keys SET result = %s, memory_id = %s WHERE key = %s",
-                                (json.dumps(out), new_id, idempotency_key))
+                    cur.execute("UPDATE idempotency_keys SET result = %s, memory_id = %s WHERE key = %s AND attempt = %s",
+                                (json.dumps(out), new_id, idempotency_key, attempt))
                 return out
     finally:
         conn.close()

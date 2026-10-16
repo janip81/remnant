@@ -631,7 +631,8 @@ def test_crash_after_reservation_is_recovered(mem, monkeypatch):
     monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
     old = _new_active(mem, "crash before write")
     rh = mem._request_hash([old], "new", False)
-    assert mem._reserve_key("k-crash-1", rh) is None                       # reserved, then the process died
+    attempt, earlier = mem._reserve_key("k-crash-1", rh)                   # reserved, then the process died
+    assert attempt and earlier is None
     assert mem.supersede([old], "new", "fix", idempotency_key="k-crash-1")["error"] == "in progress"
     _age_key("k-crash-1")
     r = mem.supersede([old], "new", "fix", idempotency_key="k-crash-1")    # abandoned -> taken over
@@ -649,3 +650,55 @@ def test_crash_after_finalisation_is_recovered(mem, monkeypatch):
     _age_key("k-crash-2")
     again = mem.supersede([old], "new", "fix", idempotency_key="k-crash-2")
     assert again["ok"] and again["id"] == first["id"] and again["recovered"] and again["replayed"]
+
+
+def _states(key):
+    conn = psycopg2.connect(URL)
+    with conn, conn.cursor() as cur:
+        cur.execute("SELECT payload->>'state', count(*) FROM mem0 WHERE payload->>'idempotency_key' = %s "
+                    "GROUP BY 1", (key,))
+        out = dict(cur.fetchall())
+        cur.execute("SELECT result FROM idempotency_keys WHERE key = %s", (key,))
+        res = cur.fetchone()[0]
+    conn.close()
+    return out, res
+
+
+@pytest.mark.parametrize("as_candidate", [False, True])
+def test_original_paused_before_insert_cannot_finalise_after_takeover(mem, monkeypatch, as_candidate):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    old = _new_active(mem, "paused before insert")
+    key = f"k-fence-a-{as_candidate}"
+    attempt, _ = mem._reserve_key(key, mem._request_hash([old], "new", as_candidate))   # original reserved, then paused
+    _age_key(key)
+    retry = mem.supersede([old], "new", "fix", idempotency_key=key, as_candidate=as_candidate)
+    assert retry["ok"]
+    late = mem._supersede([old], "new", "fix", "agent", None, key, attempt, as_candidate, "", "agent")
+    mem._finish_key(key, attempt, late)                                   # what supersede() does next
+    assert not late["ok"]
+    states, res = _states(key)
+    assert states.get("candidate" if as_candidate else "active") == 1     # exactly one replacement
+    assert res["id"] == retry["id"]                                       # retry's result not overwritten
+
+
+def test_original_paused_after_pending_row_cannot_overwrite_retry(mem, monkeypatch):
+    key = "k-fence-b"
+    real = FakeMem0ForDB()
+    holder = {}
+
+    class PausingMem0(FakeMem0ForDB):
+        def add(self, content, **kw):
+            r = real.add(content, **kw)                                   # original's pending row exists
+            if not holder:
+                holder["paused"] = True
+                _age_key(key)                                             # original stalls past the stale window
+                monkeypatch.setattr(mem, "get_memory", lambda: real)
+                holder["retry"] = mem.supersede([old], "new", "fix", idempotency_key=key)
+            return r
+
+    monkeypatch.setattr(mem, "get_memory", lambda: PausingMem0())
+    old = _new_active(mem, "paused after pending")
+    original = mem.supersede([old], "new", "fix", idempotency_key=key)
+    assert holder["retry"]["ok"] and not original["ok"]
+    states, res = _states(key)
+    assert states.get("active") == 1 and res["id"] == holder["retry"]["id"]
