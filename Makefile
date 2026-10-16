@@ -5,7 +5,7 @@ TAG      ?= latest
 IMAGE_MCP := $(REGISTRY)/$(ORG)/remnant
 IMAGE_UI  := $(REGISTRY)/$(ORG)/remnant-ui
 
-.PHONY: dev build build-mcp build-ui push push-mcp push-ui tag-mcp tag-ui run test lint clean
+.PHONY: dev build build-mcp build-ui push push-mcp push-ui tag-mcp tag-ui run test test-db lint clean
 
 # Start full local stack (postgres + MCP app)
 dev:
@@ -50,12 +50,26 @@ run:
 	cd src && uvicorn main:app --reload --host 0.0.0.0 --port 8080
 
 # Run tests
+# Unit tests. Database tests skip without TEST_DATABASE_URL; use test-db for those.
+# Needs: pip install -r requirements-mcp.txt -r requirements-dev.txt
+PYTHON  ?= python3
+TEST_PG := remnant-test-pg
 test:
-	@echo "TODO: add pytest"
+	$(PYTHON) -m pytest -q tests
+
+# All tests incl. real-PostgreSQL ones, against a throwaway pgvector container
+# (removed with its volume afterwards, also on failure).
+test-db:
+	@docker rm -fv $(TEST_PG) >/dev/null 2>&1 || true
+	docker run -d --name $(TEST_PG) -e POSTGRES_USER=remnant -e POSTGRES_PASSWORD=test \
+	  -e POSTGRES_DB=remnant -p 127.0.0.1:25499:5432 pgvector/pgvector:pg16 >/dev/null
+	@for i in $$(seq 1 60); do docker exec $(TEST_PG) pg_isready -U remnant -q && break; sleep 1; done; sleep 1
+	TEST_DATABASE_URL=postgresql://remnant:test@127.0.0.1:25499/remnant $(PYTHON) -m pytest -q tests; \
+	  status=$$?; docker rm -fv $(TEST_PG) >/dev/null; exit $$status
 
 # Lint
 lint:
-	@which ruff >/dev/null 2>&1 && ruff check src/ || echo "ruff not installed — skipping"
+	@which ruff >/dev/null 2>&1 && ruff check src/ scripts/ plugin/ tests/ || echo "ruff not installed — skipping"
 
 # Clean docker volumes
 clean:
