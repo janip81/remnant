@@ -68,3 +68,12 @@ def test_dedup_metadata_helpers_follow_the_deepest_level():
     assert out["metadata"]["tags"] == ["a", "b"] and out["category"] == "project"
     out = dedup_job._set_tags_in_payload(double, ["c"])
     assert out["metadata"]["metadata"]["tags"] == ["c"]
+
+
+def test_dedup_meta_view_skips_json_null_like_sql():
+    p = {"category": "outer", "tags": ["a"], "metadata": {"category": None, "metadata": {"tags": None}}}
+    view = dedup_job._extract_meta(p)
+    assert view["category"] == "outer" and view["tags"] == ["a"]
+    for junk in ("x", ["x"], None):
+        out = dedup_job._merge_tags_and_mark_reviewed({"data": "d", "tags": ["a"], "metadata": junk}, ["b"])
+        assert out["tags"] == ["a", "b"] and out.get("metadata") == junk

@@ -79,10 +79,10 @@ def run(dry_run: bool = False):
             skipped_empty += 1
             continue
 
-        # Resolve current tags
-        meta = payload.get("metadata") or {}
-        inner = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else meta
-        existing_tags = inner.get("tags") or []
+        # Resolve current tags: each key's deepest non-null value (as the server reads it)
+        meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        inner = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {}
+        existing_tags = next((lvl["tags"] for lvl in (inner, meta, payload) if lvl.get("tags") is not None), None) or []
         if existing_tags:
             skipped_already += 1
             continue
@@ -95,11 +95,9 @@ def run(dry_run: bool = False):
         tagged += 1
 
         if not dry_run:
-            if isinstance(meta.get("metadata"), dict):
-                meta["metadata"]["tags"] = new_tags
-            else:
-                meta["tags"] = new_tags
-            payload["metadata"] = meta
+            # deepest existing level; a flat payload stays flat
+            target = inner if isinstance(meta.get("metadata"), dict) else (meta if isinstance(payload.get("metadata"), dict) else payload)
+            target["tags"] = new_tags
             cur.execute("UPDATE mem0 SET payload = %s WHERE id = %s",
                         (json.dumps(payload), row_id))
 

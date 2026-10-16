@@ -323,13 +323,26 @@ def _project_filter(project: str = "", include_unscoped: bool = True) -> tuple[s
 CHECKPOINT_TTL_DAYS = int(os.environ.get("CHECKPOINT_TTL_DAYS", "7"))
 # Metadata (category, tags, ...) appears at three depths: top level (mem0 2.0.2's
 # own writes), payload.metadata and payload.metadata.metadata (older rows / other
-# write paths). Readers take each key from the deepest level that has it; writers
+# write paths). Readers take each key's deepest non-null value (JSON null counts as
+# absent, in SQL and in meta_view alike); writers
 # (_meta_target) write into the deepest level that exists. Picking one whole
 # object instead hid top-level categories once a payload.metadata object existed.
 def _meta_key(key: str, as_text: bool = True) -> str:
-    op = "->>" if as_text else "->"
-    return (f"coalesce(payload->'metadata'->'metadata'{op}'{key}', "
-            f"payload->'metadata'{op}'{key}', payload{op}'{key}')")
+    if as_text:                               # ->> already turns JSON null into SQL NULL
+        return (f"coalesce(payload->'metadata'->'metadata'->>'{key}', "
+                f"payload->'metadata'->>'{key}', payload->>'{key}')")
+    levels = (f"payload->'metadata'->'metadata'->'{key}'", f"payload->'metadata'->'{key}'", f"payload->'{key}'")
+    return "coalesce(" + ", ".join(f"nullif({x}, 'null'::jsonb)" for x in levels) + ")"
+
+
+def meta_view(payload: dict) -> dict:
+    """Python twin of the SQL readers: each key's deepest non-null value."""
+    meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    inner = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {}
+    view: dict = {}
+    for level in (payload, meta, inner):
+        view.update({k: v for k, v in level.items() if v is not None})
+    return view
 
 
 _META_CATEGORY = _meta_key("category")
@@ -960,9 +973,9 @@ def get_memory_detail(memory_id: str) -> Optional[dict]:
     p = row["payload"]
     keys = ("state", "superseded_by", "supersedes_ids", "supersede_reason", "superseded_at", "source",
             "project", "agent_id", "created_at", "kind", "review_reason", "reviewed_by")
-    nested = p.get("metadata") if isinstance(p.get("metadata"), dict) else {}
-    category = nested.get("category") or p.get("category") or ""
-    tags = nested.get("tags") if isinstance(nested.get("tags"), list) else p.get("tags")
+    view = meta_view(p)
+    category = view.get("category") or ""
+    tags = view.get("tags")
     return {"id": str(row["id"]), "memory": p.get("data", ""), "hash": content_hash(p.get("data", "")),
             **{k: p.get(k) for k in keys if p.get(k) is not None}, "state": p.get("state") or "active",
             "category": category, "tags": tags if isinstance(tags, list) else []}

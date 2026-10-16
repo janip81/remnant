@@ -770,6 +770,11 @@ SHAPES = {
     "double": {"metadata": {"metadata": {"category": "project", "tags": ["a"]}}},
     # seen on 133 prod rows: top-level category, plus a metadata object without one
     "mixed": {"category": "project", "metadata": {"tags": ["a"]}},
+    # explicit JSON null deeper down counts as absent, in SQL and Python alike
+    "nulls": {"category": "project", "tags": ["a"], "metadata": {"category": None, "tags": None,
+                                                                "metadata": {"tags": None}}},
+    "junk-meta": {"category": "project", "tags": ["a"], "metadata": "not an object"},
+    "list-meta": {"category": "project", "tags": ["a"], "metadata": ["x"]},
 }
 
 
@@ -787,6 +792,8 @@ def test_readers_take_each_metadata_key_from_the_deepest_level(mem):
     rows = {r["id"]: r for r in mem.list_rows()}
     for name, mid in ids.items():
         assert rows[mid]["metadata"] == {"category": "project", "tags": ["a"]}, name
+        detail = mem.get_memory_detail(mid)                                  # detail == list == search
+        assert (detail["category"], detail["tags"]) == ("project", ["a"]), name
     for hit in mem.keyword_search("q-77", 10):
         assert hit["metadata"]["category"] == "project" and hit["metadata"]["tags"] == ["a"]
 
@@ -801,6 +808,7 @@ def test_tag_update_keeps_the_payload_shape_and_category(mem):
         payloads = dict(cur.fetchall())
     conn.close()
     assert "metadata" not in payloads[ids["flat"]]                      # flat stays flat
+    assert payloads[ids["junk-meta"]]["metadata"] == "not an object" and payloads[ids["junk-meta"]]["tags"] == ["b"]
     assert payloads[ids["double"]]["metadata"]["metadata"]["tags"] == ["b"]
     rows = {r["id"]: r for r in mem.list_rows()}
     for name, mid in ids.items():

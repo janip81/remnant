@@ -191,11 +191,14 @@ def delete_rows(cur: psycopg2.extensions.cursor, row_ids: list[uuid.UUID]) -> No
 # ---------------------------------------------------------------------------
 
 def _extract_meta(payload: dict) -> dict:
-    """Metadata view: each key from the deepest level that has it (top level,
-    payload.metadata, payload.metadata.metadata), as src/memory.py's readers do."""
+    """Metadata view: each key's deepest non-null value (top level, payload.metadata,
+    payload.metadata.metadata), as src/memory.py's readers (meta_view) do."""
     meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
     inner = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {}
-    return {**payload, **meta, **inner}
+    view: dict = {}
+    for level in (payload, meta, inner):
+        view.update({k: v for k, v in level.items() if v is not None})
+    return view
 
 
 def _meta_target(payload: dict) -> dict:
