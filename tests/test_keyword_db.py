@@ -33,6 +33,11 @@ def mem(monkeypatch):
     monkeypatch.setattr(memory.settings, "database_url", URL)
     monkeypatch.setattr(memory.settings, "mem0_user_id", "u")
     monkeypatch.setattr(memory, "_FTS_DOC", memory._FTS_EXPR)
+    conn = psycopg2.connect(URL)
+    with conn, conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS idempotency_keys")
+    conn.close()
+    memory._ensure_schema()                       # creates idempotency_keys (and tag_rules, job_runs)
     return memory
 
 
@@ -480,7 +485,7 @@ def test_supersede_idempotent_retry(mem, monkeypatch):
     old = _new_active(mem, "retry me")
     a = mem.supersede([old], "new", "fix", idempotency_key="k-1")
     b = mem.supersede([old], "new", "fix", idempotency_key="k-1")
-    assert a["ok"] and b == {"ok": True, "id": a["id"], "state": "active", "replayed": True}
+    assert a["ok"] and b["replayed"] and b["id"] == a["id"] and b["state"] == "active"
 
 
 def test_concurrent_supersede_only_one_wins(mem, monkeypatch):
@@ -530,5 +535,85 @@ def test_orphaned_pending_rows_are_expired(mem):
     try:
         _job_runs(conn)
         assert dedup_job.phase_expire_checkpoints(conn, dry_run=False) == 1
+    finally:
+        conn.rollback(); conn.close()
+
+
+
+def test_idempotency_key_atomic_and_bound_to_request(mem, monkeypatch):
+    import threading
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    a, b = _new_active(mem, "dup one"), _new_active(mem, "dup two")
+    out = []
+    ts = [threading.Thread(target=lambda: out.append(mem.supersede([a, b], "merged", "merge", idempotency_key="merge:x",
+                                                                   as_candidate=True))) for _ in range(4)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    conn = psycopg2.connect(URL)
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM mem0 WHERE payload->>'idempotency_key' = 'merge:x'")
+        assert cur.fetchone()[0] == 1                      # concurrent identical proposals -> one row
+    conn.close()
+    assert sum(1 for r in out if r.get("ok")) >= 1 and all(r.get("ok") or r.get("retry") for r in out)
+    replay = mem.supersede([a, b], "merged", "merge", idempotency_key="merge:x", as_candidate=True)
+    assert replay["replayed"] and replay["state"] == "candidate"
+    reuse = mem.supersede([a, b], "different text", "merge", idempotency_key="merge:x", as_candidate=True)
+    assert reuse["ok"] is False and "different request" in reuse["error"]
+
+
+def test_edit_keeps_tags_and_project(mem, monkeypatch):
+    import uuid
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    old = str(uuid.uuid4())
+    _insert_with_id(old, {"data": "tagged", "tags": ["cnpg", "prod-k8s"], "project": "remnant", "category": "project"})
+    r = mem.update(old, "tagged v2", original="tagged")
+    n = _row(r["id"])
+    assert n["tags"] == ["cnpg", "prod-k8s"] and n["project"] == "remnant" and n["category"] == "project"
+
+
+def test_promotion_refused_when_an_original_changed(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    a, b = _new_active(mem, "orig a"), _new_active(mem, "orig b")
+    p = mem.supersede([a, b], "merged a+b", "merge", as_candidate=True)
+    fix = mem.supersede([a], "corrected a", "user correction")
+    r = mem.review(p["id"], "promote")
+    assert r["ok"] is False and r["originals"] == {a: "superseded"}
+    assert _row(a)["superseded_by"] == fix["id"] and _row(p["id"])["state"] == "candidate"
+
+
+def test_vanished_replacement_is_not_finalised(mem, monkeypatch):
+    class Vanishing(FakeMem0ForDB):
+        def add(self, *a, **k):
+            r = super().add(*a, **k)
+            conn = psycopg2.connect(URL)
+            with conn, conn.cursor() as cur:
+                cur.execute("DELETE FROM mem0 WHERE id = %s", (r["results"][0]["id"],))
+            conn.close()
+            return r
+    monkeypatch.setattr(mem, "get_memory", lambda: Vanishing())
+    old = _new_active(mem, "keep me")
+    r = mem.supersede([old], "lost", "x")
+    assert r["ok"] is False and "vanished" in r["error"] and _row(old).get("state") is None
+
+
+def test_hash_dedup_preserves_concurrent_supersede_link(mem, monkeypatch):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import dedup_job, uuid
+    import psycopg2.extras
+    keep, drop = str(uuid.uuid4()), str(uuid.uuid4())
+    _insert_with_id(keep, {"data": "dupe", "hash": "hz", "created_at": "2026-01-01"})
+    _insert_with_id(drop, {"data": "dupe", "hash": "hz", "created_at": "2026-01-02",
+                           "state": "active"})
+    conn = psycopg2.connect(URL)
+    psycopg2.extras.register_uuid(conn_or_curs=conn)
+    try:
+        _job_runs(conn)
+        # a correction supersedes the keeper after the cluster query would have seen it
+        c2 = psycopg2.connect(URL)
+        with c2, c2.cursor() as cur:
+            cur.execute("UPDATE mem0 SET payload = payload || '{\"state\":\"superseded\",\"superseded_by\":\"elsewhere\"}' WHERE id = %s", (keep,))
+        c2.close()
+        # keeper is no longer active -> cluster skipped, the duplicate keeps its state
+        dedup_job.phase1_hash_dedup(conn, dry_run=False)
+        assert _row(keep)["superseded_by"] == "elsewhere" and _row(drop).get("state") == "active"
     finally:
         conn.rollback(); conn.close()

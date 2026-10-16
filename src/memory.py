@@ -84,6 +84,17 @@ def _ensure_schema() -> None:
         try:
             with conn:
                 with conn.cursor() as cur:
+                    # supersede/propose_merge idempotency: the key is reserved atomically and
+                    # bound to a hash of the request, so a retry replays and a reuse fails
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS idempotency_keys (
+                            key          TEXT PRIMARY KEY,
+                            request_hash TEXT NOT NULL,
+                            memory_id    TEXT,
+                            result       JSONB,
+                            created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+                        )
+                    """)
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS tag_rules (
                             tag     TEXT NOT NULL,
@@ -915,9 +926,10 @@ def get_memory_detail(memory_id: str) -> Optional[dict]:
             "project", "agent_id", "created_at", "kind", "review_reason", "reviewed_by")
     nested = p.get("metadata") if isinstance(p.get("metadata"), dict) else {}
     category = nested.get("category") or p.get("category") or ""
+    tags = nested.get("tags") if isinstance(nested.get("tags"), list) else p.get("tags")
     return {"id": str(row["id"]), "memory": p.get("data", ""), "hash": content_hash(p.get("data", "")),
             **{k: p.get(k) for k in keys if p.get(k) is not None}, "state": p.get("state") or "active",
-            "category": category}
+            "category": category, "tags": tags if isinstance(tags, list) else []}
 
 
 def _now() -> str:
@@ -931,18 +943,78 @@ def _retire(cur, old_ids: list[str], new_id: str, reason: str, actor: str) -> No
                              "supersede_reason": reason[:500], "superseded_by_actor": actor[:64]}), old_ids))
 
 
+def _request_hash(old_ids, new_content, as_candidate) -> str:
+    import hashlib
+    return hashlib.md5(json.dumps([sorted(old_ids), new_content, bool(as_candidate)]).encode()).hexdigest()
+
+
+def _reserve_key(key: str, request_hash: str) -> Optional[dict]:
+    """Reserve an idempotency key. None = reserved for this call; otherwise the
+    result to return (replay, key reused for another request, or still in progress)."""
+    conn = _db_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO idempotency_keys (key, request_hash) VALUES (%s, %s) "
+                            "ON CONFLICT (key) DO NOTHING RETURNING key", (key, request_hash))
+                if cur.fetchone():
+                    return None
+                cur.execute("SELECT request_hash, result FROM idempotency_keys WHERE key = %s", (key,))
+                stored_hash, result = cur.fetchone()
+    finally:
+        conn.close()
+    if stored_hash != request_hash:
+        return {"ok": False, "error": "idempotency key already used for a different request"}
+    if result is None:
+        return {"ok": False, "error": "in progress", "retry": True}
+    return {**result, "replayed": True}
+
+
+def _finish_key(key: str, result: dict) -> None:
+    if not key:
+        return
+    conn = _db_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                if result.get("error") == "replacement not stored":
+                    cur.execute("DELETE FROM idempotency_keys WHERE key = %s", (key,))   # allow a real retry
+                else:
+                    cur.execute("UPDATE idempotency_keys SET result = %s, memory_id = %s WHERE key = %s",
+                                (json.dumps(result), result.get("id"), key))
+    finally:
+        conn.close()
+
+
+def _inherited_metadata(details: list[dict]) -> dict:
+    """What a replacement keeps from the memories it replaces: category and project when
+    they agree, tags as a union (an edit keeps the original's tags)."""
+    meta: dict = {}
+    cats = {d.get("category") for d in details if d.get("category")}
+    if len(cats) == 1:
+        meta["category"] = cats.pop()
+    projects = {d.get("project") for d in details if d.get("project")}
+    if len(projects) == 1:
+        meta["project"] = projects.pop()
+    tags = sorted({t for d in details for t in (d.get("tags") or []) if isinstance(t, str)})
+    if tags:
+        meta["tags"] = tags
+    return meta
+
+
 def supersede(old_ids: list[str], new_content: str, reason: str, actor: str = "agent",
               expected_hashes: Optional[dict] = None, idempotency_key: str = "",
               as_candidate: bool = False, agent_id: str = "", source: str = "agent") -> dict:
     """Replace active memories by a new one, keeping the old rows (state=superseded,
     superseded_by=<new>) instead of overwriting them.
 
-    1. idempotency_key: a retry returns the result of the first call
+    1. idempotency_key is reserved atomically and bound to the request: a retry
+       replays the first result, reusing the key for another request fails
     2. the new row is written as 'pending' (never searchable)
-    3. one transaction locks the old rows, re-checks they are still active and,
-       when given, that their text still matches expected_hashes[id]; then marks
-       them superseded and the new row active. On any mismatch the pending row
-       is rejected and a conflict with the current state is returned.
+    3. one transaction locks the old rows AND the pending row, re-checks that the
+       old ones are still active and, when given, unchanged (expected_hashes), then
+       marks them superseded and the new row active. Any mismatch — including the
+       pending row having vanished — rejects the replacement and returns a conflict.
     as_candidate=True (LLM merge proposals): the new row becomes a candidate with
     supersedes_ids and the originals stay active until review() promotes it.
     """
@@ -952,29 +1024,30 @@ def supersede(old_ids: list[str], new_content: str, reason: str, actor: str = "a
     if not reason.strip():
         return {"ok": False, "error": "reason is required"}
     if idempotency_key:
-        conn = _db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(f"SELECT id, coalesce(payload->>'state', 'active') FROM {_MEM_TABLE} "
-                            f"WHERE payload->>'idempotency_key' = %s AND payload->>'user_id' = %s LIMIT 1",
-                            (idempotency_key, settings.mem0_user_id))
-                row = cur.fetchone()
-        finally:
-            conn.close()
-        if row:
-            return {"ok": row[1] in ("active", "candidate"), "id": str(row[0]), "state": row[1], "replayed": True}
+        earlier = _reserve_key(idempotency_key, _request_hash(old_ids, new_content, as_candidate))
+        if earlier is not None:
+            return earlier
+    try:
+        result = _supersede(old_ids, new_content, reason, actor, expected_hashes, idempotency_key,
+                            as_candidate, agent_id, source)
+    except Exception:
+        _finish_key(idempotency_key, {"error": "replacement not stored"})   # release the key for a retry
+        raise
+    _finish_key(idempotency_key, result)
+    return result
+
+
+def _supersede(old_ids, new_content, reason, actor, expected_hashes, idempotency_key,
+               as_candidate, agent_id, source) -> dict:
     before = {i: get_memory_detail(i) for i in old_ids}
     bad = {i: (d or {}).get("state", "missing") for i, d in before.items() if not d or d["state"] != "active"}
     if bad:
         return {"ok": False, "error": "conflict", "states": bad,
                 "superseded_by": {i: before[i].get("superseded_by") for i in bad if before.get(i)}}
-    category = next((before[i].get("category") for i in old_ids if before[i].get("category")), "")
-    metadata = {"state": "pending", "supersedes_ids": old_ids, "supersede_reason": reason[:500],
-                "source": source if source in VALID_SOURCES else "agent"}
+    metadata = {**_inherited_metadata(list(before.values())), "state": "pending", "supersedes_ids": old_ids,
+                "supersede_reason": reason[:500], "source": source if source in VALID_SOURCES else "agent"}
     if idempotency_key:
         metadata["idempotency_key"] = idempotency_key
-    if category:
-        metadata["category"] = category
     result = get_memory().add(redact(new_content), user_id=settings.mem0_user_id, agent_id=_agent_id(agent_id),
                               infer=False, metadata=metadata)
     new_id = next((str(r.get("id")) for r in (result.get("results", []) if isinstance(result, dict) else result or [])
@@ -985,6 +1058,10 @@ def supersede(old_ids: list[str], new_content: str, reason: str, actor: str = "a
     try:
         with conn:
             with conn.cursor() as cur:
+                cur.execute(f"SELECT 1 FROM {_MEM_TABLE} WHERE id::text = %s AND payload->>'state' = 'pending' "
+                            f"FOR UPDATE", (new_id,))
+                if not cur.fetchone():
+                    return {"ok": False, "error": "replacement vanished before it was finalised"}
                 cur.execute(f"SELECT id::text, coalesce(payload->>'state', 'active'), md5(coalesce(payload->>'data', '')) "
                             f"FROM {_MEM_TABLE} WHERE id::text = ANY(%s) FOR UPDATE", (old_ids,))
                 now = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
@@ -993,14 +1070,16 @@ def supersede(old_ids: list[str], new_content: str, reason: str, actor: str = "a
                 if stale or changed:
                     cur.execute(f"UPDATE {_MEM_TABLE} SET payload = payload || %s::jsonb WHERE id::text = %s",
                                 (json.dumps({"state": "rejected", "review_note": "supersede conflict"}), new_id))
-                    return {"ok": False, "error": "conflict", "states": stale, "changed": changed}
+                    return {"ok": False, "error": "conflict", "states": stale, "changed": changed, "id": new_id}
+                final = ({"state": "candidate", "review_reason": "merge-proposal"} if as_candidate
+                         else {"state": "active"})
+                cur.execute(f"UPDATE {_MEM_TABLE} SET payload = payload || %s::jsonb "
+                            f"WHERE id::text = %s AND payload->>'state' = 'pending'", (json.dumps(final), new_id))
+                if cur.rowcount != 1:
+                    raise RuntimeError("replacement could not be finalised")   # rolls back the transaction
                 if as_candidate:
-                    cur.execute(f"UPDATE {_MEM_TABLE} SET payload = payload || %s::jsonb WHERE id::text = %s",
-                                (json.dumps({"state": "candidate", "review_reason": "merge-proposal"}), new_id))
                     return {"ok": True, "id": new_id, "state": "candidate", "supersedes_ids": old_ids}
                 _retire(cur, old_ids, new_id, reason, actor)
-                cur.execute(f"UPDATE {_MEM_TABLE} SET payload = payload || %s::jsonb WHERE id::text = %s",
-                            (json.dumps({"state": "active"}), new_id))
                 return {"ok": True, "id": new_id, "state": "active", "superseded": old_ids}
     finally:
         conn.close()
@@ -1010,42 +1089,45 @@ def review(memory_id: str, action: str, reviewer: str = "user", note: str = "") 
     """Promote a candidate to active or reject it, with an audit trail.
 
     Only candidates can be reviewed; anything else returns a conflict with the
-    current state. The transition is a single conditional UPDATE, so two
-    concurrent reviews cannot both apply.
+    current state. Everything happens in one transaction with the candidate row
+    locked. Promoting a merge proposal also locks its originals: if any of them
+    is no longer active (corrected or replaced meanwhile), the promotion is
+    refused with a conflict so the stale merge does not come back; otherwise the
+    originals are superseded atomically.
     """
     target = {"promote": "active", "reject": "rejected"}.get(action)
     if not target:
         return {"ok": False, "error": "action must be promote or reject"}
-    import datetime as _dt
-    audit = {"state": target, "reviewed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-             "reviewed_by": reviewer[:64], "review_note": note[:500]}
+    audit = {"state": target, "reviewed_at": _now(), "reviewed_by": reviewer[:64], "review_note": note[:500]}
     conn = _db_conn()
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute(f"UPDATE {_MEM_TABLE} SET payload = payload || %s::jsonb "
-                            f"WHERE id::text = %s AND payload->>'state' = 'candidate' "
-                            f"RETURNING payload->'supersedes_ids'",
+                cur.execute(f"SELECT coalesce(payload->>'state', 'active'), payload->'supersedes_ids' "
+                            f"FROM {_MEM_TABLE} WHERE id::text = %s FOR UPDATE", (memory_id,))
+                row = cur.fetchone()
+                if not row:
+                    return {"ok": False, "error": "not found"}
+                state, supersedes = row
+                if state != "candidate":
+                    return {"ok": False, "error": "conflict", "state": state}
+                originals = [str(i) for i in (supersedes or [])]
+                if target == "active" and originals:
+                    cur.execute(f"SELECT id::text, coalesce(payload->>'state', 'active') FROM {_MEM_TABLE} "
+                                f"WHERE id::text = ANY(%s) FOR UPDATE", (originals,))
+                    states = dict(cur.fetchall())
+                    gone = {i: states.get(i, "missing") for i in originals if states.get(i) != "active"}
+                    if gone:
+                        return {"ok": False, "error": "conflict", "state": "candidate", "originals": gone}
+                cur.execute(f"UPDATE {_MEM_TABLE} SET payload = payload || %s::jsonb WHERE id::text = %s",
                             (json.dumps(audit), memory_id))
-                row = cur.fetchone()
-                if row:
-                    out = {"ok": True, "id": memory_id, "state": target}
-                    if target == "active" and row[0]:
-                        # a promoted merge proposal replaces the originals that are still active
-                        cur.execute(f"SELECT id::text FROM {_MEM_TABLE} WHERE id::text = ANY(%s) "
-                                    f"AND coalesce(payload->>'state', 'active') = 'active' FOR UPDATE", (list(row[0]),))
-                        still = [r[0] for r in cur.fetchall()]
-                        _retire(cur, still, memory_id, "merge proposal promoted in review", reviewer)
-                        out["superseded"] = still
-                    return out
-                cur.execute(f"SELECT coalesce(payload->>'state', 'active') FROM {_MEM_TABLE} WHERE id::text = %s",
-                            (memory_id,))
-                row = cur.fetchone()
+                out = {"ok": True, "id": memory_id, "state": target}
+                if target == "active" and originals:
+                    _retire(cur, originals, memory_id, "merge proposal promoted in review", reviewer)
+                    out["superseded"] = sorted(originals)
+                return out
     finally:
         conn.close()
-    if not row:
-        return {"ok": False, "error": "not found"}
-    return {"ok": False, "error": "conflict", "state": row[0]}
 
 
 def update(memory_id: str, content: str, original: Optional[str] = None, actor: str = "ui") -> dict:

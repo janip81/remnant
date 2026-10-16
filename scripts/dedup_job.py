@@ -376,14 +376,25 @@ def phase1_hash_dedup(conn, dry_run: bool) -> int:
                 drop_ids = [uuid.UUID(str(i)) for i in row["ids"][1:]]
                 log.info("Hash dedup: keeping %s, dropping %d", keep_id, len(drop_ids))
                 if not dry_run:
-                    # exact duplicates: no LLM involved, so supersede them directly (kept, hidden)
+                    # exact duplicates: no LLM involved, so supersede them directly (kept, hidden).
+                    # Lock the whole cluster and re-check: a concurrent supersede may have
+                    # retired the keeper or a duplicate since the cluster was read.
+                    cur.execute(f"SELECT id, coalesce(payload->>'state', 'active') FROM {MEM_TABLE} "
+                                f"WHERE id = ANY(%s) FOR UPDATE", ([keep_id] + drop_ids,))
+                    states = {str(r[0]): r[1] for r in cur.fetchall()}
+                    if states.get(str(keep_id)) != "active":
+                        log.info("Hash dedup: keeper %s no longer active; cluster skipped", keep_id)
+                        conn.commit()
+                        continue
+                    still = [i for i in drop_ids if states.get(str(i)) == "active"]
                     cur.execute(
                         f"UPDATE {MEM_TABLE} SET payload = payload || %s::jsonb WHERE id = ANY(%s)",
                         (json.dumps({"state": "superseded", "superseded_by": str(keep_id),
                                      "supersede_reason": "exact duplicate (hash)",
                                      "superseded_by_actor": "dedup",
                                      "superseded_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())}),
-                         drop_ids))
+                         still))
+                    conn.commit()
                 removed += len(drop_ids)
 
             if not dry_run:
