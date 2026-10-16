@@ -617,3 +617,35 @@ def test_hash_dedup_preserves_concurrent_supersede_link(mem, monkeypatch):
         assert _row(keep)["superseded_by"] == "elsewhere" and _row(drop).get("state") == "active"
     finally:
         conn.rollback(); conn.close()
+
+
+def _age_key(key, seconds=600):
+    conn = psycopg2.connect(URL)
+    with conn, conn.cursor() as cur:
+        cur.execute("UPDATE idempotency_keys SET created_at = now() - make_interval(secs => %s) WHERE key = %s",
+                    (seconds, key))
+    conn.close()
+
+
+def test_crash_after_reservation_is_recovered(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    old = _new_active(mem, "crash before write")
+    rh = mem._request_hash([old], "new", False)
+    assert mem._reserve_key("k-crash-1", rh) is None                       # reserved, then the process died
+    assert mem.supersede([old], "new", "fix", idempotency_key="k-crash-1")["error"] == "in progress"
+    _age_key("k-crash-1")
+    r = mem.supersede([old], "new", "fix", idempotency_key="k-crash-1")    # abandoned -> taken over
+    assert r["ok"] and r["state"] == "active"
+
+
+def test_crash_after_finalisation_is_recovered(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    old = _new_active(mem, "crash after write")
+    first = mem.supersede([old], "new", "fix", idempotency_key="k-crash-2")
+    conn = psycopg2.connect(URL)                                          # simulate: result never recorded
+    with conn, conn.cursor() as cur:
+        cur.execute("UPDATE idempotency_keys SET result = NULL WHERE key = 'k-crash-2'")
+    conn.close()
+    _age_key("k-crash-2")
+    again = mem.supersede([old], "new", "fix", idempotency_key="k-crash-2")
+    assert again["ok"] and again["id"] == first["id"] and again["recovered"] and again["replayed"]

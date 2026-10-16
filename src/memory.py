@@ -948,9 +948,19 @@ def _request_hash(old_ids, new_content, as_candidate) -> str:
     return hashlib.md5(json.dumps([sorted(old_ids), new_content, bool(as_candidate)]).encode()).hexdigest()
 
 
+IDEMPOTENCY_STALE_SECONDS = 300
+
+
 def _reserve_key(key: str, request_hash: str) -> Optional[dict]:
     """Reserve an idempotency key. None = reserved for this call; otherwise the
-    result to return (replay, key reused for another request, or still in progress)."""
+    result to return (replay, key reused for another request, or still in progress).
+
+    Crash recovery: a reservation without a result older than
+    IDEMPOTENCY_STALE_SECONDS was abandoned. If its replacement was finalised (a row
+    with this key is active/candidate), that result is reconstructed and replayed;
+    otherwise this call takes the reservation over and the leftover pending row is
+    rejected.
+    """
     conn = _db_conn()
     try:
         with conn:
@@ -959,15 +969,35 @@ def _reserve_key(key: str, request_hash: str) -> Optional[dict]:
                             "ON CONFLICT (key) DO NOTHING RETURNING key", (key, request_hash))
                 if cur.fetchone():
                     return None
-                cur.execute("SELECT request_hash, result FROM idempotency_keys WHERE key = %s", (key,))
-                stored_hash, result = cur.fetchone()
+                cur.execute("SELECT request_hash, result, now() - created_at > make_interval(secs => %s) "
+                            "FROM idempotency_keys WHERE key = %s FOR UPDATE", (IDEMPOTENCY_STALE_SECONDS, key))
+                stored_hash, result, abandoned = cur.fetchone()
+                if stored_hash != request_hash:
+                    return {"ok": False, "error": "idempotency key already used for a different request"}
+                if result is not None:
+                    return {**result, "replayed": True}
+                if not abandoned:
+                    return {"ok": False, "error": "in progress", "retry": True}
+                cur.execute(f"SELECT id::text, payload->>'state', payload->'supersedes_ids' FROM {_MEM_TABLE} "
+                            f"WHERE payload->>'idempotency_key' = %s AND payload->>'state' IN ('active', 'candidate') "
+                            f"LIMIT 1", (key,))
+                done = cur.fetchone()
+                if done:
+                    recovered = {"ok": True, "id": done[0], "state": done[1], "recovered": True}
+                    if done[1] == "candidate":
+                        recovered["supersedes_ids"] = done[2]
+                    else:
+                        recovered["superseded"] = done[2]
+                    cur.execute("UPDATE idempotency_keys SET result = %s, memory_id = %s WHERE key = %s",
+                                (json.dumps(recovered), done[0], key))
+                    return {**recovered, "replayed": True}
+                cur.execute(f"UPDATE {_MEM_TABLE} SET payload = payload || %s::jsonb "
+                            f"WHERE payload->>'idempotency_key' = %s AND payload->>'state' = 'pending'",
+                            (json.dumps({"state": "rejected", "review_note": "abandoned supersede"}), key))
+                cur.execute("UPDATE idempotency_keys SET created_at = now() WHERE key = %s", (key,))
+                return None                                  # taken over by this call
     finally:
         conn.close()
-    if stored_hash != request_hash:
-        return {"ok": False, "error": "idempotency key already used for a different request"}
-    if result is None:
-        return {"ok": False, "error": "in progress", "retry": True}
-    return {**result, "replayed": True}
 
 
 def _finish_key(key: str, result: dict) -> None:
@@ -1078,9 +1108,15 @@ def _supersede(old_ids, new_content, reason, actor, expected_hashes, idempotency
                 if cur.rowcount != 1:
                     raise RuntimeError("replacement could not be finalised")   # rolls back the transaction
                 if as_candidate:
-                    return {"ok": True, "id": new_id, "state": "candidate", "supersedes_ids": old_ids}
-                _retire(cur, old_ids, new_id, reason, actor)
-                return {"ok": True, "id": new_id, "state": "active", "superseded": old_ids}
+                    out = {"ok": True, "id": new_id, "state": "candidate", "supersedes_ids": old_ids}
+                else:
+                    _retire(cur, old_ids, new_id, reason, actor)
+                    out = {"ok": True, "id": new_id, "state": "active", "superseded": old_ids}
+                if idempotency_key:
+                    # same transaction as the finalisation: success and the key's result commit together
+                    cur.execute("UPDATE idempotency_keys SET result = %s, memory_id = %s WHERE key = %s",
+                                (json.dumps(out), new_id, idempotency_key))
+                return out
     finally:
         conn.close()
 
