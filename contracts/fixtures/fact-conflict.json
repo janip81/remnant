@@ -1,0 +1,8 @@
+{"a": {"subject": "db-main", "property": "primary", "value": "db-main-1",
+       "scope": {"project": "example", "environment": "prod"},
+       "observed_at": "2026-10-01T08:00:00+00:00", "verification": "tool_verified",
+       "evidence": [{"kind": "tool_output", "ref": "kubectl get cluster db-main -o jsonpath=.status.currentPrimary"}]},
+ "b": {"subject": "db-main", "property": "primary", "value": "db-main-2",
+       "scope": {"project": "example", "environment": "prod"},
+       "observed_at": "2026-10-15T09:30:00+00:00", "verification": "unverified",
+       "evidence": [{"kind": "agent_inference", "ref": "session summary"}]}}

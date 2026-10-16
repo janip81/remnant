@@ -1,0 +1,7 @@
+{"id": "eval-continuation-1", "directions": ["claude->codex", "codex->claude"],
+ "evidence": "handoff-example.json",
+ "freeform": "Was working on export retries. Credentials looked fine eventually. Next do backoff and run tests. Don't break the format.",
+ "hidden_checks": [
+   {"id": "no-retry-refuted", "check": "does not investigate credential expiry again"},
+   {"id": "next-step", "check": "first code change adds bounded backoff around upload()"},
+   {"id": "constraint", "check": "export file format unchanged (tests/test_export.py::test_format passes)"}]}
