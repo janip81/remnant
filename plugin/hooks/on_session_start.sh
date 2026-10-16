@@ -7,6 +7,9 @@
 #
 # Input:  JSON on stdin with session_id, source, transcript_path, model, cwd
 # Output: Text injected into Claude's context (exit 0)
+#
+# REMNANT_INJECT_POLICY=off|selective drops the broad resume/compact search (the
+# session's own checkpoint is still restored); unset or broad keeps it. See bench_log.py.
 
 set -uo pipefail
 
@@ -20,6 +23,32 @@ PROJECT=$(basename "$CWD")
 
 MEMORY_URL="${REMNANT_URL:-}"
 MEMORY_TOKEN="${REMNANT_TOKEN:-}"
+POLICY="${REMNANT_INJECT_POLICY:-}"
+T0=$(date +%s%N)
+LOOKUP_MS=""
+CHECKPOINT=""
+RESULTS=""
+
+# Benchmark event (no-op unless REMNANT_BENCH_LOG is set)
+bench_event() {
+  [ -n "${REMNANT_BENCH_LOG:-}" ] || return 0
+  python3 "$SCRIPT_DIR/bench_log.py" SessionStart source="$SOURCE" session_id="$SESSION_ID" "$@" \
+    elapsed_ms=$(( ($(date +%s%N) - T0) / 1000000 )) ${LOOKUP_MS:+lookup_ms=$LOOKUP_MS} 2>/dev/null || true
+}
+
+# Broad similarity search on resume/compact, unless the policy turns it off. Sets
+# RESULTS, LOOKUP_MS and SECTION in this shell (not via $(...), which would lose them).
+broad_search() {
+  SECTION=""
+  case "$POLICY" in off|selective) return ;; esac
+  local t1; t1=$(date +%s%N)
+  RESULTS=$(search_direct "$1" "$2")
+  LOOKUP_MS=$(( ($(date +%s%N) - t1) / 1000000 ))
+  SECTION="$3
+
+${RESULTS:-$4}
+"
+}
 
 # Helper: search mem0 via HTTP directly and return result text
 search_direct() {
@@ -75,7 +104,8 @@ EOF
 elif [ "$SOURCE" = "resume" ]; then
   # Do the search directly so Claude gets results even if MCP is slow to connect
   CHECKPOINT=$(checkpoint_direct)
-  RESULTS=$(search_direct "project status recent work $PROJECT $CWD" 6)
+  broad_search "project status recent work $PROJECT $CWD" 6 "Relevant memories retrieved directly:" \
+    "*(no memories found — MCP may still be connecting)*"
   # Built outside the heredoc: an apostrophe inside ${VAR:+...} in a heredoc is a
   # bash "bad substitution" error that silently dropped the whole block.
   CP_BLOCK=""
@@ -87,10 +117,7 @@ $CHECKPOINT
 
 This is a resumed session.
 ${CP_BLOCK}
-Relevant memories retrieved directly:
-
-${RESULTS:-*(no memories found — MCP may still be connecting)*}
-
+${SECTION}
 Continue where you left off. If the memories above look stale, call \`search_memory\` with a more specific query.
 EOF
 
@@ -100,7 +127,9 @@ elif [ "$SOURCE" = "compact" ]; then
   # Context was just lost — fetch the pre-compaction summary and recent session state directly.
   # Do NOT rely on Claude calling search_memory; MCP may not be connected yet.
   CHECKPOINT=$(checkpoint_direct)
-  RESULTS=$(search_direct "$PROJECT $CWD recent work decisions" 6)
+  broad_search "$PROJECT $CWD recent work decisions" 6 \
+    "Related memories retrieved directly (HTTP fallback — MCP may not be connected yet):" \
+    "*(no memories found — try calling search_memory manually once MCP reconnects)*"
   CP_BLOCK=""
   [ -n "$CHECKPOINT" ] && CP_BLOCK="### This session's latest checkpoint (see \"captured\" time — may predate the compaction)
 $CHECKPOINT
@@ -110,12 +139,11 @@ $CHECKPOINT
 
 Context was just compacted.
 ${CP_BLOCK}
-Related memories retrieved directly (HTTP fallback — MCP may not be connected yet):
-
-${RESULTS:-*(no memories found — try calling search_memory manually once MCP reconnects)*}
-
+${SECTION}
 Use the memories above to continue the session. If something is missing, call \`search_memory\` with a specific query once MCP tools are available.
 EOF
 fi
 
+bench_event checkpoint_chars=${#CHECKPOINT} injected_chars=${#RESULTS} \
+  searched=$([ -n "$LOOKUP_MS" ] && echo 1 || echo 0)
 exit 0

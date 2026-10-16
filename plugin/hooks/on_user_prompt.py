@@ -14,6 +14,9 @@ at most MAX_ITEMS memories and MAX_CHARS characters; 'candidate' rows (unreviewe
 LLM output) are never injected; a memory is injected at most once per session
 (cache in $XDG_CACHE_HOME/remnant, cleared on compaction by on_session_start.sh).
 
+REMNANT_INJECT_POLICY (bench_log.py) switches this off, or back to the pre-gate
+"broad" behaviour, for benchmarks; unset means the identifier gate.
+
 Input: hook JSON on stdin. Output: <memory> block or nothing. Always exits 0.
 """
 from __future__ import annotations
@@ -26,6 +29,9 @@ import sys
 import tempfile
 import time
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bench_log  # noqa: E402
 
 MAX_ITEMS = int(os.environ.get("REMNANT_INJECT_MAX_ITEMS", "3"))
 MAX_CHARS = int(os.environ.get("REMNANT_INJECT_MAX_CHARS", "3000"))
@@ -142,10 +148,10 @@ class session_lock:
             os.close(self.fd)       # releases the lock
 
 
-def search(url: str, token: str, query: str) -> list[dict]:
+def search(url: str, token: str, query: str, limit: int = CANDIDATES) -> list[dict]:
     payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                "params": {"name": "search_memory",
-                          "arguments": {"query": query, "limit": CANDIDATES, "format": "json"}}}
+                          "arguments": {"query": query, "limit": limit, "format": "json"}}}
     req = urllib.request.Request(f"{url.rstrip('/')}/mcp", data=json.dumps(payload).encode(), method="POST",
                                  headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json",
                                           "Accept": "application/json, text/event-stream"})
@@ -163,23 +169,68 @@ def search(url: str, token: str, query: str) -> list[dict]:
     return []
 
 
+def broad_query(prompt: str, cwd: str) -> str:
+    """Pre-gate behaviour (before the identifier gate): project name + prompt, top 3."""
+    project = os.path.basename(cwd.rstrip("/")) if cwd else ""
+    return f"{project} {prompt[:900]}" if project and project != "." else prompt[:900]
+
+
+def render(chosen: list[dict], idents: list[str]) -> str:
+    def label(h):
+        hit = [i for i in idents if mentions(h["memory"], i)]
+        return f"{h['id'][:8]} | matches {', '.join(hit)}" if hit else h["id"][:8]
+    body = "\n\n".join(f"[{label(h)}]\n{h['memory']}" for h in chosen)
+    return f"<memory>\n{body}\n</memory>"
+
+
 def main() -> None:
+    t0 = time.monotonic()
+    policy = bench_log.policy()
+    stats: dict = {"lookup_ms": None, "injected_count": 0, "injected_chars": 0}
+
+    def done(reason: str, out: str = "") -> None:
+        if out:
+            print(out)
+        bench_log.log("UserPromptSubmit", reason=reason, prompt_hash=bench_log.prompt_hash(prompt),
+                      session_id=session_id, elapsed_ms=round((time.monotonic() - t0) * 1000, 1), **stats)
+
+    prompt, session_id = "", ""
     url, token = os.environ.get("REMNANT_URL", ""), os.environ.get("REMNANT_TOKEN", "")
     try:
         event = json.loads(sys.stdin.read())
     except ValueError:
-        return
+        return done("bad-input")
     prompt = (event.get("prompt") or "").strip()
-    if not url or not token or len(prompt) < 20 or prompt.startswith("/"):
-        return
+    session_id = str(event.get("session_id") or "")
+    if policy == "off":
+        return done("policy-off")
+    if not url or not token:
+        return done("no-config")
+    if len(prompt) < 20 or prompt.startswith("/"):
+        return done("short-or-command")
+    if policy == "broad":
+        t1 = time.monotonic()
+        try:
+            hits = search(url, token, broad_query(prompt, str(event.get("cwd") or "")), limit=3)
+        except Exception:
+            return done("search-failed")
+        finally:
+            stats["lookup_ms"] = round((time.monotonic() - t1) * 1000, 1)
+        if not hits:
+            return done("no-hits")
+        out = render(hits, [])
+        stats.update(injected_count=len(hits), injected_chars=len(out))
+        return done("injected", out)
     idents = identifiers(prompt[:900])
     if not idents:
-        return                                       # nothing specific to look up
-    session_id = str(event.get("session_id") or "")
+        return done("no-identifier")                 # nothing specific to look up
+    t1 = time.monotonic()
     try:
         hits = search(url, token, prompt[:900])
     except Exception:
-        return                                       # never block or slow the prompt
+        return done("search-failed")                 # never block or slow the prompt
+    finally:
+        stats["lookup_ms"] = round((time.monotonic() - t1) * 1000, 1)
     try:
         with session_lock(session_id):
             seen = load_seen(session_id)
@@ -187,12 +238,12 @@ def main() -> None:
             if chosen:
                 save_seen(session_id, seen | {str(h["id"]) for h in chosen})
     except TimeoutError:
-        return                                       # another prompt holds the cache; skip rather than wait
+        return done("cache-busy")                    # another prompt holds the cache; skip rather than wait
     if not chosen:
-        return
-    body = "\n\n".join(f"[{h['id'][:8]} | matches {', '.join(i for i in idents if mentions(h['memory'], i))}]\n{h['memory']}"
-                       for h in chosen)
-    print(f"<memory>\n{body}\n</memory>")
+        return done("no-match")
+    out = render(chosen, idents)
+    stats.update(injected_count=len(chosen), injected_chars=len(out))
+    return done("injected", out)
 
 
 if __name__ == "__main__":
