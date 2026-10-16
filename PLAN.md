@@ -1,4 +1,4 @@
-# PLAN.md — claude-memory
+# PLAN.md — Remnant
 
 ## How to use this file
 
@@ -9,60 +9,58 @@
 
 ---
 
-## Phase 14 — Hardening & memory quality (PROPOSED 2026-10-14 — not yet agreed, nothing implemented)
+## Phase 14 — Hardening & memory quality (in progress; status reconciled 2026-10-16)
 > Goal: make writes reliable and retrieval trustworthy for a single-user homelab setup, while keeping
-> the data model ready for multiple agents later. Source: external review (ChatGPT) verified against local `dev` @ 9b64ae8.
-> Principle: no new infrastructure unless it removes a real failure mode. Redis + CNPG + one MCP pod stays the shape.
+> the data model ready for multiple agents later. Principle: no new infrastructure unless it removes
+> a real failure mode. Redis + CNPG + one MCP pod stays the shape.
+>
+> Status words: **merged (#N)** = on `dev` via that PR. **Deployed** = the server image built from
+> `dev` after #15 runs in the author's cluster (restarted 2026-10-16). The hooks run client-side from a
+> checkout, so a merged hook change is only active once that checkout is updated (noted per item).
 
-### P0 — correctness / security (small, do first)
-- [x] Commit the WIP `asyncio.to_thread` wrapping in `main.py` + `queue_worker.py` — *done on branch `hardening/p0`, not deployed*
-- [ ] Thread safety: create the mem0 `Memory` once at startup (or behind a lock) — *lock added on `hardening/p0`; startup init still open* — `get_memory()` lazy init can race under `to_thread`. mem0 2.0 stores themselves are thread-safe (SQLite history has a lock, pgvector uses `ThreadedConnectionPool`); verify against the pinned version
-- [x] Pin MCP server deps to prod versions (mcp 1.27.1, mem0ai 2.0.2; unpinned would pull mcp 2.3.0) — *done on branch `hardening/p0`, not deployed*
-- [ ] mem0 history DB lives in `~/.mem0` inside the container — lost on every restart. Move to a PVC or disable, decide together with lifecycle metadata
-- [x] Start queue worker at app startup (lifespan) — *done on branch `hardening/p0-followup`, not deployed*
-- [x] Redis Stream + consumer group (`XADD`/`XREADGROUP`/`XACK`, `XAUTOCLAIM`, max 5 attempts → `remnant:stream:add_memory:dead`), legacy list migrated on start. Same process, no new Deployment — *done on branch `hardening/p0-followup`, not deployed*
-- [x] Retry idempotency by `job_id` stored in memory metadata (covers crash after write, before `XACK`) — *done on branch `hardening/p0-followup`, not deployed*
-- [x] Claim timeout 10 min (`QUEUE_CLAIM_IDLE_SECONDS`) — *done on branch `hardening/p0-followup`, not deployed*
-- [x] Queue metrics: `remnant_queue_depth`/`_pending`/`_dead` — *done on branch `hardening/p0-followup`, not deployed*
-- [x] Refuse to start when `BEARER_TOKEN` is empty, `change-me` or < 16 chars; removed `change-me` from manifest/.env.example/README; constant-time compare — *done on branch `hardening/p0`, not deployed*
-- [ ] Web UI auth: UI proxy injects the bearer token server-side, so anyone reaching `remnant.prod.threshold.se` has full read/write/delete/export. Decide: Keycloak via oauth2-proxy / gateway auth, or drop the UI HTTPRoute until auth exists
-- [x] Fix env-var drift: accept `REMNANT_USER_ID`/`REMNANT_AGENT_ID`, keep `MEM0_*` — *done on branch `hardening/p0`, not deployed*
-- [ ] Secret redaction before storage (*server-side `src/redact.py` in add/update done on `hardening/p0`, not deployed; hook-side not needed since all writes go through the server*): session-end/pre-compact hooks store raw "Recent commands" incl. `Authorization: Bearer …`. Redact in hooks AND server-side in `add` (Bearer tokens, `password=`/`token=`/`secret=` values, `-p<pw>`, `<path:…>` is fine). 2026-10-14 scan: 5 memories with Bearer tokens, ~42 broader matches
-- [ ] One-off cleanup of existing memories containing secrets — *pass 1 done 2026-10-14 (32 rows + 102 archive); pass 2 with redact.py rules prepared (64 + 38 rows), awaiting run*
-- [x] `/metrics`, `/api/stats`, list, export, `get_all_memories` via SQL without vectors (root cause of the 3× OOM: mem0 `get_all` loads every embedding). Stopgap 1Gi limit in k8s-gitops c46e6ae8 can go back down after deploy — *done on branch `hardening/p0`, not deployed*
-- [x] Read paths (list/export/stats/metrics) work while Ollama is offline — tested with Ollama unreachable — *done on branch `hardening/p0`, not deployed*
-
-- [x] **infer=True silently dropped writes in prod** (found 2026-10-14): mem0 2.0.2 + qwen2.5:7b returns `[]` (model answers `{"message": ...}`) or crashes on `{"memory": ["string"]}`; the old worker logged "Processed". Raw text is now stored as fallback with `infer_fallback` metadata — *done on branch `hardening/p0-followup`, not deployed*
-- [x] `add_memory` defaults to `infer=false` (follows `MEM0_INFER`, default false) — *branch `feat/hybrid-search`; gitops `mem0.infer` must be set to "false" too*
-- [x] Disable mem0 PostHog telemetry (`MEM0_TELEMETRY=false` in the image) — *branch only*
+### P0 — correctness / security
+- [x] Blocking calls moved off the event loop (`asyncio.to_thread`) — merged (#4), deployed
+- [ ] Thread safety: create the mem0 `Memory` once at startup; a lock exists, startup init is still open
+- [x] Pinned MCP server deps (mcp 1.27.1, mem0ai 2.0.2) — merged (#4), deployed
+- [ ] mem0 history DB in `~/.mem0` inside the container is lost on restart: move it to a PVC, or disable it
+- [x] Redis Stream queue: consumer group, reclaim, 5 attempts then dead-letter stream, legacy list migration, `job_id` idempotency, worker started at app startup, queue metrics — merged (#5), deployed
+- [x] Refuse to start with an empty, placeholder or <16-char `BEARER_TOKEN`; constant-time compare — merged (#4), deployed
+- [ ] Web UI auth: the UI proxy injects the bearer token server-side, so anyone who can reach the UI has full access. Decide: gateway auth (e.g. oauth2-proxy), or no public UI route
+- [x] `REMNANT_USER_ID`/`REMNANT_AGENT_ID` accepted, `MEM0_*` kept — merged (#4), deployed
+- [x] Server-side secret redaction (`src/redact.py`) on add and update — merged (#4, #5), deployed
+- [x] One-off cleanup of stored memories containing secrets — done on the author's data, 2026-10
+- [x] SQL read paths without vectors (OOM fix), and reads while Ollama is offline — merged (#4), deployed
+- [x] `infer=True` silently dropping writes: raw text stored as a fallback with `infer_fallback` — merged (#5); `add_memory` defaults to `infer=false` — merged (#6), deployed
+- [x] mem0 telemetry disabled in the image — merged, deployed
 
 ### P1 — memory quality
-- [ ] Lifecycle metadata on every memory: `status` (active | superseded | historical | uncertain), `superseded_by`, `valid_from`, `source` (agent_id, client, session_id, hook vs manual), keep `created_at`/`updated_at`
-- [ ] `search_memory` returns `active` by default; optional `include_history` flag
-- [ ] Updates/merges mark the old memory `superseded` (or archive with pointer) instead of overwriting in place; dedup job does the same
-- [x] Hybrid search: idf-weighted Postgres FTS (stored `fts` column + GIN, substring match for identifiers) + direct pgvector cosine, merged with weighted RRF; keyword-only when Ollama is offline. Also replaced mem0 2.0.2 `Memory.search()` (0/30 on a semantic eval vs 16/30 for plain cosine). hit@5 on prod data: identifiers 2–12% → 82%, questions 0% → 47–60% — *done on branch `feat/hybrid-search`, not deployed*
-- [ ] pg_trgm index for the identifier substring match if search latency (~350 ms) becomes a problem
-- [x] Step A (Codex design input 2026-10-15): session checkpoints — one replaceable checkpoint per session_id, excluded from search, restored by exact id, 7-day expiry, Stop capture throttled to 15 min, dedup skips them + 30-min LLM budget + no transaction across LLM calls — *branch `feat/session-checkpoints`, not deployed*
-- [ ] Step B: injection gate — structured results, cosine ≥ 0.70 (calibrate on labelled related/unrelated prompts), max 3 facts / 3000 chars, per-session cache of injected ids in ~/.cache/remnant (reset after compaction)
-- [ ] Step C: latency budget — ~1 s embedding timeout, keyword-only fallback only for exact identifiers, 3 s hook cap
-- [ ] Step D: provenance + lifecycle — kind=fact|checkpoint, state=candidate|active|superseded|expired, source session/project, auto-extracted facts start as candidate
-- [ ] DNS rebinding protection back on with `allowed_hosts` from config/Helm (`gatewayApi.host`) instead of disabled
-- [ ] Minimal pytest suite (auth, queue ack/retry/DLQ, hybrid merge) run in CI
+- [x] Lifecycle states active / candidate / superseded / rejected (+ internal pending); `superseded_by`; provenance `source` / `session_id` / `project`; extraction output starts as candidate — merged (#13, #15), deployed
+- [ ] `valid_from` / observation time distinct from insertion time — not implemented (see the temporal-facts discussion)
+- [x] `search_memory` returns active facts by default; `include_history` / `include_candidates` — merged (#13), deployed
+- [x] Corrections and merges supersede instead of overwriting; the nightly dedup supersedes exact duplicates and proposes semantic merges for review — merged (#15), deployed
+- [x] Hybrid search: idf-weighted FTS + identifier substring + direct pgvector cosine, weighted RRF, keyword-only when Ollama is offline — merged (#6, #7), deployed
+- [ ] pg_trgm index for the identifier substring match, if search latency becomes a problem
+- [x] Session checkpoints: one per session, excluded from search, restored by exact id, 7-day expiry, Stop capture throttled — merged (#8), deployed
+- [x] Resume/compact recovery output was never printed (bash heredoc error) — merged (#16). **Hook not yet active** in the author's live hook checkout
+- [x] Injection gate: identifier match instead of a cosine threshold (calibration: no threshold above ~44% useful), max 3 items / 3000 chars, per-session cache reset on compaction — merged (#11), active in the Claude hook. Codex parity is pending (its hook lives outside this repo)
+- [~] Latency budget: 5 s total hook deadline, keyword-only fallback when embeddings fail — merged (#11, #6). A separate ~1 s embedding timeout is not implemented
+- [ ] DNS rebinding protection back on, with `allowed_hosts` from config/Helm (currently disabled in `src/main.py`)
+- [~] Test suite: `make test` (unit) and `make test-db` (real PostgreSQL) — local only; CI does not run tests yet
+- [ ] Measure the injection policies with `scripts/bench/` (smoke run, then pilot) before claiming token or time savings
 
-### P1 — documentation (single source of truth)
-- [ ] README = users/operators, AGENTS.md = agent working rules + architecture, PLAN.md = roadmap only, CHANGELOG = history; fold MVP.md into README/CHANGELOG
-- [ ] Fix stale content: `claude-memory`/`mem0.*` hostnames, unchecked Phase 9 rename items, duplicate "Phase 11", Phase 10 claims `infer=False` while prod runs `infer: "true"`, chart version (docs 0.2.3, prod 0.2.6), non-existent `externalsecret.yaml`
-- [ ] Renumber phases; move finished phases to "Completed"
-- [ ] Chart: `helm-charts/charts/remnant` is the source of truth; `helm/` here becomes a generated mirror via a GitHub Actions sync (copies removals too, failures visible). No such workflow exists yet — build it, then let it resolve current drift
-- [ ] Populate ISSUES.md with open items from this review
+### P1 — documentation
+- [ ] README = users/operators, AGENTS.md = agent rules + architecture, PLAN.md = roadmap, CHANGELOG = history; fold MVP.md in
+- [ ] Remaining stale content in older phases below (old `claude-memory` names, duplicate phase numbers); renumber, and move finished phases to "Completed"
+- [ ] Chart source of truth is `helm-charts/charts/remnant`; `helm/` here should become a generated mirror (no sync workflow yet)
+- [x] ISSUES.md populated with the open items from this reconciliation
 
 ### P2 — multi-agent readiness (design now, build when needed)
-- [ ] Agent identity from token, not self-declared header: token → {agent_id, scopes: read|write} map (Secret); keep single `user_id`
-- [ ] Namespaces via metadata `scope` (`shared` | `project:<name>`); `search_memory(scope=…)` filter (today `agent_id` is stored but ignored by search)
-- [ ] Remote MCP compatibility: re-test against current MCP spec/clients, remove `initialize` + `outputSchema` workarounds if no longer needed
-- [ ] External clients (ChatGPT etc.) need a public HTTPS endpoint + OAuth — only if wanted; separate decision, not on internal-shared gateway
+- [ ] Agent identity from token, not a self-declared header: token → {agent_id, scopes} map; keep single `user_id`
+- [ ] Project scope filter for `search_memory` (stored `project` metadata, filter before ranking); not access control
+- [ ] Remote MCP compatibility: re-test against the current MCP spec/clients, remove the `initialize` + `outputSchema` workarounds if no longer needed
+- [ ] External clients (ChatGPT etc.) need a public HTTPS endpoint + OAuth — only if wanted; separate decision
 - [ ] Separate worker Deployment only if >1 MCP replica or worker load hurts request latency
-- [ ] Align Phase 12 graph edges (`supersedes`, `contradicts`) with lifecycle metadata above
+- [ ] Align Phase 12 graph edges (`supersedes`, `contradicts`) with the lifecycle states above
 
 ---
 
