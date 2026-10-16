@@ -262,3 +262,16 @@ def test_session_start_policies(tmp_path):
             assert ev["searched"] == 0 and ev["checkpoint_chars"] > 0 and ev["injected_chars"] == 0
     out, calls, ev = run_session_start(tmp_path, "startup", "off")
     assert calls == [] and "Session Bootstrap" in out and ev["source"] == "startup"
+
+
+def test_precompact_flag_is_per_session(tmp_path):
+    """A compaction in one session must not suppress another session's Stop backup."""
+    import json, subprocess
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path)}
+    hooks = HOOK.parent
+    subprocess.run(["bash", str(hooks / "on_pre_compact.sh")], env=env, text=True, capture_output=True,
+                   input=json.dumps({"session_id": "sess-a"}))
+    flags = sorted(p.name for p in (tmp_path / "remnant").glob("precompact-*"))
+    assert flags == ["precompact-sess-a"]
+    assert not os.path.exists("/tmp/.claude-precompact-flag") or \
+        os.path.getmtime("/tmp/.claude-precompact-flag") < time.time() - 5     # global flag no longer written
