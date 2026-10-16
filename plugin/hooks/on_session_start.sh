@@ -76,13 +76,17 @@ elif [ "$SOURCE" = "resume" ]; then
   # Do the search directly so Claude gets results even if MCP is slow to connect
   CHECKPOINT=$(checkpoint_direct)
   RESULTS=$(search_direct "project status recent work $PROJECT $CWD" 6)
+  # Built outside the heredoc: an apostrophe inside ${VAR:+...} in a heredoc is a
+  # bash "bad substitution" error that silently dropped the whole block.
+  CP_BLOCK=""
+  [ -n "$CHECKPOINT" ] && CP_BLOCK="### This session's last checkpoint
+$CHECKPOINT
+"
   cat <<EOF
 ## Mem0 Session Resumed
 
 This is a resumed session.
-${CHECKPOINT:+### This session's last checkpoint
-$CHECKPOINT
-}
+${CP_BLOCK}
 Relevant memories retrieved directly:
 
 ${RESULTS:-*(no memories found — MCP may still be connecting)*}
@@ -97,13 +101,15 @@ elif [ "$SOURCE" = "compact" ]; then
   # Do NOT rely on Claude calling search_memory; MCP may not be connected yet.
   CHECKPOINT=$(checkpoint_direct)
   RESULTS=$(search_direct "$PROJECT $CWD recent work decisions" 6)
+  CP_BLOCK=""
+  [ -n "$CHECKPOINT" ] && CP_BLOCK="### This session's latest checkpoint (see \"captured\" time — may predate the compaction)
+$CHECKPOINT
+"
   cat <<EOF
 ## Mem0 Post-Compaction Recovery
 
 Context was just compacted.
-${CHECKPOINT:+### This session's latest checkpoint (see "captured" time — may predate the compaction)
-$CHECKPOINT
-}
+${CP_BLOCK}
 Related memories retrieved directly (HTTP fallback — MCP may not be connected yet):
 
 ${RESULTS:-*(no memories found — try calling search_memory manually once MCP reconnects)*}
