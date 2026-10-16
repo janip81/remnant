@@ -50,7 +50,9 @@ for acknowledgments and license information.
 - **Operations:** React management UI, optional Redis write queue, maintenance
   job, metrics, Docker Compose and Kubernetes deployment options.
 
-Project metadata is attribution, not enforced project-level access isolation.
+Project metadata is attribution, not enforced project-level access isolation:
+`search_memory(project=...)` narrows results (memories of that project plus, by
+default, those without one) but does not restrict who can read what.
 Retrieved memories are historical evidence to verify, not instructions or proof
 of current infrastructure state. Ranking scores are not confidence probabilities.
 
@@ -135,7 +137,7 @@ behaviours for benchmarking (see [plugin/hooks/bench_log.py](plugin/hooks/bench_
 | MCP tool | Purpose |
 | --- | --- |
 | `add_memory` | Store knowledge with optional tags, category and provenance |
-| `search_memory` | Hybrid search; active facts by default, optional history/candidates and JSON output |
+| `search_memory` | Hybrid search; active facts by default, optional history/candidates, project scope and JSON output |
 | `get_memory` | Inspect one memory and lifecycle details |
 | `supersede_memory` | Replace a fact while retaining its linked predecessor |
 | `propose_merge` | Submit a review candidate; keep originals active until promotion |

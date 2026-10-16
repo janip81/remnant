@@ -303,6 +303,23 @@ def _population(include_checkpoints: bool = False, states=("active",)) -> str:
     if not include_checkpoints:
         parts.append(_SEARCHABLE)
     return " AND ".join(parts)
+def _project_filter(project: str = "", include_unscoped: bool = True) -> tuple[str, list]:
+    """Optional project scope for search, as (" AND ...", params).
+
+    "" = no filter (the default; existing callers are unchanged). Otherwise memories
+    whose stored `project` equals it, plus — when include_unscoped — memories with
+    no project: shared facts and everything written before provenance existed.
+    `project` is caller-supplied metadata, so this narrows results; it is not
+    access control.
+    """
+    project = (project or "").strip()
+    if not project:
+        return "", []
+    if include_unscoped:
+        return " AND (payload->>'project' = %s OR coalesce(payload->>'project', '') = '')", [project]
+    return " AND payload->>'project' = %s", [project]
+
+
 CHECKPOINT_TTL_DAYS = int(os.environ.get("CHECKPOINT_TTL_DAYS", "7"))
 _META = ("(CASE WHEN jsonb_typeof(payload->'metadata') = 'object' "
          "THEN payload->'metadata' ELSE payload END)")
@@ -667,19 +684,20 @@ def _has_fts_column() -> bool:
 
 
 def keyword_search(query: str, limit: int = _CANDIDATES, include_checkpoints: bool = False,
-                   states=("active",)) -> list[dict]:
+                   states=("active",), project: str = "", include_unscoped: bool = True) -> list[dict]:
     try:
-        return _keyword_search(query, limit, include_checkpoints, states)
+        return _keyword_search(query, limit, include_checkpoints, states, project, include_unscoped)
     except psycopg2.errors.UndefinedColumn:
         ensure_fts_index()          # table was created after startup
-        return _keyword_search(query, limit, include_checkpoints, states)
+        return _keyword_search(query, limit, include_checkpoints, states, project, include_unscoped)
 
 
 def _like(term: str) -> str:
     return "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
-def _keyword_search(query: str, limit: int, include_checkpoints: bool = False, states=("active",)) -> list[dict]:
+def _keyword_search(query: str, limit: int, include_checkpoints: bool = False, states=("active",),
+                    project: str = "", include_unscoped: bool = True) -> list[dict]:
     """Full-text search weighted by term rarity (BM25 idf, no term frequency).
 
     Each query term that occurs in a memory adds its idf, so one rare
@@ -699,8 +717,10 @@ def _keyword_search(query: str, limit: int, include_checkpoints: bool = False, s
             sql, params = f"({sql} OR payload->>'data' ILIKE %s)", [term, _like(term)]
         return sql, params
 
-    # same population for the idf statistics and the results
-    user = "payload->>'user_id' = %s AND " + _population(include_checkpoints, states)
+    # same population (incl. the project scope) for the idf statistics and the results
+    scope_sql, scope_params = _project_filter(project, include_unscoped)
+    user = "payload->>'user_id' = %s AND " + _population(include_checkpoints, states) + scope_sql
+    user_params = [settings.mem0_user_id] + scope_params
     conn = _db_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -708,7 +728,7 @@ def _keyword_search(query: str, limit: int, include_checkpoints: bool = False, s
             # unique aliases: RealDictCursor keeps one value per column name
             counts = ", ".join(f"count(*) FILTER (WHERE {c}) AS df{i}" for i, (c, _) in enumerate(conds))
             cur.execute(f"SELECT count(*) AS n, {counts} FROM {_MEM_TABLE} WHERE {user}",
-                        [p for _, ps in conds for p in ps] + [settings.mem0_user_id])
+                        [p for _, ps in conds for p in ps] + user_params)
             row = cur.fetchone()
             n, dfs = row["n"], [row[f"df{i}"] for i in range(len(conds))]
             weighted = [(c, df) for c, df in zip(conds, dfs) if df]
@@ -733,7 +753,7 @@ def _keyword_search(query: str, limit: int, include_checkpoints: bool = False, s
                 f"({' + '.join(score_sql)}) AS rank "
                 f"FROM {_MEM_TABLE} WHERE {user} AND ({any_sql}) "
                 f"ORDER BY rank DESC, length(payload->>'data') ASC LIMIT %s",
-                score_params + [settings.mem0_user_id] + any_params + [limit])
+                score_params + user_params + any_params + [limit])
             rows = cur.fetchall()
     except psycopg2.errors.UndefinedTable:
         return []
@@ -747,17 +767,20 @@ def _keyword_search(query: str, limit: int, include_checkpoints: bool = False, s
     return out
 
 
-def hybrid_search(query: str, limit: int = 5, include_checkpoints: bool = False, states=("active",)) -> list[dict]:
+def hybrid_search(query: str, limit: int = 5, include_checkpoints: bool = False, states=("active",),
+                  project: str = "", include_unscoped: bool = True) -> list[dict]:
     """Merge keyword and vector results with reciprocal rank fusion.
 
     score is the fused score scaled to 0..1 (1.0 = ranked first by both).
     vector_score is the cosine similarity when the vector side found the item.
     If the vector side fails (Ollama offline), keyword results are returned alone.
+    The optional project scope is applied inside both sides, before their limits.
     """
     pool = max(_CANDIDATES, limit)
-    keyword = keyword_search(query, pool, include_checkpoints, states)
+    keyword = keyword_search(query, pool, include_checkpoints, states, project, include_unscoped)
     try:
-        vector = search(query, limit=pool, include_checkpoints=include_checkpoints, states=states)
+        vector = search(query, limit=pool, include_checkpoints=include_checkpoints, states=states,
+                        project=project, include_unscoped=include_unscoped)
     except Exception as e:
         logger.warning("Vector search unavailable (%s); keyword results only", type(e).__name__)
         vector = []
@@ -787,7 +810,7 @@ def hybrid_search(query: str, limit: int = 5, include_checkpoints: bool = False,
 
 
 def search(query: str, limit: int = 5, agent_id: str = "", include_checkpoints: bool = False,
-           states=("active",)) -> list[dict]:
+           states=("active",), project: str = "", include_unscoped: bool = True) -> list[dict]:
     """Vector search: cosine similarity over the stored embeddings.
 
     Deliberately not mem0's Memory.search(): with mem0ai 2.0.2 its fused
@@ -797,6 +820,7 @@ def search(query: str, limit: int = 5, agent_id: str = "", include_checkpoints: 
     used when memories were written.
     """
     embedding = get_memory().embedding_model.embed(query, "search")
+    scope_sql, scope_params = _project_filter(project, include_unscoped)
     sql = (f"SELECT id, payload->>'data' AS memory, payload->>'agent_id' AS agent_id, "
            f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
            f"{_META}->>'category' AS category, "
@@ -806,13 +830,13 @@ def search(query: str, limit: int = 5, agent_id: str = "", include_checkpoints: 
                 f"payload->>'superseded_by' AS superseded_by, "
            f"1 - (vector <=> %s::vector) AS score "
            f"FROM {_MEM_TABLE} WHERE payload->>'user_id' = %s "
-           + f"AND {_population(include_checkpoints, states)} " +
+           + f"AND {_population(include_checkpoints, states)}{scope_sql} " +
            f"ORDER BY vector <=> %s::vector LIMIT %s")
     vec = str(list(embedding))
     conn = _db_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, [vec, settings.mem0_user_id, vec, limit])
+            cur.execute(sql, [vec, settings.mem0_user_id, *scope_params, vec, limit])
             rows = cur.fetchall()
     except psycopg2.errors.UndefinedTable:
         return []

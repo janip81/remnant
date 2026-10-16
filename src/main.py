@@ -54,7 +54,8 @@ async def add_memory(content: str, agent_id: str = "", infer: Optional[bool] = N
 
 @mcp.tool()
 async def search_memory(query: str, limit: int = 5, include_sessions: bool = False, format: str = "text",
-                        include_history: bool = False, include_candidates: bool = False) -> str:
+                        include_history: bool = False, include_candidates: bool = False,
+                        project: str = "", include_unscoped: bool = True) -> str:
     """Search memory by meaning and exact terms (hostnames, versions, error codes, names).
     Each hit shows rank (fused ordering, 0..1), cos (cosine similarity, when the
     vector side matched) and which side matched. Neither is a calibrated
@@ -63,10 +64,13 @@ async def search_memory(query: str, limit: int = 5, include_sessions: bool = Fal
     session use get_checkpoint(session_id).
     format="json" returns [{id, memory, rank, cos, match, state}] for hooks/tools.
     Only active memories by default; include_history adds superseded ones,
-    include_candidates adds unreviewed LLM output (state shown either way)."""
+    include_candidates adds unreviewed LLM output (state shown either way).
+    project narrows results to memories stored with that project, plus (unless
+    include_unscoped=False) memories with no project; empty = all projects."""
     states = ["active"] + (["superseded"] if include_history else []) + (["candidate"] if include_candidates else [])
     results = await asyncio.to_thread(mem_store.hybrid_search, query, limit=limit,
-                                      include_checkpoints=include_sessions, states=states)
+                                      include_checkpoints=include_sessions, states=states,
+                                      project=project, include_unscoped=include_unscoped)
     if format == "json":
         return json.dumps([{"id": r.get("id"), "memory": r.get("memory", ""), "rank": r.get("score"),
                             "cos": r.get("vector_score"), "match": r.get("match", ""),
@@ -521,17 +525,21 @@ async def app(scope, receive, send):
             filter_agent = qs.get("agent_id", "").strip()
             filter_category = qs.get("category", "").strip()
             filter_state = qs.get("state", "").strip()
+            filter_project = qs.get("project", "").strip()     # UI filter: exactly this project
 
             if q:
                 # the UI browses everything (all states, checkpoints) unless a state filter is set
                 states = [filter_state] if filter_state in mem_store.VALID_STATES else list(mem_store.VALID_STATES)
                 results = await asyncio.to_thread(mem_store.hybrid_search, q, limit=200,
-                                                  include_checkpoints=True, states=states)
+                                                  include_checkpoints=True, states=states,
+                                                  project=filter_project, include_unscoped=False)
                 if sort in ("newest", "oldest"):
                     reverse = sort == "newest"
                     results.sort(key=lambda r: r.get("created_at", ""), reverse=reverse)
             else:
                 results = await asyncio.to_thread(mem_store.list_rows, filter_agent, filter_state)
+                if filter_project:
+                    results = [r for r in results if r.get("project") == filter_project]
                 reverse = sort != "oldest"
                 results.sort(key=lambda r: r.get("created_at", ""), reverse=reverse)
 
