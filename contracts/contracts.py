@@ -17,6 +17,11 @@ TIMELINE_KINDS = {"observation", "hypothesis", "attempt", "outcome"}
 ATTEMPT_RESULTS = {"failed", "partial", "worked"}
 
 
+def _is(value, allowed: set) -> bool:
+    """Enum membership that can't raise on unhashable input (lists, dicts)."""
+    return isinstance(value, str) and value in allowed
+
+
 def _time(value) -> datetime | None:
     try:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -43,7 +48,7 @@ def check_evidence(items, problems: list, where: str = "evidence") -> set:
         return kinds
     for i, e in enumerate(items):
         ref = e.get("ref") if isinstance(e, dict) else None
-        if not isinstance(e, dict) or e.get("kind") not in EVIDENCE_KINDS or not isinstance(ref, str) or not ref.strip():
+        if not isinstance(e, dict) or not _is(e.get("kind"), EVIDENCE_KINDS) or not isinstance(ref, str) or not ref.strip():
             problems.append(f"{where}[{i}] needs kind in {sorted(EVIDENCE_KINDS)} and a non-empty ref")
             continue
         _check_time(e, "observed_at", problems)
@@ -52,7 +57,7 @@ def check_evidence(items, problems: list, where: str = "evidence") -> set:
 
 
 def _check_verification(level: str, kinds: set, problems: list, where: str):
-    if level not in VERIFICATIONS:
+    if not _is(level, VERIFICATIONS):
         problems.append(f"{where}: verification must be one of {sorted(VERIFICATIONS)}")
     elif level in VERIFIED_BY and not kinds & VERIFIED_BY[level]:
         problems.append(f"{where}: {level} needs evidence of kind {sorted(VERIFIED_BY[level])}")
@@ -128,7 +133,7 @@ def validate_handoff(h: dict) -> list[str]:
         if not str(h.get(k, "")).strip():
             p.append(f"{k} is required")
     _check_time(h, "created_at", p, required=True)
-    if h.get("state") not in HANDOFF_STATES:
+    if not _is(h.get("state"), HANDOFF_STATES):
         p.append(f"state must be one of {sorted(HANDOFF_STATES)}")
     for k in ("done", "next", "constraints", "open_questions"):
         if k in h and not (isinstance(h[k], list) and all(isinstance(x, str) and x.strip() for x in h[k])):
@@ -137,7 +142,7 @@ def validate_handoff(h: dict) -> list[str]:
         p.append("an open handoff needs at least one next step")
     check_evidence(h.get("evidence") or [], p)
     for i, hy in _records(h.get("hypotheses"), "hypotheses", p):
-        if hy.get("status") not in HYPOTHESIS_STATES or not isinstance(hy.get("text"), str) or not hy["text"].strip():
+        if not _is(hy.get("status"), HYPOTHESIS_STATES) or not isinstance(hy.get("text"), str) or not hy["text"].strip():
             p.append(f"hypotheses[{i}] needs text and status in {sorted(HYPOTHESIS_STATES)}")
             continue
         kinds = check_evidence(hy.get("evidence") or [], p, f"hypotheses[{i}].evidence")
@@ -161,7 +166,7 @@ def validate_incident(inc: dict) -> list[str]:
     last = None
     for i, e in _records(inc.get("timeline"), "timeline", []):
         t = _check_time(e, "at", p, required=True)
-        if e.get("kind") not in TIMELINE_KINDS or not str(e.get("text", "")).strip():
+        if not _is(e.get("kind"), TIMELINE_KINDS) or not str(e.get("text", "")).strip():
             p.append(f"timeline[{i}] needs text and kind in {sorted(TIMELINE_KINDS)}")
             continue
         if t and last and t < last:
@@ -171,7 +176,7 @@ def validate_incident(inc: dict) -> list[str]:
         last = t or last
         kinds = check_evidence(e.get("evidence") or [], p, f"timeline[{i}].evidence")
         if e["kind"] == "attempt":
-            if e.get("result") not in ATTEMPT_RESULTS:
+            if not _is(e.get("result"), ATTEMPT_RESULTS):
                 p.append(f"timeline[{i}]: attempt needs result in {sorted(ATTEMPT_RESULTS)}")
             elif e["result"] == "worked" and not kinds & QUALIFYING:
                 p.append(f"timeline[{i}]: a worked attempt needs evidence other than agent_inference")

@@ -133,3 +133,17 @@ def test_eval_arms_carry_the_same_facts():
     for term in case["parity_terms"]:
         assert term in case["freeform"], term
         assert term in structured, term
+
+
+def test_unhashable_enum_values_are_problems_not_crashes():
+    bad = [["x"], {"a": 1}]
+    for v in bad:
+        assert c.validate_fact({"verification": v})
+        assert c.validate_fact({"evidence": [{"kind": v, "ref": "r"}]})
+        assert c.validate_handoff({**FIX["handoff-example"], "state": v})
+        assert c.validate_handoff({**FIX["handoff-example"], "hypotheses": [{"text": "t", "status": v}]})
+        inc = copy.deepcopy(FIX["incident-example"])
+        inc["timeline"][2]["result"] = v
+        assert c.validate_incident(inc)
+        inc["timeline"][0]["kind"] = v
+        assert c.validate_incident(inc)
