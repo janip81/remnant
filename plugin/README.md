@@ -54,8 +54,9 @@ claude mcp add --scope user remnant python3 "$REMNANT_PLUGIN_DIR/mcp-stdio.py"
 | `Stop` | `on_stop.sh` | Reminds the agent to store learnings. Captures the checkpoint, throttled to once per 15 minutes per session, and skipped right after that session compacted. |
 
 There are two optional hooks. `on_task_completed.sh` (TaskCompleted) is a learning
-reminder. `block_memory_write.sh` (PreToolUse, matcher `Write|Edit`) sends writes to
-`MEMORY.md`/`memory/*.md` to `add_memory` instead.
+reminder. `block_memory_write.sh` (PreToolUse, matcher `Write|Edit`) blocks writes to
+`MEMORY.md`/`memory/*.md` and tells the agent to call `add_memory` instead. Nothing is
+stored unless the agent then makes that call.
 
 `search-memory.*` and `save-context.*` are the earlier versions of the prompt and
 capture hooks. The template no longer uses them.

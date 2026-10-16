@@ -14,8 +14,9 @@
 > the data model ready for multiple agents later. Principle: no new infrastructure unless it removes
 > a real failure mode. Redis + CNPG + one MCP pod stays the shape.
 >
-> Status words: **merged (#N)** = on `dev` via that PR. **Deployed** = the server image built from
-> `dev` after #15 runs in the author's cluster (restarted 2026-10-16). The hooks run client-side from a
+> Status words: **merged (#N)** = on `dev` via that PR. **Deployed** = in the server image built from
+> `dev` at #15, which runs in the author's cluster (pod digest = the manifest pushed by that CI run,
+> checked 2026-10-16; #16 changed only hooks and tests). The hooks run client-side from a
 > checkout, so a merged hook change is only active once that checkout is updated (noted per item).
 
 ### P0 — correctness / security

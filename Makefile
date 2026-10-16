@@ -50,24 +50,28 @@ run:
 	cd src && uvicorn main:app --reload --host 0.0.0.0 --port 8080
 
 # Run tests
-# Unit tests. Database tests skip without TEST_DATABASE_URL; use test-db for those.
+# Unit tests only: TEST_DATABASE_URL is cleared, because the DB tests drop and
+# recreate tables in whatever database it points to. Use test-db for those.
 # Needs: pip install -r requirements-mcp.txt -r requirements-dev.txt
 PYTHON  ?= python3
 TEST_PG := remnant-test-pg
 test:
-	$(PYTHON) -m pytest -q tests
+	env -u TEST_DATABASE_URL $(PYTHON) -m pytest -q tests
 
-# All tests incl. real-PostgreSQL ones, against a throwaway pgvector container
-# (removed with its volume afterwards, also on failure).
+# All tests incl. real-PostgreSQL ones, against a throwaway pgvector container.
+# One shell with a trap: the container and its volume are removed on success,
+# test failure, startup failure, readiness timeout and interruption.
 test-db:
-	@docker rm -fv $(TEST_PG) >/dev/null 2>&1 || true
+	@set -u; \
+	cleanup() { docker rm -fv $(TEST_PG) >/dev/null 2>&1 || true; }; \
+	trap cleanup EXIT; trap 'exit 130' INT TERM; cleanup; \
 	docker run -d --name $(TEST_PG) -e POSTGRES_USER=remnant -e POSTGRES_PASSWORD=test \
-	  -e POSTGRES_DB=remnant -p 127.0.0.1:25499:5432 pgvector/pgvector:pg16 >/dev/null
-	@for i in $$(seq 1 60); do docker exec $(TEST_PG) pg_isready -U remnant -q && break; sleep 1; done; sleep 1
-	TEST_DATABASE_URL=postgresql://remnant:test@127.0.0.1:25499/remnant $(PYTHON) -m pytest -q tests; \
-	  status=$$?; docker rm -fv $(TEST_PG) >/dev/null; exit $$status
+	  -e POSTGRES_DB=remnant -p 127.0.0.1:25499:5432 pgvector/pgvector:pg16 >/dev/null || exit 1; \
+	ready=0; for i in $$(seq 1 60); do \
+	  if docker exec $(TEST_PG) pg_isready -U remnant -q 2>/dev/null; then ready=1; break; fi; sleep 1; done; \
+	[ $$ready = 1 ] || { echo "test database not ready after 60 s" >&2; exit 1; }; sleep 1; \
+	TEST_DATABASE_URL=postgresql://remnant:test@127.0.0.1:25499/remnant $(PYTHON) -m pytest -q tests
 
-# Lint
 lint:
 	@which ruff >/dev/null 2>&1 && ruff check src/ scripts/ plugin/ tests/ || echo "ruff not installed — skipping"
 
