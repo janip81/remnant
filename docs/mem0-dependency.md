@@ -23,15 +23,19 @@ The line numbers below refer to files inside those wheels.
 
 Everything else goes through direct SQL against mem0's table (`mem0`: `id UUID`,
 `vector`, `payload JSONB`). The payload has more than one shape. mem0 2.0.2 writes the
-caller's metadata keys at the top level of `payload`, but older rows and some
-pgvector write paths nest them as `payload.metadata` or even
-`payload.metadata.metadata`. Remnant's code has to handle all three:
+caller's metadata keys at the top level of `payload`, while other rows carry them in
+`payload.metadata` or `payload.metadata.metadata`. Rows that mix levels exist too: on
+the author's data, 133 rows have a top-level category next to a `payload.metadata`
+object holding only tags.
 
-- the SQL readers use `_META` (`src/memory.py`), which picks `payload->'metadata'`
-  when it's an object and falls back to the top level;
-- `update_tags` (`src/memory.py`) and the dedup job's tag/metadata writers
-  (`scripts/dedup_job.py`, the tagging phase) write into the innermost existing
-  level.
+- Readers (`_META_CATEGORY`/`_META_TAGS` in `src/memory.py`, `_extract_meta` in
+  `scripts/dedup_job.py`) take each key from the deepest level that has it.
+- Writers (`_meta_target`: `update_tags` and the dedup tag writers) write into the
+  deepest level that already exists, and never create `payload.metadata` on a flat
+  payload.
+- Before 2026-10-16 the readers picked one whole object (`payload.metadata` if it
+  existed). Together with writers that created that object on flat rows, this hid
+  top-level categories and tags. The tests cover all four shapes.
 
 Direct SQL handles:
 

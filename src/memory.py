@@ -321,8 +321,29 @@ def _project_filter(project: str = "", include_unscoped: bool = True) -> tuple[s
 
 
 CHECKPOINT_TTL_DAYS = int(os.environ.get("CHECKPOINT_TTL_DAYS", "7"))
-_META = ("(CASE WHEN jsonb_typeof(payload->'metadata') = 'object' "
-         "THEN payload->'metadata' ELSE payload END)")
+# Metadata (category, tags, ...) appears at three depths: top level (mem0 2.0.2's
+# own writes), payload.metadata and payload.metadata.metadata (older rows / other
+# write paths). Readers take each key from the deepest level that has it; writers
+# (_meta_target) write into the deepest level that exists. Picking one whole
+# object instead hid top-level categories once a payload.metadata object existed.
+def _meta_key(key: str, as_text: bool = True) -> str:
+    op = "->>" if as_text else "->"
+    return (f"coalesce(payload->'metadata'->'metadata'{op}'{key}', "
+            f"payload->'metadata'{op}'{key}', payload{op}'{key}')")
+
+
+_META_CATEGORY = _meta_key("category")
+_META_TAGS = (f"(CASE WHEN jsonb_typeof({_meta_key('tags', False)}) = 'array' "
+              f"THEN {_meta_key('tags', False)} END)")
+
+
+def _meta_target(payload: dict) -> dict:
+    """The dict a metadata write goes into: the deepest level that already exists.
+    Never creates payload.metadata on a flat payload."""
+    meta = payload.get("metadata")
+    if isinstance(meta, dict):
+        return meta["metadata"] if isinstance(meta.get("metadata"), dict) else meta
+    return payload
 
 
 def _row_to_result(row: dict) -> dict:
@@ -352,8 +373,8 @@ def list_rows(agent_id: str = "", state: str = "", states=None, include_checkpoi
     MCP get_all_memories passes the default eligibility instead."""
     sql = (f"SELECT id, payload->>'data' AS memory, payload->>'agent_id' AS agent_id, "
            f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
-           f"{_META}->>'category' AS category, "
-           f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
+           f"{_META_CATEGORY} AS category, "
+           f"{_META_TAGS} AS tags, "
            f"payload->>'state' AS state, payload->>'source' AS source, "
            f"payload->>'review_reason' AS review_reason, payload->>'project' AS project, "
                 f"payload->>'superseded_by' AS superseded_by, "
@@ -393,12 +414,11 @@ def stats() -> dict:
             cur.execute(f"SELECT coalesce(nullif(payload->>'agent_id', ''), 'unknown'), count(*) "
                         f"FROM {_MEM_TABLE} {where} GROUP BY 1", p)
             by_agent = dict(cur.fetchall())
-            cur.execute(f"SELECT coalesce(nullif({_META}->>'category', ''), 'uncategorized'), count(*) "
+            cur.execute(f"SELECT coalesce(nullif({_META_CATEGORY}, ''), 'uncategorized'), count(*) "
                         f"FROM {_MEM_TABLE} {where} GROUP BY 1", p)
             by_category = dict(cur.fetchall())
             cur.execute(f"SELECT t, count(*) FROM {_MEM_TABLE}, "
-                        f"jsonb_array_elements_text(CASE WHEN jsonb_typeof({_META}->'tags') = 'array' "
-                        f"THEN {_META}->'tags' ELSE '[]'::jsonb END) AS t {where} GROUP BY 1", p)
+                        f"jsonb_array_elements_text(coalesce({_META_TAGS}, '[]'::jsonb)) AS t {where} GROUP BY 1", p)
             by_tag = dict(cur.fetchall())
     except psycopg2.errors.UndefinedTable:
         return {"total": 0, "first_added": None, "last_added": None,
@@ -745,8 +765,8 @@ def _keyword_search(query: str, limit: int, include_checkpoints: bool = False, s
             cur.execute(
                 f"SELECT id, payload->>'data' AS memory, payload->>'agent_id' AS agent_id, "
                 f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
-                f"{_META}->>'category' AS category, "
-                f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
+                f"{_META_CATEGORY} AS category, "
+                f"{_META_TAGS} AS tags, "
                 f"payload->>'state' AS state, payload->>'source' AS source, "
                 f"payload->>'review_reason' AS review_reason, payload->>'project' AS project, "
                 f"payload->>'superseded_by' AS superseded_by, "
@@ -823,8 +843,8 @@ def search(query: str, limit: int = 5, agent_id: str = "", include_checkpoints: 
     scope_sql, scope_params = _project_filter(project, include_unscoped)
     sql = (f"SELECT id, payload->>'data' AS memory, payload->>'agent_id' AS agent_id, "
            f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
-           f"{_META}->>'category' AS category, "
-           f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
+           f"{_META_CATEGORY} AS category, "
+           f"{_META_TAGS} AS tags, "
            f"payload->>'state' AS state, payload->>'source' AS source, "
                 f"payload->>'review_reason' AS review_reason, payload->>'project' AS project, "
                 f"payload->>'superseded_by' AS superseded_by, "
@@ -1226,12 +1246,7 @@ def update_tags(memory_id: str, tags: list) -> bool:
                 if not row:
                     return False
                 payload = row[0]
-                meta = payload.get("metadata") or {}
-                if isinstance(meta.get("metadata"), dict):
-                    meta["metadata"]["tags"] = tags
-                else:
-                    meta["tags"] = tags
-                payload["metadata"] = meta
+                _meta_target(payload)["tags"] = tags
                 cur.execute(
                     "UPDATE mem0 SET payload = %s WHERE id = %s",
                     (json.dumps(payload), memory_id),

@@ -55,3 +55,16 @@ def test_merge_longer_than_input_is_rejected(monkeypatch):
     monkeypatch.setattr(dedup_job.requests, "post",
                         lambda *a, **k: Resp('{"facts": ["' + "x" * 50 + '", "' + "y" * 50 + '"]}'))
     assert dedup_job.ollama_merge(["short a", "short b"]) is None
+
+
+def test_dedup_metadata_helpers_follow_the_deepest_level():
+    flat = {"data": "x", "category": "project", "tags": ["a"]}
+    mixed = {"data": "x", "category": "project", "metadata": {"tags": ["a"]}}
+    double = {"data": "x", "metadata": {"metadata": {"tags": ["a"]}}}
+    assert dedup_job._extract_meta(mixed)["category"] == "project" and dedup_job._extract_meta(mixed)["tags"] == ["a"]
+    out = dedup_job._merge_tags_and_mark_reviewed(dict(flat), ["b"])
+    assert "metadata" not in out and out["tags"] == ["a", "b"] and out["llm_reviewed"] is True
+    out = dedup_job._merge_tags_and_mark_reviewed(mixed, ["b"])
+    assert out["metadata"]["tags"] == ["a", "b"] and out["category"] == "project"
+    out = dedup_job._set_tags_in_payload(double, ["c"])
+    assert out["metadata"]["metadata"]["tags"] == ["c"]

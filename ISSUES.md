@@ -10,6 +10,7 @@ Known bugs, blockers, and tech debt. Add items here as they are discovered.
 | 4 | CI builds images but runs no tests | P2 | open | Add `make test` (and a DB service for `make test-db`) to the workflow |
 | 5 | Legacy hook scripts `search-memory.*` / `save-context.*` are still shipped but unused by the template | debt | open | Remove once no installation uses them |
 | 6 | Dedup CronJob still sets legacy `CLAUDE_MEMORY_*` env names | debt | open | Chart/values cleanup |
+| 7 | Category/tags invisible when a row mixes metadata levels (top-level category + `payload.metadata` object), and tag writers created that mix on flat rows | P1 | fixed on branch, not deployed | Per-key deepest-level readers and writers; affects 133 rows on the author's data, no migration needed |
 
 ## Priority levels
 - **P0** — Blocker, must fix before continuing

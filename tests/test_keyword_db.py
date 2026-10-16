@@ -760,3 +760,48 @@ def test_project_value_is_a_parameter_not_sql(mem, monkeypatch):
     evil = "alpha' OR '1'='1"
     assert mem.keyword_search("port-7443", 50, project=evil, include_unscoped=False) == []
     assert mem.search("port-7443", limit=50, project=evil, include_unscoped=False) == []
+
+
+# --- metadata at three depths ---------------------------------------------------------
+
+SHAPES = {
+    "flat": {"category": "project", "tags": ["a"]},
+    "nested": {"metadata": {"category": "project", "tags": ["a"]}},
+    "double": {"metadata": {"metadata": {"category": "project", "tags": ["a"]}}},
+    # seen on 133 prod rows: top-level category, plus a metadata object without one
+    "mixed": {"category": "project", "metadata": {"tags": ["a"]}},
+}
+
+
+def _shape_rows(mem):
+    import uuid
+    ids = {}
+    for name, extra in SHAPES.items():
+        ids[name] = str(uuid.uuid4())
+        _insert_with_id(ids[name], {"data": f"shape {name} q-77", **extra})
+    return ids
+
+
+def test_readers_take_each_metadata_key_from_the_deepest_level(mem):
+    ids = _shape_rows(mem)
+    rows = {r["id"]: r for r in mem.list_rows()}
+    for name, mid in ids.items():
+        assert rows[mid]["metadata"] == {"category": "project", "tags": ["a"]}, name
+    for hit in mem.keyword_search("q-77", 10):
+        assert hit["metadata"]["category"] == "project" and hit["metadata"]["tags"] == ["a"]
+
+
+def test_tag_update_keeps_the_payload_shape_and_category(mem):
+    ids = _shape_rows(mem)
+    for name, mid in ids.items():
+        assert mem.update_tags(mid, ["b"])
+    conn = psycopg2.connect(URL)
+    with conn, conn.cursor() as cur:
+        cur.execute("SELECT id::text, payload FROM mem0 WHERE id::text = ANY(%s)", (list(ids.values()),))
+        payloads = dict(cur.fetchall())
+    conn.close()
+    assert "metadata" not in payloads[ids["flat"]]                      # flat stays flat
+    assert payloads[ids["double"]]["metadata"]["metadata"]["tags"] == ["b"]
+    rows = {r["id"]: r for r in mem.list_rows()}
+    for name, mid in ids.items():
+        assert rows[mid]["metadata"] == {"category": "project", "tags": ["b"]}, name
