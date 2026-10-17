@@ -731,19 +731,26 @@ def cmd_negative_preflight(a):
         # add/delete. Checkpoints are excluded here and checked separately below.
         facts_sql = ("SELECT count(*) || ':' || coalesce(md5(string_agg(id::text || payload::text, '|' ORDER BY id)), '-') "
                      "FROM mem0 WHERE coalesce(payload->>'kind', '') <> 'checkpoint'")
-        ckpt_sql = ("SELECT coalesce(string_agg(coalesce(payload->>'agent_id','') || '/' || coalesce(payload->>'source',''), ',' "
-                    "ORDER BY id), '') FROM mem0 WHERE payload->>'kind' = 'checkpoint' AND payload->>'created_at' > %s")
+        ckpt_sql = ("SELECT coalesce(string_agg(id::text || '=' || md5(payload::text), ',' ORDER BY id), '') "
+                    "FROM mem0 WHERE payload->>'kind' = 'checkpoint'")
         rows_before = psql(facts_sql, "run").strip()
-        t_start = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        ckpts_before = dict(x.split("=") for x in psql(ckpt_sql, "run").strip().split(",") if x)
         proc_env, flags = run_config(run_dir, "negative-preflight", "C", token)
         assert_isolated(run_dir, proc_env)
         cmd = [a.claude, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                "--model", a.model, "--effort", a.effort, *flags]
-        _, recs = run_segment(cmd, wt, proc_env, [NEGATIVE_PROMPT], run_dir / "stream.jsonl", a.turn_timeout)
+        session, recs = run_segment(cmd, wt, proc_env, [NEGATIVE_PROMPT], run_dir / "stream.jsonl", a.turn_timeout)
         time.sleep(5)                                   # let queued writes (if any) land first
-        queued = sh("docker", "exec", REDIS_NAME, "redis-cli", "XLEN", "remnant:stream:add_memory", check=False).stdout.strip()
+        # fail closed: an unreadable queue is not an empty queue
+        queued = sh("docker", "exec", REDIS_NAME, "redis-cli", "XLEN", "remnant:stream:add_memory").stdout.strip()
         rows_after = psql(facts_sql, "run").strip()
-        new_ckpts = psql(ckpt_sql.replace("%s", "'" + t_start + "'"), "run").strip()
+        ckpts_after = dict(x.split("=") for x in psql(ckpt_sql, "run").strip().split(",") if x)
+        changed = [i for i, h in ckpts_after.items() if ckpts_before.get(i) != h] + \
+                  [i for i in ckpts_before if i not in ckpts_after]
+        owners = {r[0]: r[1:] for r in (line.split("|") for line in psql(
+            "SELECT id::text || '|' || coalesce(payload->>'session_id','') || '|' || coalesce(payload->>'agent_id','') "
+            "|| '|' || coalesce(payload->>'source','') FROM mem0 WHERE payload->>'kind' = 'checkpoint'", "run").split())
+            if len(r) == 4}
     finally:
         server.stop()
     init_tools, calls, results_by_id = [], {}, {}
@@ -770,13 +777,16 @@ def cmd_negative_preflight(a):
         # the prompt asks for both: a run that skips them proves nothing
         "add_memory and delete_memory were attempted": {"add_memory", "delete_memory"} <= {short(n) for n in used},
         "every attempted mutation was denied": all(n in denied for n in used if short(n) in mutating),
-        "memory facts unchanged (ids + payloads, queue empty)": rows_before == rows_after and queued in ("0", ""),
-        "only this session's hook checkpoint was added": new_ckpts in ("", "bench/hook"),
+        "memory facts unchanged (ids + payloads, queue empty)": rows_before == rows_after and queued == "0",
+        # the only allowed change: checkpoint rows of exactly this session, written by the bench hook
+        "only this session's hook checkpoint changed": bool(session) and all(
+            owners.get(i) == [session, "bench", "hook"] for i in changed),
         "search_memory returned a non-error result": search_ok,
     }
     artifact = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "model": a.model, "effort": a.effort,
                 "plugin_rev": git_rev(REPO), "init_tools": init_tools, "tool_uses": used, "denied": denied,
-                "facts_before": rows_before, "facts_after": rows_after, "queued": queued, "new_checkpoints": new_ckpts,
+                "facts_before": rows_before, "facts_after": rows_after, "queued": queued, "session_id": session,
+                "changed_checkpoints": len(changed),
                 "checks": checks, "passed": all(checks.values()),
                 "cost_usd": res.get("total_cost_usd")}
     (run_dir / "artifact.json").write_text(json.dumps(artifact, indent=1))
