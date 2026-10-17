@@ -524,6 +524,21 @@ class _NoHistory:
     def close(self): return None
 
 
+def _keep_history_disabled(m) -> None:
+    """mem0's Memory.reset() builds a fresh SQLite history store; put _NoHistory back."""
+    original = m.reset
+
+    def reset(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        finally:
+            fresh, m.db = m.db, _NoHistory()
+            if not isinstance(fresh, _NoHistory):
+                fresh.close()
+
+    m.reset = reset
+
+
 def get_memory() -> Memory:
     # Calls arrive from worker threads (asyncio.to_thread); build the client once.
     global _mem
@@ -533,6 +548,7 @@ def get_memory() -> Memory:
                 m = Memory(config=_build_config())
                 old_db, m.db = m.db, _NoHistory()        # see _NoHistory
                 old_db.close()
+                _keep_history_disabled(m)
                 _cap_embedding_input(m.embedding_model)
                 _mem = m
     return _mem
