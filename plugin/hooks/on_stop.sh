@@ -22,7 +22,8 @@ fi
 # Check if PreCompact ran recently (within 120s). If so, skip the Python
 # backup — it would save post-compaction content, which is less valuable
 # than the pre-compaction snapshot already stored by on_pre_compact.sh.
-FLAG=/tmp/.claude-precompact-flag
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // ""' 2>/dev/null || echo "")
+FLAG="${XDG_CACHE_HOME:-$HOME/.cache}/remnant/precompact-${SESSION_ID//[^A-Za-z0-9_-]/}"
 SKIP_BACKUP=false
 if [ -f "$FLAG" ]; then
   FLAG_AGE=$(( $(date +%s) - $(stat -c %Y "$FLAG" 2>/dev/null || echo 0) ))

@@ -303,9 +303,60 @@ def _population(include_checkpoints: bool = False, states=("active",)) -> str:
     if not include_checkpoints:
         parts.append(_SEARCHABLE)
     return " AND ".join(parts)
+def _project_filter(project: str = "", include_unscoped: bool = True) -> tuple[str, list]:
+    """Optional project scope for search, as (" AND ...", params).
+
+    "" = no filter (the default; existing callers are unchanged). Otherwise memories
+    whose stored `project` equals it, plus — when include_unscoped — memories with
+    no project: shared facts and everything written before provenance existed.
+    `project` is caller-supplied metadata, so this narrows results; it is not
+    access control.
+    """
+    project = (project or "").strip()
+    if not project:
+        return "", []
+    if include_unscoped:
+        return " AND (payload->>'project' = %s OR coalesce(payload->>'project', '') = '')", [project]
+    return " AND payload->>'project' = %s", [project]
+
+
 CHECKPOINT_TTL_DAYS = int(os.environ.get("CHECKPOINT_TTL_DAYS", "7"))
-_META = ("(CASE WHEN jsonb_typeof(payload->'metadata') = 'object' "
-         "THEN payload->'metadata' ELSE payload END)")
+# Metadata (category, tags, ...) appears at three depths: top level (mem0 2.0.2's
+# own writes), payload.metadata and payload.metadata.metadata (older rows / other
+# write paths). Readers take each key's deepest non-null value (JSON null counts as
+# absent, in SQL and in meta_view alike); writers
+# (_meta_target) write into the deepest level that exists. Picking one whole
+# object instead hid top-level categories once a payload.metadata object existed.
+def _meta_key(key: str, as_text: bool = True) -> str:
+    if as_text:                               # ->> already turns JSON null into SQL NULL
+        return (f"coalesce(payload->'metadata'->'metadata'->>'{key}', "
+                f"payload->'metadata'->>'{key}', payload->>'{key}')")
+    levels = (f"payload->'metadata'->'metadata'->'{key}'", f"payload->'metadata'->'{key}'", f"payload->'{key}'")
+    return "coalesce(" + ", ".join(f"nullif({x}, 'null'::jsonb)" for x in levels) + ")"
+
+
+def meta_view(payload: dict) -> dict:
+    """Python twin of the SQL readers: each key's deepest non-null value."""
+    meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    inner = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {}
+    view: dict = {}
+    for level in (payload, meta, inner):
+        view.update({k: v for k, v in level.items() if v is not None})
+    return view
+
+
+_META_CATEGORY = _meta_key("category")
+_META_TAGS = (f"(CASE WHEN jsonb_typeof({_meta_key('tags', False)}) = 'array' "
+              f"THEN {_meta_key('tags', False)} END)")
+
+
+def _meta_target(payload: dict) -> dict:
+    """The dict a metadata write goes into: the deepest level that already exists.
+    Never creates payload.metadata on a flat payload."""
+    meta = payload.get("metadata")
+    if isinstance(meta, dict):
+        return meta["metadata"] if isinstance(meta.get("metadata"), dict) else meta
+    return payload
 
 
 def _row_to_result(row: dict) -> dict:
@@ -335,8 +386,8 @@ def list_rows(agent_id: str = "", state: str = "", states=None, include_checkpoi
     MCP get_all_memories passes the default eligibility instead."""
     sql = (f"SELECT id, payload->>'data' AS memory, payload->>'agent_id' AS agent_id, "
            f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
-           f"{_META}->>'category' AS category, "
-           f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
+           f"{_META_CATEGORY} AS category, "
+           f"{_META_TAGS} AS tags, "
            f"payload->>'state' AS state, payload->>'source' AS source, "
            f"payload->>'review_reason' AS review_reason, payload->>'project' AS project, "
                 f"payload->>'superseded_by' AS superseded_by, "
@@ -376,12 +427,11 @@ def stats() -> dict:
             cur.execute(f"SELECT coalesce(nullif(payload->>'agent_id', ''), 'unknown'), count(*) "
                         f"FROM {_MEM_TABLE} {where} GROUP BY 1", p)
             by_agent = dict(cur.fetchall())
-            cur.execute(f"SELECT coalesce(nullif({_META}->>'category', ''), 'uncategorized'), count(*) "
+            cur.execute(f"SELECT coalesce(nullif({_META_CATEGORY}, ''), 'uncategorized'), count(*) "
                         f"FROM {_MEM_TABLE} {where} GROUP BY 1", p)
             by_category = dict(cur.fetchall())
             cur.execute(f"SELECT t, count(*) FROM {_MEM_TABLE}, "
-                        f"jsonb_array_elements_text(CASE WHEN jsonb_typeof({_META}->'tags') = 'array' "
-                        f"THEN {_META}->'tags' ELSE '[]'::jsonb END) AS t {where} GROUP BY 1", p)
+                        f"jsonb_array_elements_text(coalesce({_META_TAGS}, '[]'::jsonb)) AS t {where} GROUP BY 1", p)
             by_tag = dict(cur.fetchall())
     except psycopg2.errors.UndefinedTable:
         return {"total": 0, "first_added": None, "last_added": None,
@@ -667,19 +717,20 @@ def _has_fts_column() -> bool:
 
 
 def keyword_search(query: str, limit: int = _CANDIDATES, include_checkpoints: bool = False,
-                   states=("active",)) -> list[dict]:
+                   states=("active",), project: str = "", include_unscoped: bool = True) -> list[dict]:
     try:
-        return _keyword_search(query, limit, include_checkpoints, states)
+        return _keyword_search(query, limit, include_checkpoints, states, project, include_unscoped)
     except psycopg2.errors.UndefinedColumn:
         ensure_fts_index()          # table was created after startup
-        return _keyword_search(query, limit, include_checkpoints, states)
+        return _keyword_search(query, limit, include_checkpoints, states, project, include_unscoped)
 
 
 def _like(term: str) -> str:
     return "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
-def _keyword_search(query: str, limit: int, include_checkpoints: bool = False, states=("active",)) -> list[dict]:
+def _keyword_search(query: str, limit: int, include_checkpoints: bool = False, states=("active",),
+                    project: str = "", include_unscoped: bool = True) -> list[dict]:
     """Full-text search weighted by term rarity (BM25 idf, no term frequency).
 
     Each query term that occurs in a memory adds its idf, so one rare
@@ -699,8 +750,10 @@ def _keyword_search(query: str, limit: int, include_checkpoints: bool = False, s
             sql, params = f"({sql} OR payload->>'data' ILIKE %s)", [term, _like(term)]
         return sql, params
 
-    # same population for the idf statistics and the results
-    user = "payload->>'user_id' = %s AND " + _population(include_checkpoints, states)
+    # same population (incl. the project scope) for the idf statistics and the results
+    scope_sql, scope_params = _project_filter(project, include_unscoped)
+    user = "payload->>'user_id' = %s AND " + _population(include_checkpoints, states) + scope_sql
+    user_params = [settings.mem0_user_id] + scope_params
     conn = _db_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -708,7 +761,7 @@ def _keyword_search(query: str, limit: int, include_checkpoints: bool = False, s
             # unique aliases: RealDictCursor keeps one value per column name
             counts = ", ".join(f"count(*) FILTER (WHERE {c}) AS df{i}" for i, (c, _) in enumerate(conds))
             cur.execute(f"SELECT count(*) AS n, {counts} FROM {_MEM_TABLE} WHERE {user}",
-                        [p for _, ps in conds for p in ps] + [settings.mem0_user_id])
+                        [p for _, ps in conds for p in ps] + user_params)
             row = cur.fetchone()
             n, dfs = row["n"], [row[f"df{i}"] for i in range(len(conds))]
             weighted = [(c, df) for c, df in zip(conds, dfs) if df]
@@ -725,15 +778,15 @@ def _keyword_search(query: str, limit: int, include_checkpoints: bool = False, s
             cur.execute(
                 f"SELECT id, payload->>'data' AS memory, payload->>'agent_id' AS agent_id, "
                 f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
-                f"{_META}->>'category' AS category, "
-                f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
+                f"{_META_CATEGORY} AS category, "
+                f"{_META_TAGS} AS tags, "
                 f"payload->>'state' AS state, payload->>'source' AS source, "
                 f"payload->>'review_reason' AS review_reason, payload->>'project' AS project, "
                 f"payload->>'superseded_by' AS superseded_by, "
                 f"({' + '.join(score_sql)}) AS rank "
                 f"FROM {_MEM_TABLE} WHERE {user} AND ({any_sql}) "
                 f"ORDER BY rank DESC, length(payload->>'data') ASC LIMIT %s",
-                score_params + [settings.mem0_user_id] + any_params + [limit])
+                score_params + user_params + any_params + [limit])
             rows = cur.fetchall()
     except psycopg2.errors.UndefinedTable:
         return []
@@ -747,17 +800,20 @@ def _keyword_search(query: str, limit: int, include_checkpoints: bool = False, s
     return out
 
 
-def hybrid_search(query: str, limit: int = 5, include_checkpoints: bool = False, states=("active",)) -> list[dict]:
+def hybrid_search(query: str, limit: int = 5, include_checkpoints: bool = False, states=("active",),
+                  project: str = "", include_unscoped: bool = True) -> list[dict]:
     """Merge keyword and vector results with reciprocal rank fusion.
 
     score is the fused score scaled to 0..1 (1.0 = ranked first by both).
     vector_score is the cosine similarity when the vector side found the item.
     If the vector side fails (Ollama offline), keyword results are returned alone.
+    The optional project scope is applied inside both sides, before their limits.
     """
     pool = max(_CANDIDATES, limit)
-    keyword = keyword_search(query, pool, include_checkpoints, states)
+    keyword = keyword_search(query, pool, include_checkpoints, states, project, include_unscoped)
     try:
-        vector = search(query, limit=pool, include_checkpoints=include_checkpoints, states=states)
+        vector = search(query, limit=pool, include_checkpoints=include_checkpoints, states=states,
+                        project=project, include_unscoped=include_unscoped)
     except Exception as e:
         logger.warning("Vector search unavailable (%s); keyword results only", type(e).__name__)
         vector = []
@@ -787,7 +843,7 @@ def hybrid_search(query: str, limit: int = 5, include_checkpoints: bool = False,
 
 
 def search(query: str, limit: int = 5, agent_id: str = "", include_checkpoints: bool = False,
-           states=("active",)) -> list[dict]:
+           states=("active",), project: str = "", include_unscoped: bool = True) -> list[dict]:
     """Vector search: cosine similarity over the stored embeddings.
 
     Deliberately not mem0's Memory.search(): with mem0ai 2.0.2 its fused
@@ -797,22 +853,23 @@ def search(query: str, limit: int = 5, agent_id: str = "", include_checkpoints: 
     used when memories were written.
     """
     embedding = get_memory().embedding_model.embed(query, "search")
+    scope_sql, scope_params = _project_filter(project, include_unscoped)
     sql = (f"SELECT id, payload->>'data' AS memory, payload->>'agent_id' AS agent_id, "
            f"payload->>'created_at' AS created_at, payload->>'updated_at' AS updated_at, "
-           f"{_META}->>'category' AS category, "
-           f"CASE WHEN jsonb_typeof({_META}->'tags') = 'array' THEN {_META}->'tags' END AS tags, "
+           f"{_META_CATEGORY} AS category, "
+           f"{_META_TAGS} AS tags, "
            f"payload->>'state' AS state, payload->>'source' AS source, "
                 f"payload->>'review_reason' AS review_reason, payload->>'project' AS project, "
                 f"payload->>'superseded_by' AS superseded_by, "
            f"1 - (vector <=> %s::vector) AS score "
            f"FROM {_MEM_TABLE} WHERE payload->>'user_id' = %s "
-           + f"AND {_population(include_checkpoints, states)} " +
+           + f"AND {_population(include_checkpoints, states)}{scope_sql} " +
            f"ORDER BY vector <=> %s::vector LIMIT %s")
     vec = str(list(embedding))
     conn = _db_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, [vec, settings.mem0_user_id, vec, limit])
+            cur.execute(sql, [vec, settings.mem0_user_id, *scope_params, vec, limit])
             rows = cur.fetchall()
     except psycopg2.errors.UndefinedTable:
         return []
@@ -824,17 +881,6 @@ def search(query: str, limit: int = 5, agent_id: str = "", include_checkpoints: 
         item["score"] = round(float(r["score"]), 4)
         out.append(item)
     return out
-
-
-def get_all(agent_id: str = "") -> list[dict]:
-    m = get_memory()
-    filters = {"user_id": settings.mem0_user_id}
-    if agent_id:
-        filters["agent_id"] = agent_id
-    result = m.get_all(filters=filters, top_k=10000)
-    if isinstance(result, dict) and "results" in result:
-        return result["results"]
-    return result if isinstance(result, list) else []
 
 
 def save_checkpoint(session_id: str, content: str, agent_id: str = "", project: str = "",
@@ -927,9 +973,9 @@ def get_memory_detail(memory_id: str) -> Optional[dict]:
     p = row["payload"]
     keys = ("state", "superseded_by", "supersedes_ids", "supersede_reason", "superseded_at", "source",
             "project", "agent_id", "created_at", "kind", "review_reason", "reviewed_by")
-    nested = p.get("metadata") if isinstance(p.get("metadata"), dict) else {}
-    category = nested.get("category") or p.get("category") or ""
-    tags = nested.get("tags") if isinstance(nested.get("tags"), list) else p.get("tags")
+    view = meta_view(p)
+    category = view.get("category") or ""
+    tags = view.get("tags")
     return {"id": str(row["id"]), "memory": p.get("data", ""), "hash": content_hash(p.get("data", "")),
             **{k: p.get(k) for k in keys if p.get(k) is not None}, "state": p.get("state") or "active",
             "category": category, "tags": tags if isinstance(tags, list) else []}
@@ -1213,12 +1259,7 @@ def update_tags(memory_id: str, tags: list) -> bool:
                 if not row:
                     return False
                 payload = row[0]
-                meta = payload.get("metadata") or {}
-                if isinstance(meta.get("metadata"), dict):
-                    meta["metadata"]["tags"] = tags
-                else:
-                    meta["tags"] = tags
-                payload["metadata"] = meta
+                _meta_target(payload)["tags"] = tags
                 cur.execute(
                     "UPDATE mem0 SET payload = %s WHERE id = %s",
                     (json.dumps(payload), memory_id),

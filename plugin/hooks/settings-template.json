@@ -5,14 +5,26 @@
     "REMNANT_PLUGIN_DIR": "/path/to/remnant/plugin"
   },
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${REMNANT_PLUGIN_DIR}/hooks/on_session_start.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "${REMNANT_PLUGIN_DIR}/hooks/search-memory.sh",
-            "statusMessage": "Searching memory...",
-            "timeout": 10
+            "command": "${REMNANT_PLUGIN_DIR}/hooks/on_user_prompt.sh",
+            "timeout": 10,
+            "statusMessage": "Searching memory..."
           }
         ]
       }
@@ -22,9 +34,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${REMNANT_PLUGIN_DIR}/hooks/save-context.sh",
-            "statusMessage": "Preparing memory save...",
-            "timeout": 15
+            "command": "${REMNANT_PLUGIN_DIR}/hooks/on_pre_compact.sh",
+            "timeout": 30,
+            "statusMessage": "Saving session checkpoint..."
           }
         ]
       }
@@ -34,7 +46,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${REMNANT_PLUGIN_DIR}/hooks/save-context.sh",
+            "command": "${REMNANT_PLUGIN_DIR}/hooks/on_stop.sh",
             "timeout": 15
           }
         ]

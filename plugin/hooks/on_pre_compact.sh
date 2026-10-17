@@ -15,7 +15,11 @@ INPUT=$(cat)
 
 # Write flag so the Stop hook knows a compaction just happened and skips
 # its own backup (which would save post-compaction content instead).
-touch /tmp/.claude-precompact-flag
+# Per session: a global flag let one session's compaction suppress another's backup.
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // ""' 2>/dev/null || echo "")
+FLAG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/remnant"
+mkdir -p -m 700 "$FLAG_DIR" 2>/dev/null || true
+touch "$FLAG_DIR/precompact-${SESSION_ID//[^A-Za-z0-9_-]/}" 2>/dev/null || true
 
 # Save transcript state synchronously BEFORE compaction starts.
 # Running without & ensures the save completes before the hook exits

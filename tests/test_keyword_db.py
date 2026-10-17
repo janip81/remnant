@@ -702,3 +702,114 @@ def test_original_paused_after_pending_row_cannot_overwrite_retry(mem, monkeypat
     assert holder["retry"]["ok"] and not original["ok"]
     states, res = _states(key)
     assert states.get("active") == 1 and res["id"] == holder["retry"]["id"]
+
+
+# --- project scope (search_memory project=...) -------------------------------------
+
+def _scoped_corpus(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    for text, extra in (("alpha owns port-7443 here", {"project": "alpha"}),
+                        ("beta owns port-7443 too", {"project": "beta"}),
+                        ("shared port-7443 note", {}),
+                        ("empty-project port-7443 note", {"project": ""}),
+                        ("old alpha port-7443 fact", {"project": "alpha", "state": "superseded"})):
+        _insert(text, extra)
+
+
+def test_project_scope_in_keyword_and_vector_paths(mem, monkeypatch):
+    _scoped_corpus(mem, monkeypatch)
+    for fn in (lambda **kw: mem.keyword_search("port-7443", 50, **kw),
+               lambda **kw: mem.search("port-7443", limit=50, **kw)):
+        everything = texts(fn())
+        assert {"alpha owns port-7443 here", "beta owns port-7443 too", "shared port-7443 note"} <= set(everything)
+        scoped = set(texts(fn(project="alpha")))
+        assert "alpha owns port-7443 here" in scoped and "beta owns port-7443 too" not in scoped
+        assert {"shared port-7443 note", "empty-project port-7443 note"} <= scoped      # unscoped = shared
+        only = set(texts(fn(project="alpha", include_unscoped=False)))
+        assert only == {"alpha owns port-7443 here"}                                   # history still excluded
+        assert "old alpha port-7443 fact" in texts(fn(project="alpha", include_unscoped=False,
+                                                      states=("active", "superseded")))
+        assert texts(fn(project="  ")) == everything                                   # blank = no filter
+
+
+def test_project_scope_applies_before_the_limit(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    for i in range(30):
+        _insert(f"beta noise port-9999 #{i}", {"project": "beta"})
+    _insert("alpha needle port-9999", {"project": "alpha"})
+    for fn in (lambda **kw: mem.keyword_search("port-9999", 5, **kw),
+               lambda **kw: mem.search("port-9999", limit=5, **kw)):
+        assert texts(fn(project="alpha", include_unscoped=False)) == ["alpha needle port-9999"]
+
+
+def test_project_scope_keyword_only_when_embeddings_fail(mem, monkeypatch):
+    _scoped_corpus(mem, monkeypatch)
+
+    class Down:
+        class embedding_model:
+            @staticmethod
+            def embed(*a):
+                raise ConnectionError("ollama offline")
+    monkeypatch.setattr(mem, "get_memory", lambda: Down())
+    hits = mem.hybrid_search("port-7443", 10, project="beta", include_unscoped=False)
+    assert [h["memory"] for h in hits] == ["beta owns port-7443 too"] and hits[0]["match"] == "keyword"
+
+
+def test_project_value_is_a_parameter_not_sql(mem, monkeypatch):
+    _scoped_corpus(mem, monkeypatch)
+    evil = "alpha' OR '1'='1"
+    assert mem.keyword_search("port-7443", 50, project=evil, include_unscoped=False) == []
+    assert mem.search("port-7443", limit=50, project=evil, include_unscoped=False) == []
+
+
+# --- metadata at three depths ---------------------------------------------------------
+
+SHAPES = {
+    "flat": {"category": "project", "tags": ["a"]},
+    "nested": {"metadata": {"category": "project", "tags": ["a"]}},
+    "double": {"metadata": {"metadata": {"category": "project", "tags": ["a"]}}},
+    # seen on 133 prod rows: top-level category, plus a metadata object without one
+    "mixed": {"category": "project", "metadata": {"tags": ["a"]}},
+    # explicit JSON null deeper down counts as absent, in SQL and Python alike
+    "nulls": {"category": "project", "tags": ["a"], "metadata": {"category": None, "tags": None,
+                                                                "metadata": {"tags": None}}},
+    "junk-meta": {"category": "project", "tags": ["a"], "metadata": "not an object"},
+    "list-meta": {"category": "project", "tags": ["a"], "metadata": ["x"]},
+}
+
+
+def _shape_rows(mem):
+    import uuid
+    ids = {}
+    for name, extra in SHAPES.items():
+        ids[name] = str(uuid.uuid4())
+        _insert_with_id(ids[name], {"data": f"shape {name} q-77", **extra})
+    return ids
+
+
+def test_readers_take_each_metadata_key_from_the_deepest_level(mem):
+    ids = _shape_rows(mem)
+    rows = {r["id"]: r for r in mem.list_rows()}
+    for name, mid in ids.items():
+        assert rows[mid]["metadata"] == {"category": "project", "tags": ["a"]}, name
+        detail = mem.get_memory_detail(mid)                                  # detail == list == search
+        assert (detail["category"], detail["tags"]) == ("project", ["a"]), name
+    for hit in mem.keyword_search("q-77", 10):
+        assert hit["metadata"]["category"] == "project" and hit["metadata"]["tags"] == ["a"]
+
+
+def test_tag_update_keeps_the_payload_shape_and_category(mem):
+    ids = _shape_rows(mem)
+    for name, mid in ids.items():
+        assert mem.update_tags(mid, ["b"])
+    conn = psycopg2.connect(URL)
+    with conn, conn.cursor() as cur:
+        cur.execute("SELECT id::text, payload FROM mem0 WHERE id::text = ANY(%s)", (list(ids.values()),))
+        payloads = dict(cur.fetchall())
+    conn.close()
+    assert "metadata" not in payloads[ids["flat"]]                      # flat stays flat
+    assert payloads[ids["junk-meta"]]["metadata"] == "not an object" and payloads[ids["junk-meta"]]["tags"] == ["b"]
+    assert payloads[ids["double"]]["metadata"]["metadata"]["tags"] == ["b"]
+    rows = {r["id"]: r for r in mem.list_rows()}
+    for name, mid in ids.items():
+        assert rows[mid]["metadata"] == {"category": "project", "tags": ["b"]}, name

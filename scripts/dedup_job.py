@@ -191,34 +191,35 @@ def delete_rows(cur: psycopg2.extensions.cursor, row_ids: list[uuid.UUID]) -> No
 # ---------------------------------------------------------------------------
 
 def _extract_meta(payload: dict) -> dict:
-    meta = payload.get("metadata") or {}
-    inner = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else None
-    return inner if inner is not None else meta
+    """Metadata view: each key's deepest non-null value (top level, payload.metadata,
+    payload.metadata.metadata), as src/memory.py's readers (meta_view) do."""
+    meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    inner = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {}
+    view: dict = {}
+    for level in (payload, meta, inner):
+        view.update({k: v for k, v in level.items() if v is not None})
+    return view
+
+
+def _meta_target(payload: dict) -> dict:
+    """Deepest existing metadata level; never creates payload.metadata on a flat payload."""
+    meta = payload.get("metadata")
+    if isinstance(meta, dict):
+        return meta["metadata"] if isinstance(meta.get("metadata"), dict) else meta
+    return payload
 
 
 def _set_tags_in_payload(payload: dict, tags: list[str]) -> dict:
-    meta = payload.get("metadata") or {}
-    if isinstance(meta.get("metadata"), dict):
-        meta["metadata"]["tags"] = tags
-    else:
-        meta["tags"] = tags
-    payload["metadata"] = meta
+    _meta_target(payload)["tags"] = tags
     return payload
 
 
 def _merge_tags_and_mark_reviewed(payload: dict, new_tags: list[str]) -> dict:
-    """Merge new_tags with any existing tags and set llm_reviewed=True."""
-    meta = payload.get("metadata") or {}
-    if isinstance(meta.get("metadata"), dict):
-        inner = meta["metadata"]
-        existing = inner.get("tags") or []
-        inner["tags"] = sorted(set(existing) | set(new_tags))
-        inner["llm_reviewed"] = True
-    else:
-        existing = meta.get("tags") or []
-        meta["tags"] = sorted(set(existing) | set(new_tags))
-        meta["llm_reviewed"] = True
-    payload["metadata"] = meta
+    """Merge new_tags with the existing tags (as readers see them) and set llm_reviewed=True."""
+    existing = _extract_meta(payload).get("tags")
+    target = _meta_target(payload)
+    target["tags"] = sorted(set(existing if isinstance(existing, list) else []) | set(new_tags))
+    target["llm_reviewed"] = True
     return payload
 
 

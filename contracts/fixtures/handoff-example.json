@@ -1,0 +1,13 @@
+{"schema": "remnant.handoff/1", "task_id": "example-1234", "from_agent": "claude", "to_agent": "codex",
+ "created_at": "2026-10-16T17:00:00+00:00", "state": "open",
+ "goal": "Make the nightly export job retry on transient S3 errors",
+ "repo": {"path": "/srv/example", "branch": "feat/export-retry", "commit": "0123456789abcdef"},
+ "done": ["Reproduced the failure with a fake S3 returning 503"],
+ "next": ["Add bounded exponential backoff around upload()", "Run tests/test_export.py"],
+ "constraints": ["Do not change the export file format"],
+ "open_questions": ["Is 5 attempts enough for the observed outage length?"],
+ "evidence": [{"kind": "file", "ref": "logs/export-2026-10-15.log:L120"}],
+ "hypotheses": [
+   {"text": "The job fails because credentials expire", "status": "refuted",
+    "evidence": [{"kind": "tool_output", "ref": "credentials valid until 2027"}]},
+   {"text": "503s come from the storage gateway, not the bucket", "status": "untested"}]}

@@ -152,3 +152,126 @@ def test_session_start_resume_and_compact_render(tmp_path):
             assert title in r.stdout and "was fixing pg" in r.stdout and "memory hit" in r.stdout
     finally:
         srv.shutdown()
+
+
+# --- benchmark policies and instrumentation (scripts/bench/) ---------------------
+
+import io
+import json
+import subprocess
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+HIT = {"id": "aaaaaaaa-1111", "memory": "pg-main-rw listens on 192.168.101.11", "state": "active"}
+
+
+def run_prompt_hook(h, monkeypatch, capsys, tmp_path, prompt, policy="", hits=(HIT,), cwd="/x/k8s-gitops"):
+    log = tmp_path / "bench.jsonl"
+    monkeypatch.setenv("REMNANT_BENCH_LOG", str(log))
+    monkeypatch.setenv("REMNANT_INJECT_POLICY", policy)
+    monkeypatch.setenv("REMNANT_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("REMNANT_TOKEN", "t")
+    calls = []
+    monkeypatch.setattr(h, "search", lambda url, tok, q, limit=10: calls.append((q, limit)) or list(hits))
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"prompt": prompt, "session_id": "s1", "cwd": cwd})))
+    h.main()
+    events = [json.loads(line) for line in log.read_text().splitlines()]
+    return capsys.readouterr().out, calls, events[-1]
+
+
+def test_policy_off_searches_nothing_but_logs(tmp_path, monkeypatch, capsys):
+    h = load_prompt_hook(tmp_path, monkeypatch)
+    out, calls, ev = run_prompt_hook(h, monkeypatch, capsys, tmp_path, "why is pg-main-rw down again today", "off")
+    assert out == "" and calls == [] and ev["reason"] == "policy-off" and ev["policy"] == "off"
+
+
+def test_policy_broad_is_prefixed_top3_without_gate(tmp_path, monkeypatch, capsys):
+    h = load_prompt_hook(tmp_path, monkeypatch)
+    out, calls, ev = run_prompt_hook(h, monkeypatch, capsys, tmp_path, "how is the database doing these days", "broad")
+    assert calls == [("k8s-gitops how is the database doing these days", 3)]
+    assert "pg-main-rw listens" in out and ev["reason"] == "injected" and ev["injected_count"] == 1
+
+
+def test_default_and_selective_keep_the_gate(tmp_path, monkeypatch, capsys):
+    h = load_prompt_hook(tmp_path, monkeypatch)
+    for policy in ("", "selective"):
+        out, calls, ev = run_prompt_hook(h, monkeypatch, capsys, tmp_path, "how is the database doing these days", policy)
+        assert out == "" and calls == [] and ev["reason"] == "no-identifier"
+    out, _, ev = run_prompt_hook(h, monkeypatch, capsys, tmp_path, "why is pg-main-rw refusing connections")
+    assert "matches pg-main-rw" in out and ev["policy"] == "default"
+    assert ev["injected_chars"] == len(out.strip()) and ev["lookup_ms"] is not None
+
+
+def test_log_never_contains_prompt_or_memory_text(tmp_path, monkeypatch, capsys):
+    h = load_prompt_hook(tmp_path, monkeypatch)
+    run_prompt_hook(h, monkeypatch, capsys, tmp_path, "why is pg-main-rw refusing connections")
+    raw = (tmp_path / "bench.jsonl").read_text()
+    assert "refusing" not in raw and "listens" not in raw and "prompt_hash" in raw
+
+
+def test_no_log_without_bench_env(tmp_path, monkeypatch, capsys):
+    h = load_prompt_hook(tmp_path, monkeypatch)
+    monkeypatch.delenv("REMNANT_BENCH_LOG", raising=False)
+    h.bench_log.log("x", a=1)
+    assert not list(tmp_path.glob("*.jsonl"))
+
+
+class FakeRemnant(BaseHTTPRequestHandler):
+    calls: list = []
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        name = body["params"]["name"]
+        FakeRemnant.calls.append(name)
+        text = "checkpoint: was fixing pg" if name == "get_checkpoint" else "1. broad memory hit"
+        data = json.dumps({"result": {"content": [{"text": text}]}})
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(f"data: {data}\n\n".encode())
+
+    def log_message(self, *a):
+        pass
+
+
+def run_session_start(tmp_path, source, policy):
+    srv = HTTPServer(("127.0.0.1", 0), FakeRemnant)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    FakeRemnant.calls = []
+    log = tmp_path / f"ss-{source}-{policy}.jsonl"
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path),
+           "REMNANT_URL": f"http://127.0.0.1:{srv.server_port}", "REMNANT_TOKEN": "t",
+           "REMNANT_INJECT_POLICY": policy, "REMNANT_BENCH_LOG": str(log)}
+    out = subprocess.run(["bash", str(HOOK.parent / "on_session_start.sh")], env=env, capture_output=True, text=True,
+                         input=json.dumps({"source": source, "session_id": "s1", "cwd": "/x/k8s-gitops"})).stdout
+    srv.shutdown()
+    return out, list(FakeRemnant.calls), json.loads(log.read_text().splitlines()[-1])
+
+
+def test_session_start_policies(tmp_path):
+    for source in ("resume", "compact"):
+        for policy in ("", "broad"):
+            out, calls, ev = run_session_start(tmp_path, source, policy)
+            assert calls == ["get_checkpoint", "search_memory"] and "broad memory hit" in out
+            assert ev["searched"] == 1 and ev["source"] == source
+        for policy in ("off", "selective"):
+            out, calls, ev = run_session_start(tmp_path, source, policy)
+            assert calls == ["get_checkpoint"] and "was fixing pg" in out           # checkpoint always restored
+            assert "broad memory hit" not in out and "retrieved directly" not in out
+            assert ev["searched"] == 0 and ev["checkpoint_chars"] > 0 and ev["injected_chars"] == 0
+    out, calls, ev = run_session_start(tmp_path, "startup", "off")
+    assert calls == [] and "Session Bootstrap" in out and ev["source"] == "startup"
+
+
+def test_precompact_flag_is_per_session(tmp_path):
+    """A compaction in one session must not suppress another session's Stop backup."""
+    import json, subprocess
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "XDG_CACHE_HOME": str(tmp_path)}
+    hooks = HOOK.parent
+    subprocess.run(["bash", str(hooks / "on_pre_compact.sh")], env=env, text=True, capture_output=True,
+                   input=json.dumps({"session_id": "sess-a"}))
+    flags = sorted(p.name for p in (tmp_path / "remnant").glob("precompact-*"))
+    assert flags == ["precompact-sess-a"]
+    assert not os.path.exists("/tmp/.claude-precompact-flag") or \
+        os.path.getmtime("/tmp/.claude-precompact-flag") < time.time() - 5     # global flag no longer written

@@ -38,3 +38,44 @@ scripts/imported.json
 
 # Personal research notes — not part of public repo
 RESEARCH.md
+
+# Local agent discussions — not part of public repo
+/docs/discussions/
+
+# Local session history and working reviews (not public project documentation)
+/memory/
+/REVIEW.md
+/REVIEW-*.md
+
+# Environment variants; keep distributable templates
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# Database snapshots / local persistence
+*.dump
+*.sql.gz
+*.sql.zst
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Local benchmark corpora, model transcripts and generated results
+/bench-local/
+/bench-results/
+/bench-artifacts/
+/scripts/bench/local/
+/scripts/bench/results/
+/scripts/bench/artifacts/
+/stream.jsonl
+/answers/
+
+# Local test/tool caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/

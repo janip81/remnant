@@ -1,349 +1,189 @@
-# remnant
+# Remnant
 
-> **Personal project.** I built this for myself to explore what's possible with self-hosted LLM memory for Claude Code. It works well for my use case but comes with no guarantees — no warranty, no support commitment, no SLA. Use it, fork it, adapt it.
+**Built almost entirely by AI agents, for AI agents—with human direction.**
+I supplied the idea and direction, then wanted to see how far AI agents could
+build it themselves. Claude Code and Codex have done most of the design,
+implementation, review, and iteration on the memory system they use. Remnant is
+an ongoing experiment in AI-led development, built on Mem0 and other open-source
+projects—not a claim that I wrote every component or that AI-generated code is
+automatically correct.
 
-Self-hosted MCP memory server for Claude Code. Stores facts in PostgreSQL + pgvector, retrieves them via semantic search using Ollama embeddings. No external API calls — fully self-hosted.
+Remnant is a self-hosted MCP memory service for coding agents. It stores durable
+knowledge in PostgreSQL + pgvector, combines semantic and keyword retrieval, and
+keeps temporary session checkpoints separate from long-term facts. Embeddings
+and optional LLM processing run through Ollama; the memory service can operate
+without an external AI API. Your connected coding agents use their own providers.
+
+Personal project: use it, fork it, adapt it. No warranty, support commitment or SLA.
+This README describes the current source; deployed images may differ.
+
+## Built on Mem0 and open source
+
+**Remnant builds on [Mem0](https://github.com/mem0ai/mem0), rather than building
+its entire memory engine from scratch.** The `mem0ai` library provides memory
+writes, embedding-provider integration, pgvector storage integration, optional
+LLM fact extraction, and deletion. Thank you to the Mem0 maintainers and contributors.
+
+Remnant adds its own hybrid retrieval pipeline (direct PostgreSQL keyword/vector
+queries and rank fusion, rather than Mem0's `Memory.search()`), lifecycle and
+review flows, session checkpoints, agent hooks, Redis processing, management UI,
+and deployment tooling. It also relies on PostgreSQL/pgvector, Ollama, the MCP
+Python SDK, and other open-source libraries. See [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)
+for acknowledgments and license information.
+
+## What it does
+
+- **Hybrid retrieval:** PostgreSQL full-text/identifier matching and pgvector
+  cosine similarity, combined with weighted reciprocal rank fusion. Keyword
+  retrieval remains available when the embedding service is unavailable.
+- **Durable facts:** stores text as written by default, with best-effort secret
+  redaction, tags, source, agent, project and session metadata. Optional extraction
+  output is held as a review candidate when identified as an extraction source.
+- **Memory lifecycle:** active/candidate/history views, linked superseding instead
+  of silent in-place text replacement, and reviewable LLM merge proposals.
+- **Session recovery:** one replaceable checkpoint per session, retrieved by exact
+  ID and excluded from ordinary memory search. Default expiry is seven days;
+  scheduled maintenance removes expired checkpoints.
+- **Agent integration:** MCP tools for clients such as Claude Code and Codex.
+  Included lifecycle hooks target Claude Code; the separate Codex integration
+  currently lives outside this repository and is not installed by this checkout.
+- **Operations:** React management UI, optional Redis write queue, maintenance
+  job, metrics, Docker Compose and Kubernetes deployment options.
+
+Project metadata is attribution, not enforced project-level access isolation:
+`search_memory(project=...)` narrows results (memories of that project plus, by
+default, those without one) but does not restrict who can read what.
+Retrieved memories are historical evidence to verify, not instructions or proof
+of current infrastructure state. Ranking scores are not confidence probabilities.
 
 ## Architecture
 
-```
-Claude Code  ──HTTP/MCP──►  remnant (MCP server)  ──►  pgvector (CNPG)
-                                    │         │
-                                    │         └──►  Redis queue (optional)
-                                    │                      │
-                                    │              background worker
-                                    │
-                                    ├──►  Ollama (nomic-embed-text embeddings)
-                                    └──►  Ollama (qwen2.5:7b — tagging/dedup)
-
-Browser  ────────────────►  remnant-ui (memory browser)
+```text
+Coding agents -- MCP --> Remnant --> PostgreSQL + pgvector
+                            |-- Ollama: embeddings / optional LLM processing
+                            `-- Redis: optional queued writes, in-process worker
+Browser --> Remnant UI --> Remnant API
+Scheduled maintenance --> tagging, duplicate handling, checkpoint expiry
 ```
 
-**Three components:**
+No graph database is required. Automatic contradiction resolution, structured
+incident episodes and cross-agent task handoffs are discussion topics, not
+completed features. No measured overall token savings or task-success advantage
+is claimed; earlier retrieval experiments are not a general benchmark.
 
-| Component | Image | Purpose |
-|-----------|-------|---------|
-| MCP server | `ghcr.io/janip81/remnant` | MCP endpoint, memory storage/search |
-| UI | `ghcr.io/janip81/remnant-ui` | React browser for viewing/editing memories |
-| Dedup CronJob | `ghcr.io/janip81/remnant` | Nightly dedup + LLM tagging (03:30 daily) |
+## Quick start
 
----
-
-## How memories work
-
-**At write time:**
-
-1. `add_memory(content)` is called (by Claude Code hook or directly). Content is stored as written; credentials are redacted first. `infer=true` (or `MEM0_INFER=true`) asks the LLM to extract facts instead, with the raw text as fallback when extraction yields nothing
-2. Content is embedded via Ollama (`nomic-embed-text`) and stored in pgvector
-3. Keyword tag rules are applied immediately (fast, synchronous)
-
-**At search time** (`search_memory`, UI search) — hybrid:
-
-- **Meaning**: cosine similarity over the embeddings (pgvector, HNSW). Remnant queries pgvector directly; mem0 2.0.2's own `Memory.search()` ranked poorly on this data
-- **Exact terms**: Postgres full-text search (`simple` config, no stemming, stored `fts` column + GIN index), weighted by term rarity (BM25 idf). Identifier-like terms (`pg-main-rw`, `0.2.6`, `project_worklog`) also match as substrings
-- Both lists are merged with reciprocal rank fusion. Keyword hits count fully when the query contains identifier-like terms, at `SEARCH_KEYWORD_WEIGHT_PLAIN` (default 0.3) otherwise. `score` is the fused 0..1 score; `vector_score` is the cosine similarity
-- If Ollama is offline, search returns keyword results instead of failing
-
-**Session checkpoints** — the hooks' working-state snapshots are stored as one replaceable checkpoint per Claude/Codex session (`save_checkpoint` / `get_checkpoint`), excluded from `search_memory` unless `include_sessions=true`, restored by exact `session_id` after resume/compaction, and expired after `CHECKPOINT_TTL_DAYS` (7) by the nightly job. On Stop the hook captures at most every 15 minutes per session.
-
-Measured on the prod memories (2026-10-14, hit@5): identifier queries 2–12% → 82%, plain-language questions 0% → 47–60%.
-
-**Nightly (03:30 daily CronJob):**
-
-- **Phase 0 — LLM tagging**: Reviews any memory not yet processed by LLM. Asks Ollama to assign tags from the `tag_rules` table. Merges with existing keyword tags. Sets `llm_reviewed=true` so each memory is processed only once.
-- **Phase 1 — Hash dedup**: Removes exact duplicate memories (same content hash). Originals archived to `mem0_archive` before deletion.
-- **Phase 2 — Semantic dedup**: Finds clusters of memories with cosine similarity > 0.92. Archives originals, asks Ollama to merge the cluster into one comprehensive memory.
-
-**Tagging modes** (set via `TAGGING_MODE` env / Helm values):
-
-| Mode | Behaviour |
-|------|-----------|
-| `keyword` | Regex rules at write time only. Fast, no GPU needed. |
-| `llm` | Ollama tags at write time. Adds latency. |
-| `hybrid` | Keyword at write time + LLM nightly pass for anything missed. Recommended. |
-
----
-
-## Prerequisites
-
-- **Ollama** with models pulled:
-  ```bash
-  ollama pull nomic-embed-text   # embeddings (required)
-  ollama pull qwen2.5:7b         # tagging + dedup merging (required for llm/hybrid mode)
-  ```
-- **PostgreSQL + pgvector** (local dev: included in docker-compose; production: CNPG cluster)
-
----
-
-## Quick start — Docker Compose
-
-The fastest way to run remnant locally. Requires Ollama running on the host (see Prerequisites above).
+Requires Docker Compose and a reachable Ollama server. Pull the embedding model;
+add the chat model if you enable LLM extraction, tagging or merge proposals:
 
 ```bash
-git clone https://github.com/janip81/remnant
+ollama pull nomic-embed-text
+ollama pull qwen2.5:7b
+
+git clone https://github.com/janip81/remnant.git
 cd remnant
 cp .env.example .env
+openssl rand -hex 32
 ```
 
-Edit `.env` — minimum required changes:
+Put the generated value in `BEARER_TOKEN` in `.env`. The server refuses empty,
+placeholder or shorter-than-16-character tokens. For the Compose stack, set:
+
+```dotenv
+BEARER_TOKEN=<paste-generated-token>
+DATABASE_URL=postgresql://remnant:remnant@postgres:5432/remnant
+OLLAMA_BASE_URL=http://<host-reachable-from-containers>:11434
+REMNANT_USER_ID=default
+MEM0_INFER=false
+```
+
+Use an Ollama address reachable **from the containers**; their `localhost` is not
+ your host. `host.docker.internal` requires a suitable host mapping on Linux.
+The example database credentials are for local development only.
 
 ```bash
-BEARER_TOKEN=your-secret-token        # pick anything
-OLLAMA_BASE_URL=http://host.docker.internal:11434  # or your Ollama host
+docker compose up -d --build
+curl --fail http://localhost:8080/health
 ```
 
-Start everything:
+| Service | Address |
+| --- | --- |
+| MCP | `http://localhost:8080/mcp` |
+| UI | `http://localhost:8081` |
+| PostgreSQL | `localhost:5432` (published by the development Compose file) |
+
+The supplied Compose file publishes ports on the host. Restrict their exposure
+for your environment. The UI proxies API credentials server-side; do not expose
+it publicly without an authentication/access-control layer.
+
+Stop with `docker compose down`; data remains in the database volume. Adding
+`-v` deletes that volume and its data. `make dev` starts the same Compose stack;
+it does not provide source hot reload.
+
+## Connect an agent
+
+Use your client's MCP configuration to connect to `/mcp` with an
+`Authorization: Bearer <token>` header. Store credentials outside Git.
+For Claude Code setup and hook configuration, see [plugin/README.md](plugin/README.md).
+
+The included Claude prompt hook is selective: it injects a memory only when an
+identifier-like term from the prompt (hostname, file, version, IP ...) literally
+appears in it, within item/character limits and once per session. Most prompts
+get no injected context; agents call `search_memory` themselves. Resume and
+compaction restore the session's own checkpoint plus a broad related-memory
+search; Stop capture is throttled. `REMNANT_INJECT_POLICY` switches these
+behaviours for benchmarking (see [plugin/hooks/bench_log.py](plugin/hooks/bench_log.py)).
+
+| MCP tool | Purpose |
+| --- | --- |
+| `add_memory` | Store knowledge with optional tags, category and provenance |
+| `search_memory` | Hybrid search; active facts by default, optional history/candidates, project scope and JSON output |
+| `get_memory` | Inspect one memory and lifecycle details |
+| `supersede_memory` | Replace a fact while retaining its linked predecessor |
+| `propose_merge` | Submit a review candidate; keep originals active until promotion |
+| `save_checkpoint`, `get_checkpoint` | Save/restore temporary state by session ID |
+| `get_all_memories` | List memories with optional lifecycle views |
+| `delete_memory` | Explicit deletion; distinct from superseding |
+
+Use the tool schemas exposed by your running server for current arguments.
+Queued writes return an acknowledgement, not proof that persistence has completed.
+
+## Maintenance and deployment
+
+With `REDIS_URL` configured, writes use a Redis Stream and an in-process worker
+with acknowledgement, reclaim/retry and a dead-letter stream. Inspect `/metrics`
+for queue depth, pending/dead jobs and worker health. Without Redis, writes execute
+synchronously. Embedding availability still matters for new writes.
+
+The maintenance job applies tagging rules, handles exact duplicates, proposes
+semantic merges for review, and expires checkpoints. Similarity alone does not
+establish equivalent facts. Semantic proposals preserve active originals until
+review; do not assume every explicit deletion is archived or reversible.
+
+- [deploy/manifest.yaml](deploy/manifest.yaml): plain Kubernetes deployment; review
+  credentials, storage and network exposure before applying.
+- [Helm chart](https://github.com/janip81/helm-charts/tree/main/charts/remnant):
+  deployment configuration and values; requires the corresponding cluster services.
+- [docker-compose.yml](docker-compose.yml), [.env.example](.env.example) and
+  [src/config.py](src/config.py): local setup and configuration reference.
+- [Makefile](Makefile): build and development commands. `make clean` deletes local
+  Compose volumes.
+
+## Development and current work
+
+The pytest suite lives in [tests/](tests/):
 
 ```bash
-docker compose up -d
+pip install -r requirements-mcp.txt -r requirements-dev.txt
+make test        # unit tests; PostgreSQL-dependent tests are skipped
+make test-db     # everything, against a throwaway pgvector container (needs Docker)
 ```
 
-Services:
-
-| Service | URL | Description |
-|---------|-----|-------------|
-| MCP server | `http://localhost:8080` | MCP endpoint + REST API |
-| UI | `http://localhost:8081` | Memory browser |
-| PostgreSQL | `localhost:5432` | pgvector DB (internal) |
-
-Register with Claude Code:
-
-```bash
-claude mcp add --transport http --scope user remnant \
-  "http://localhost:8080/mcp" \
-  --header "Authorization: Bearer your-secret-token"
-```
-
-Stop and clean up:
-
-```bash
-docker compose down          # keep data
-docker compose down -v       # also remove postgres volume
-```
-
----
-
-## Quick start — make (local dev with hot reload)
-
-```bash
-make dev          # starts postgres+pgvector + MCP server (with live reload)
-```
-
-MCP server: `http://localhost:8080`
-
----
-
-## Kubernetes — plain manifests (no Helm)
-
-A single self-contained manifest is provided in `deploy/manifest.yaml`. It includes PostgreSQL + pgvector, the MCP server, the UI, and the nightly dedup CronJob.
-
-```bash
-# 1. Edit the two values marked with ← in the file:
-#    - BEARER_TOKEN in the remnant-auth Secret
-#    - OLLAMA_BASE_URL in the remnant-settings ConfigMap
-#    - storageClassName if "standard" doesn't exist in your cluster
-
-# 2. Apply
-kubectl apply -f deploy/manifest.yaml
-
-# 3. Verify
-kubectl get pods -n remnant
-kubectl logs -n remnant -l app=remnant,component=mcp
-
-# 4. Register with Claude Code
-kubectl port-forward -n remnant svc/remnant 8080:8080
-claude mcp add --transport http --scope user remnant \
-  "http://localhost:8080/mcp" \
-  --header "Authorization: Bearer your-token"
-```
-
-For external access add an Ingress — a commented-out template is included at the bottom of `deploy/manifest.yaml`.
-
----
-
-## Kubernetes (Helm)
-
-### Auth secret
-
-Create before deploying (or use AVP to render from Vault):
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: remnant-auth
-  namespace: remnant
-stringData:
-  BEARER_TOKEN: <your-token>
-```
-
-### Deploy
-
-```bash
-helm repo add janip81 https://janip81.github.io/helm-charts/
-helm repo update
-
-helm install remnant janip81/remnant \
-  --namespace remnant \
-  --create-namespace \
-  --set gatewayApi.host=remnant-mcp.your-domain.com \
-  --set ui.host=remnant.your-domain.com \
-  --set ollama.baseUrl=http://your-ollama-host:11434 \
-  --set tagging.mode=hybrid \
-  --set cnpg.backup.enabled=true \
-  --set cnpg.backup.endpointURL=https://your-s3-endpoint \
-  --set cnpg.backup.destinationPath=s3://your-bucket/remnant
-```
-
-### ArgoCD
-
-Point an Application at the chart with a `cluster-config/` folder for AVP-rendered secrets. See [`remnant-app.yaml`](https://github.com/janip81/k8s-gitops) for a reference deployment.
-
----
-
-## Configure Claude Code
-
-```bash
-# Add MCP server (HTTP transport)
-claude mcp add --transport http --scope user remnant \
-  "https://remnant-mcp.your-domain.com/mcp" \
-  --header "Authorization: Bearer ${BEARER_TOKEN}"
-
-# Verify
-claude mcp list
-```
-
-Available MCP tools:
-
-| Tool | Description |
-|------|-------------|
-| `add_memory` | Store a fact. Supports `tags=["prod-k8s"]`, `category="incident"` |
-| `search_memory` | Semantic search — returns top matching memories |
-| `get_all_memories` | List all stored memories with metadata |
-| `delete_memory` | Remove a memory by ID |
-
----
-
-## Claude Code hooks
-
-The `plugin/` directory contains hooks that wire remnant into every Claude Code session automatically.
-
-```bash
-export REMNANT_URL="https://remnant-mcp.your-domain.com"
-export REMNANT_TOKEN="your-bearer-token"
-export REMNANT_PLUGIN_DIR="/path/to/remnant/plugin"
-```
-
-| Hook | Trigger | Action |
-|------|---------|--------|
-| `UserPromptSubmit` | Every prompt | Searches memory, injects `<memory>` block |
-| `PreCompact` | Before context compression | Saves session state to memory |
-| `Stop` | Session end | Saves session summary |
-
-See [`plugin/README.md`](plugin/README.md) for full installation instructions.
-
----
-
-## Configuration
-
-All config via environment variables (see `.env.example`):
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `BEARER_TOKEN` | — (required) | Auth token for MCP and `/api`; server refuses to start if empty, `change-me` or < 16 chars |
-| `DATABASE_URL` | `postgresql://remnant:remnant@localhost:5432/remnant` | PostgreSQL connection |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
-| `OLLAMA_MODEL` | `qwen2.5:7b` | Chat model for tagging and dedup merging |
-| `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Embedding model |
-| `TAGGING_MODE` | `keyword` | `keyword` / `llm` / `hybrid` |
-| `REMNANT_USER_ID` | `default` | User ID namespace for stored memories |
-| `APP_PORT` | `8080` | Listen port |
-| `REDIS_URL` | _(unset)_ | Optional. Enables async queue for `add_memory`. Format: `redis://:password@host:6379/0` |
-
-### Redis async queue (optional)
-
-When `REDIS_URL` is set, `add_memory` calls are added to a Redis Stream (`remnant:stream:add_memory`, consumer group `remnant-workers`) and written by a worker inside the MCP process. The caller gets an immediate response (`{"queued": true, "job_id": "..."}`) instead of blocking while Ollama runs LLM extraction (which can take 15–17 s with `infer=true`).
-
-Delivery is at-least-once and safe to retry:
-- content is redacted before it is queued; a job is acknowledged (and deleted from the stream) only after the memory is written — the stream is never trimmed by length
-- jobs from a crashed or restarted pod are reclaimed after `QUEUE_CLAIM_IDLE_SECONDS` (default 600)
-- **Ollama offline** (e.g. the GPU desktop is asleep): jobs stay pending and are retried every `QUEUE_CLAIM_IDLE_SECONDS` for as long as the outage lasts, without using up attempts
-- other failures count as attempts; after `QUEUE_MAX_ATTEMPTS` (default 5) a job moves to `remnant:stream:add_memory:dead`
-- `infer=false`: the `job_id` is stored in the memory's metadata, so a retry after a crash never writes twice. `infer=true`: a retry re-runs mem0's extraction, whose LLM step NOOPs facts that already exist
-- the worker starts with the app (retrying until Redis is reachable) and moves any jobs left in the old `remnant:queue:add_memory` list into the stream
-
-Inspect dead jobs with `XRANGE remnant:stream:add_memory:dead - +`; to replay one, `XADD remnant:stream:add_memory * job '<job field>'` and `XDEL` it from the dead stream.
-
-`/metrics` exports `remnant_queue_depth` (pending + not yet delivered), `remnant_queue_pending`, `remnant_queue_dead`, `remnant_queue_worker_up` and `remnant_queue_metrics_error` (1 = backlog unknown). Alert on `remnant_queue_worker_up == 0` or `remnant_queue_dead > 0`.
-
----
-
-## Makefile
-
-```bash
-make dev          # start postgres + MCP server (docker compose)
-make build        # build both images (MCP + UI)
-make build-mcp    # build MCP server image only
-make build-ui     # build UI image only
-make push         # push both images to ghcr.io
-make push-mcp     # push MCP image only
-make push-ui      # push UI image only
-make tag-mcp      # tag + push versioned MCP release: make tag-mcp TAG=v0.3.0
-make tag-ui       # tag + push versioned UI release: make tag-ui TAG=v0.3.0
-make clean        # stop containers, remove volumes
-```
-
----
-
-## Import existing memories
-
-```bash
-python3 scripts/import_memories.py --path /path/to/memory/files/
-```
-
-Options:
-
-| Flag | Description |
-|------|-------------|
-| `--path PATH` | Directory of `.md` files to import |
-| `--dry-run` | Print what would be imported without writing |
-| `--bearer TOKEN` | Bearer token (default: reads from `.env`) |
-| `--url URL` | MCP server URL (default: `http://localhost:8080`) |
-
----
-
-## Nightly job — manual trigger
-
-```bash
-# Trigger a manual run
-kubectl create job -n remnant --from=cronjob/remnant-dedup manual-$(date +%s)
-
-# Watch logs
-kubectl logs -n remnant -l job-name=<job-name> --follow
-
-# Dry run (no writes)
-# Set args: ["python", "src/scripts/dedup_job.py", "--dry-run"] in a one-off Job
-```
-
----
-
-## Database maintenance
-
-The nightly job maintains `mem0_archive` as cold storage — all deduplicated/merged originals are archived there before deletion. Nothing is hard-deleted without first being archived.
-
-```sql
--- Row counts
-SELECT COUNT(*) FROM mem0;
-SELECT COUNT(*) FROM mem0_archive;
-
--- Job run history
-SELECT phase, status, memories_scanned, memories_changed, duration_seconds, started_at
-FROM job_runs ORDER BY started_at DESC LIMIT 20;
-```
-
----
-
-## Documentation
-
-- [`plugin/README.md`](plugin/README.md) — Claude Code hook installation
-- [`AGENTS.md`](AGENTS.md) — architecture and session guide
+[scripts/bench/](scripts/bench/README.md) is an isolated harness for measuring the
+hook injection policies. No benchmark results are published yet; local scenarios,
+snapshots, streams and answers may contain private data and stay out of Git.
+
+- [AGENTS.md](AGENTS.md): agent working instructions.
+- [PLAN.md](PLAN.md) and [ISSUES.md](ISSUES.md): planning; some older status notes
+  still need reconciliation against current code and releases.
+- [CHANGELOG.md](CHANGELOG.md): change history.
