@@ -31,6 +31,15 @@ for n, line in enumerate(sys.stdin):
               "usage": {"input_tokens": 10, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 1000,
                         "output_tokens": 5, "output_tokens_details": {"thinking_tokens": 3}},
               "total_cost_usd": 0.01, "duration_ms": 40, "num_turns": 1}
+    # real CLI (smoke 2026-10-17): total_cost_usd and modelUsage are cumulative per
+    # session (also across --resume); top-level usage is this turn only
+    prev = float(os.environ.get("FAKE_PREV_COST", "0")) if n == 0 else 0
+    result["total_cost_usd"] = round(prev + 0.01 * (n + 1), 6)
+    prev_out = int(os.environ.get("FAKE_PREV_OUT", "0"))
+    result["modelUsage"] = {"claude-x": {"outputTokens": prev_out + 5 * (n + 1)}}
+    if mode == "per-turn":
+        result["total_cost_usd"] = 0.01
+        result["modelUsage"] = {"claude-x": {"outputTokens": 5}}
     if mode == "nocost":
         del result["total_cost_usd"]
         del result["usage"]["cache_read_input_tokens"]

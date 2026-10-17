@@ -344,8 +344,11 @@ def check_events(log: Path, run_id: str, segments: list[list[str]], policy: str 
     return sorted(set(problems), key=problems.index)
 
 
-def accept(answer: str, patterns: list[str]) -> bool:
-    return all(re.search(p, answer or "", re.I | re.S) for p in patterns)
+def accept(answer: str, patterns: list[str], reject: list[str] | None = None) -> bool:
+    """All accept patterns match and no reject pattern (a known wrong/contradicting
+    claim) does. Keyword checks are a floor; blinded grading judges usefulness."""
+    return (all(re.search(p, answer or "", re.I | re.S) for p in patterns)
+            and not any(re.search(p, answer or "", re.I | re.S) for p in reject or []))
 
 
 # Claude result usage: input_tokens, cache_creation_input_tokens and
@@ -360,14 +363,45 @@ def known_sum(values):
     return None if not values or any(v is None for v in values) else sum(values)
 
 
+def cost_semantics(turns: list[dict]) -> list[str]:
+    """Classify each result's total_cost_usd as session-cumulative or per-turn.
+
+    Smoke 2026-10-17: across --resume, total_cost_usd and modelUsage are cumulative for
+    the session, while top-level usage is incremental. So a result is "cumulative" when
+    its modelUsage output tokens equal the running sum of incremental usage, and
+    "per-turn" when they equal this turn's usage alone (the first turn fits both)."""
+    labels, running = [], 0
+    for t in turns:
+        out = (t.get("usage") or {}).get("output_tokens")
+        mu = t.get("model_usage_output")
+        if out is None or mu is None:
+            labels.append("unknown")
+            continue
+        running += out
+        cum, per = mu == running, mu == out
+        labels.append("either" if cum and per else "cumulative" if cum else "per-turn" if per else "unknown")
+    return labels
+
+
+def run_cost(turns: list[dict]) -> tuple[float | None, str]:
+    """Session cost without double counting: the last cumulative value, or the sum of
+    per-turn values. Anything mixed or unknown is None (fails the cap closed)."""
+    if not turns or any(t.get("cost_usd") is None for t in turns):
+        return None, "unknown"
+    kinds = set(cost_semantics(turns)) - {"either"}
+    if not kinds or kinds == {"cumulative"}:
+        return turns[-1]["cost_usd"], "cumulative"
+    if kinds == {"per-turn"}:
+        return sum(t["cost_usd"] for t in turns), "per-turn"
+    return None, "mixed/unknown"
+
+
 def run_totals(turns: list[dict]) -> dict:
     out = {f: known_sum((t.get("usage") or {}).get(f) for t in turns) for f in USAGE_FIELDS}
     ins = [out[f] for f in USAGE_FIELDS[:3]]
-    out["total_input_tokens"] = None if None in ins else sum(ins)
-    # Summing per-turn total_cost_usd is conservative: if the CLI reports a cumulative
-    # session cost this over-counts (safe for the cap); the smoke test settles which.
-    out["cost_usd"] = known_sum(t.get("cost_usd") for t in turns)
-    out["cost_usd_last"] = turns[-1].get("cost_usd") if turns else None
+    out["total_input_tokens"] = None if None in ins else sum(ins)   # top-level usage is incremental
+    out["cost_usd"], out["cost_semantics"] = run_cost(turns)          # native list price, not billing
+    out["cost_usd_raw_sum"] = known_sum(t.get("cost_usd") for t in turns)   # transparency only
     return out
 
 
@@ -383,7 +417,8 @@ def hook_stats(log: Path, run_id: str) -> dict:
             "auto_checkpoint_chars": sum(e.get("checkpoint_chars") or 0 for e in ev)}
 
 
-def run_one(spec: dict, scen: dict, sfile: dict, a, server: Server, token: str, results: Path):
+def run_one(spec: dict, scen: dict, sfile: dict, a, server: Server, token: str, results: Path, meta: dict | None = None):
+    t_run = time.monotonic()
     run_id = f"{spec['scenario']}-r{spec['repeat']}-{spec['arm']}-{secrets.token_hex(3)}"
     run_dir = Path(a.workdir) / "runs" / run_id
     repo_name = Path(sfile["repo"]).name
@@ -404,7 +439,8 @@ def run_one(spec: dict, scen: dict, sfile: dict, a, server: Server, token: str, 
     import bench_log
     for seg_no, prompts in enumerate(segments):
         cmd = [a.claude, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-               "--include-partial-messages", "--model", a.model, *flags] + (["--resume", session_id] if seg_no else [])
+               "--include-partial-messages", "--model", a.model, "--effort", a.effort, *flags] + \
+            (["--resume", session_id] if seg_no else [])
         sid, recs = run_segment(cmd, wt, proc_env, prompts, run_dir / "stream.jsonl", a.turn_timeout)
         session_id = session_id or sid
         sids.add(sid)
@@ -413,15 +449,21 @@ def run_one(spec: dict, scen: dict, sfile: dict, a, server: Server, token: str, 
             res = rec.get("result") or {}
             answer = res.get("result") or ""
             checks = scen["accept"].get(str(i), [])
+            rejects = (scen.get("reject") or {}).get(str(i), [])
+            mu = res.get("modelUsage")
+            # timing: from writing this prompt to the CLI to its first non-empty text delta
+            # (may be preliminary commentary) and to its result event; not whole-task time
             turns.append({"i": i, "segment": seg_no, "prompt_hash": bench_log.prompt_hash(prompt),
-                          "first_text_ms": rec["first_text_ms"], "result_ms": rec.get("result_ms"),
+                          "first_text_ms": rec["first_text_ms"], "prompt_to_result_ms": rec.get("result_ms"),
+                          "model_usage_output": (sum(v.get("outputTokens", 0) for v in mu.values())
+                                                 if isinstance(mu, dict) else None),
                           "timeout": rec["timeout"], "crashed": rec["crashed"], "exit": rec["exit"],
                           "has_result": bool(res),
                           "is_error": res.get("is_error"), "usage": res.get("usage"),
                           "cost_usd": res.get("total_cost_usd"), "cli_duration_ms": res.get("duration_ms"),
                           "num_turns": res.get("num_turns"), "tool_uses": rec["tool_uses"],
                           "permission_denials": len(res.get("permission_denials") or []),
-                          "accepted": accept(answer, checks) if checks else None})
+                          "accepted": accept(answer, checks, rejects) if checks else None})
             (run_dir / f"answer-{i}.md").write_text(answer)
         if len(recs) < len(prompts) or not session_id:
             break
@@ -430,7 +472,8 @@ def run_one(spec: dict, scen: dict, sfile: dict, a, server: Server, token: str, 
     hits = sum(1 for l in (run_dir / "server.log").read_text().splitlines() if "POST /mcp" in l)
     complete = len(turns) == n_expected
     checked = [t["accepted"] for t in turns if t["accepted"] is not None]
-    row = {"run_id": run_id, **spec, "model": a.model, "plugin_rev": git_rev(REPO), "repo_commit": sfile["repo_commit"],
+    row = {"run_id": run_id, **spec, **(meta or {}), "model": a.model, "effort": a.effort,
+           "run_wall_ms": round((time.monotonic() - t_run) * 1000, 1), "plugin_rev": git_rev(REPO), "repo_commit": sfile["repo_commit"],
            "claude_version": sh(a.claude, "--version").stdout.strip(), "turns": turns,
            # three separate questions: did the harness measure what it claims, did the
            # CLI/model work, did the answers pass their objective checks
@@ -571,18 +614,28 @@ def cmd_execute(a):
         sys.exit("a previous run has unknown cost: the cap cannot be enforced; inspect before continuing")
     spent = sum(r["cost_usd"] for r in rows)
     worst = max([a.max_run_usd] + [r["cost_usd"] for r in rows])
+    budget = a.cap_usd - a.reserve_usd                # reserve: retries, grading, interrupted runs
     server = Server(Path(a.workdir) / "server", token, a.python)
+    last_end = None
     try:
-        for spec in plan["runs"]:
+        for n, spec in enumerate(plan["runs"]):
             if (spec["scenario"], spec["repeat"], spec["arm"]) in done:
                 continue
-            # Start a run only if even the worst run seen so far (or the declared
-            # per-run maximum) still fits. A single run can still exceed that bound,
-            # so the cap can be overshot by at most one run's excess.
-            if spent + worst > a.cap_usd:
-                print(f"cap: spent ${spent:.2f}, next run may cost up to ${worst:.2f}, cap ${a.cap_usd:.2f}; stopping")
+            # Admission estimate, not a hard ceiling: start a run only if the worst run seen
+            # so far (or the declared per-run maximum) still fits the budget. A running CLI
+            # is not stopped mid-run, so one run's excess can overshoot it.
+            if spent + worst > budget:
+                print(f"cap: spent ${spent:.2f}, next run may cost up to ${worst:.2f}, budget ${budget:.2f} "
+                      f"(cap ${a.cap_usd:.2f} - reserve ${a.reserve_usd:.2f}); stopping")
                 break
-            row = run_one(spec, by_id[spec["scenario"]], sfile, a, server, token, results)
+            # Provider prompt caches (1 h) are not reset between runs: record order/timing
+            # so cache effects can be analysed instead of silently confounding arms.
+            block = [r for r in plan["runs"] if r["block"] == spec["block"]]
+            meta = {"plan_index": n, "block_position": block.index(spec), "cache_regime": a.cache_regime,
+                    "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "since_prev_run_end_s": round(time.monotonic() - last_end, 1) if last_end else None}
+            row = run_one(spec, by_id[spec["scenario"]], sfile, a, server, token, results, meta)
+            last_end = time.monotonic()
             print(f"{row['run_id']}: harness_valid={row['harness_valid']} cli_ok={row['cli_ok']} "
                   f"accepted={row['accepted']} cost={row['cost_usd']} problems={row['hook_problems']}")
             if row["cost_usd"] is None:
@@ -595,12 +648,13 @@ def cmd_execute(a):
     print(f"spent ${spent:.2f} of ${a.cap_usd:.2f}")
 
 
-EXPORT_RUN = ("run_id", "scenario", "repeat", "arm", "block", "model", "plugin_rev", "repo_commit", "claude_version",
-              "harness_valid", "cli_ok", "accepted", "local_mcp_requests", "hook_events", "auto_lookups",
-              "auto_injected_chars", "auto_checkpoint_chars", "total_input_tokens", "cost_usd", "cost_usd_last",
-              *USAGE_FIELDS)
-EXPORT_TURN = ("i", "segment", "first_text_ms", "result_ms", "timeout", "crashed", "is_error", "cost_usd", "cli_duration_ms",
-               "num_turns", "permission_denials", "accepted")
+EXPORT_RUN = ("run_id", "scenario", "repeat", "arm", "block", "model", "effort", "plugin_rev", "repo_commit",
+              "claude_version", "plan_index", "block_position", "cache_regime", "started_at", "since_prev_run_end_s",
+              "run_wall_ms", "harness_valid", "cli_ok", "accepted", "local_mcp_requests", "hook_events", "auto_lookups",
+              "auto_injected_chars", "auto_checkpoint_chars", "total_input_tokens", "cost_usd", "cost_semantics",
+              "cost_usd_raw_sum", *USAGE_FIELDS)
+EXPORT_TURN = ("i", "segment", "first_text_ms", "prompt_to_result_ms", "timeout", "crashed", "is_error", "cost_usd",
+               "model_usage_output", "cli_duration_ms", "num_turns", "permission_denials", "accepted")
 
 
 def export_rows(rows: list[dict]) -> list[dict]:
@@ -615,6 +669,87 @@ def export_rows(rows: list[dict]) -> list[dict]:
                       for t in r.get("turns") or []]
         out.append(e)
     return out
+
+
+def cmd_blind_export(a):
+    """Answers for blinded grading: opaque file names, the arm/run key in a separate file."""
+    os.umask(0o077)
+    rows = [json.loads(l) for l in Path(a.results).read_text().splitlines()]
+    out = private_dir(Path(a.out_dir))
+    (out / "answers").mkdir(exist_ok=True)
+    rng, key = random.Random(a.seed), {}
+    items = [(r, t) for r in rows for t in r["turns"]]
+    rng.shuffle(items)
+    for n, (r, t) in enumerate(items):
+        oid = f"a{n:04d}"
+        src = Path(a.workdir) / "runs" / r["run_id"] / f"answer-{t['i']}.md"
+        (out / "answers" / f"{oid}.md").write_text(src.read_text() if src.exists() else "")
+        key[oid] = {"run_id": r["run_id"], "scenario": r["scenario"], "arm": r["arm"], "turn": t["i"]}
+    (out / "KEY-do-not-give-to-grader.json").write_text(json.dumps(key, indent=1))
+    print(f"{len(items)} answers -> {out}/answers (grader gets only these + the scenario questions)")
+
+
+NEGATIVE_PROMPT = ("Harness permission check. Try each action below exactly once and report, for each, "
+                   "whether it succeeded or was denied: (1) create a file named negative-check.txt with the "
+                   "text x; (2) run the shell command `echo negative-check`; (3) store the memory "
+                   "'negative-check' with the add_memory tool; (4) delete any memory with delete_memory; "
+                   "(5) search memory for 'remnant' with search_memory and say how many results came back.")
+
+
+def cmd_negative_preflight(a):
+    """MODEL CALL (one short session): prove forbidden tools are unavailable or denied and
+    that permitted retrieval works, on the exact run configuration. Saves an artifact."""
+    if not a.confirm_model_calls:
+        sys.exit("negative-preflight makes one real model call: pass --confirm-model-calls")
+    os.umask(0o077)
+    work = private_dir(Path(a.workdir))
+    token = read_token(a)
+    run_dir = work / "preflight-negative" / time.strftime("%Y%m%dT%H%M%S")
+    wt = run_dir / "repo"
+    wt.mkdir(parents=True)
+    (wt / "README.md").write_text("negative preflight sandbox\n")
+    server = Server(work / "server", token, a.python)
+    server.reset()
+    server.start(run_dir / "server.log")
+    try:
+        # facts only: the Stop hook writing this session's checkpoint is intended harness behaviour
+        facts_sql = "SELECT count(*) FROM mem0 WHERE coalesce(payload->>'kind', '') <> 'checkpoint'"
+        rows_before = psql(facts_sql, "run").strip()
+        proc_env, flags = run_config(run_dir, "negative-preflight", "C", token)
+        assert_isolated(run_dir, proc_env)
+        cmd = [a.claude, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+               "--model", a.model, "--effort", a.effort, *flags]
+        _, recs = run_segment(cmd, wt, proc_env, [NEGATIVE_PROMPT], run_dir / "stream.jsonl", a.turn_timeout)
+        rows_after = psql(facts_sql, "run").strip()
+    finally:
+        server.stop()
+    init_tools = []
+    for l in (run_dir / "stream.jsonl").read_text().splitlines():
+        ev = json.loads(json.loads(l)["line"] or "{}") if l.strip() else {}
+        if ev.get("type") == "system" and ev.get("subtype") == "init":
+            init_tools = ev.get("tools") or []
+    res = (recs[0].get("result") if recs else None) or {}
+    denied = [d.get("tool_name") for d in res.get("permission_denials") or []]
+    used = recs[0]["tool_uses"] if recs else []
+    checks = {
+        "no Write/Edit/Bash tool available": not any(t in init_tools for t in ("Write", "Edit", "Bash", "NotebookEdit")),
+        "no file created": sorted(p.name for p in wt.iterdir()) == ["README.md"],
+        "no memory facts written (checkpoint rows excluded)": rows_before == rows_after,
+        "mutating memory tools denied when tried": all(n in denied for n in used
+                                                       if n and n.split("__")[-1] in ("add_memory", "delete_memory",
+                                                                                      "save_checkpoint", "supersede_memory")),
+        "search_memory allowed and used": "mcp__remnant__search_memory" in used
+                                          and "mcp__remnant__search_memory" not in denied,
+    }
+    artifact = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "model": a.model, "effort": a.effort,
+                "plugin_rev": git_rev(REPO), "init_tools": init_tools, "tool_uses": used, "denied": denied,
+                "rows_before": rows_before, "rows_after": rows_after, "checks": checks, "passed": all(checks.values()),
+                "cost_usd": res.get("total_cost_usd")}
+    (run_dir / "artifact.json").write_text(json.dumps(artifact, indent=1))
+    for k, v in checks.items():
+        print(("PASS " if v else "FAIL ") + k)
+    print(f"artifact: {run_dir / 'artifact.json'}  cost ${artifact['cost_usd']}")
+    return 0 if artifact["passed"] else 1
 
 
 def cmd_export(a):
@@ -642,10 +777,22 @@ def main():
     p.add_argument("--confirm-model-calls", action="store_true", help="required to run the real CLI")
     p.add_argument("--max-run-usd", type=float, required=True,
                    help="declared worst-case cost of one run, used until a costlier run is observed")
+    p.add_argument("--reserve-usd", type=float, default=0.0, help="part of the cap kept for retries/grading")
+    p.add_argument("--effort", required=True, choices=["low", "medium", "high", "xhigh", "max"])
+    p.add_argument("--cache-regime", required=True,
+                   help="predeclared provider-cache condition, e.g. warm-sequential (recorded per run)")
+    p = sub.add_parser("negative-preflight"); p.add_argument("--model", required=True)
+    p.add_argument("--effort", required=True, choices=["low", "medium", "high", "xhigh", "max"])
+    p.add_argument("--claude", default="claude"); p.add_argument("--turn-timeout", type=int, default=300)
+    p.add_argument("--confirm-model-calls", action="store_true")
+    p = sub.add_parser("blind-export"); p.add_argument("--results", required=True)
+    p.add_argument("--out-dir", required=True); p.add_argument("--seed", type=int, required=True)
     p = sub.add_parser("export"); p.add_argument("--results", required=True); p.add_argument("--out", required=True)
     a = ap.parse_args()
-    {"snapshot": cmd_snapshot, "up": cmd_up, "down": cmd_down, "preflight": cmd_preflight,
-     "schedule": cmd_schedule, "execute": cmd_execute, "export": cmd_export}[a.cmd](a)
+    rc = {"snapshot": cmd_snapshot, "up": cmd_up, "down": cmd_down, "preflight": cmd_preflight,
+     "schedule": cmd_schedule, "execute": cmd_execute, "export": cmd_export,
+     "negative-preflight": cmd_negative_preflight, "blind-export": cmd_blind_export}[a.cmd](a)
+    raise SystemExit(rc or 0)
 
 
 if __name__ == "__main__":

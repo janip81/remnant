@@ -23,6 +23,14 @@ search on resume/compact.
   a generated `--settings`, and MCP from `--strict-mcp-config`.
 - Runs are read-only: `--tools Read,Grep,Glob` plus Remnant `search_memory`/`get_memory`,
   under `--permission-mode dontAsk`.
+- `negative-preflight` proves this on the exact run configuration:
+  - Write/Edit/Bash aren't available, and no file appears;
+  - mutating memory tools are denied when tried;
+  - no memory facts are written. The Stop hook's own session checkpoint is expected and
+    excluded from this check.
+  - permitted `search_memory` works.
+
+  The artifact is saved under `preflight-negative/`.
 - Each run gets a fresh `git archive` copy of the target repo. The copy's own
   `.claude/settings*.json` and `.mcp.json` are removed, and recorded in
   `sanitized_project_files`, so the target repo can't add hooks, env or MCP servers.
@@ -41,8 +49,11 @@ $B snapshot --out ~/.cache/remnant-bench/snap.dump   # reads the prod replica
 $B up --dump ~/.cache/remnant-bench/snap.dump
 $B preflight                               # no model calls
 $B schedule --scenarios scen.json --repeats 2 --seed 42 --out plan.json
+$B negative-preflight --model <id> --effort low --confirm-model-calls     # one short model call
 $B execute --plan plan.json --results ~/.cache/remnant-bench/results.jsonl \
-   --cap-usd 10 --max-run-usd 1.5 --model <id> --confirm-model-calls
+   --cap-usd 60 --reserve-usd 10 --max-run-usd 1.5 --model <id> --effort <level> \
+   --cache-regime warm-sequential --confirm-model-calls
+$B blind-export --results ~/.cache/remnant-bench/results.jsonl --out-dir ~/.cache/remnant-bench/grading --seed 1
 $B export --results ~/.cache/remnant-bench/results.jsonl --out metrics.json   # numbers only
 $B down
 ```
@@ -60,8 +71,17 @@ The cap fails closed, but it's a guard rather than a hard limit:
   one run's excess.
 - A run with unknown cost (missing `total_cost_usd`) stops the execution, and a later
   `execute` refuses to resume until that run has been inspected.
-- Per-turn costs are summed. If the CLI reports a cumulative session cost instead,
-  this over-counts, which is the safe direction. The smoke test must settle which it is.
+- The cap is an admission estimate, not a hard ceiling: a running CLI is never stopped
+  mid-run. `--reserve-usd` keeps part of the cap for retries, grading and interrupted runs.
+- **Cost semantics (smoke test 2026-10-17):**
+  - `total_cost_usd` and `modelUsage` are **cumulative per session**, including across
+    `--resume`, while top-level `usage` is per turn.
+  - The harness classifies each result by comparing `modelUsage` output tokens with the
+    running sum of `usage`. A session's cost is then its last cumulative value, or the sum
+    when per-turn.
+  - Mixed or unknown semantics give `cost_usd: null`, which stops the run (fail closed).
+  - `cost_usd_raw_sum` is kept for transparency.
+  - This is the native list price (`costBasis: list`), not proof of what was billed.
 
 ## Token semantics
 
@@ -82,9 +102,30 @@ both stay out of this repo. A scenario looks like this:
    "accept": {"0": ["regex that must match turn 0's answer"]}}]}
 ```
 
-Each segment is one CLI process, with its turns streamed over stdin. The segments
+An optional `"reject": {"0": ["regex"]}` lists claims that make that turn's answer
+fail. Each segment is one CLI process, with its turns streamed over stdin. The segments
 after the first resume the same session. A `/compact` turn expects a compact
 SessionStart.
+
+## Order, caching and effort
+
+Provider prompt caches (about 1 h) are **not** reset between runs; only the local state
+is. Each run therefore records:
+- `plan_index` and `block_position` (the arm's place in its paired block);
+- `started_at` and `since_prev_run_end_s`;
+- the predeclared `--cache-regime`.
+
+Cache creation and reads are reported separately, so caching effects can be analysed
+rather than confounding the arms. `--effort` is pinned and recorded.
+
+## Timing
+
+- `first_text_ms` runs from writing the prompt to the first non-empty text delta. That
+  delta may be preliminary commentary.
+- `prompt_to_result_ms` runs from writing the prompt to its result event.
+- `run_wall_ms` is the whole run, including server reset, the archive, every segment and
+  shutdown.
+- None of these is "time to a verified task".
 
 ## Three separate outcomes per run
 
@@ -95,8 +136,11 @@ SessionStart.
   - all scripted turns ran.
 - `cli_ok` means every turn returned a result, without a CLI error, timeout, crash
   or non-zero exit.
-- `accepted` means every turn that has a check passed it. Every scenario must have at
-  least one objective check.
+- `accepted` means every turn that has a check passed it: all `accept` patterns match,
+  and no `reject` pattern (a known wrong or contradicting claim) matches. Every scenario
+  must have at least one objective check. Keyword checks are only a floor:
+  `blind-export` writes the answers under opaque names, with the arm key in a separate
+  file, for blinded usefulness grading.
 
 Failed and timed-out runs stay in the results and in summaries. They are never
 dropped or silently re-run. Hook events (`bench_log.py`) never contain prompt or
