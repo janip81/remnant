@@ -447,7 +447,12 @@ def stats() -> dict:
 # ---------------------------------------------------------------------------
 
 def _build_config() -> MemoryConfig:
+    # history_db_path: mem0 records an add/update/delete history in SQLite. Remnant never
+    # reads it (its own lifecycle keeps superseded rows), and the default ~/.mem0/history.db
+    # sat in the container filesystem and vanished on every restart. In memory instead: no
+    # false durability, no disk writes; it is reset whenever the pod restarts.
     return MemoryConfig(
+        history_db_path=":memory:",
         vector_store=VectorStoreConfig(
             provider="pgvector",
             config={

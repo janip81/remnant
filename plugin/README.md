@@ -58,9 +58,6 @@ reminder. `block_memory_write.sh` (PreToolUse, matcher `Write|Edit`) blocks writ
 `MEMORY.md`/`memory/*.md` and tells the agent to call `add_memory` instead. Nothing is
 stored unless the agent then makes that call.
 
-`search-memory.*` and `save-context.*` are the earlier versions of the prompt and
-capture hooks. The template no longer uses them.
-
 Per-session state (the injected-memory cache and the compaction flag) lives in
 `$XDG_CACHE_HOME/remnant/`. `REMNANT_INJECT_POLICY` (`off|broad|selective`) changes
 the automatic injection for benchmarks; unset is the behaviour described above. See
