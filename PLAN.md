@@ -23,7 +23,7 @@
 - [x] Blocking calls moved off the event loop (`asyncio.to_thread`) — merged (#4), deployed
 - [x] Thread safety: `get_memory()` builds the mem0 client once under a lock (double-checked, published only when fully initialised). Kept lazy on purpose: eager init at startup would make the server fail to start while Ollama or the DB is down, whereas lazy init lets reads keep working
 - [x] Pinned MCP server deps (mcp 1.27.1, mem0ai 2.0.2) — merged (#4), deployed
-- [ ] mem0 history DB in `~/.mem0` inside the container is lost on restart: move it to a PVC, or disable it
+- [x] mem0 history DB: kept in memory (`history_db_path=":memory:"`); Remnant never reads it and keeps its own lifecycle history
 - [x] Redis Stream queue: consumer group, reclaim, 5 attempts then dead-letter stream, legacy list migration, `job_id` idempotency, worker started at app startup, queue metrics — merged (#5), deployed
 - [x] Refuse to start with an empty, placeholder or <16-char `BEARER_TOKEN`; constant-time compare — merged (#4), deployed
 - [ ] Web UI auth: the UI proxy injects the bearer token server-side, so anyone who can reach the UI has full access. Decide: gateway auth (e.g. oauth2-proxy), or no public UI route
@@ -42,12 +42,12 @@
 - [x] Hybrid search: idf-weighted FTS + identifier substring + direct pgvector cosine, weighted RRF, keyword-only when Ollama is offline — merged (#6, #7), deployed
 - [ ] pg_trgm index for the identifier substring match, if search latency becomes a problem
 - [x] Session checkpoints: one per session, excluded from search, restored by exact id, 7-day expiry, Stop capture throttled — merged (#8), deployed
-- [x] Resume/compact recovery output was never printed (bash heredoc error) — merged (#16). **Hook not yet active** in the author's live hook checkout
+- [x] Resume/compact recovery output was never printed (bash heredoc error) — merged (#16), active in the live hook checkout
 - [x] Injection gate: identifier match instead of a cosine threshold (calibration: no threshold above ~44% useful), max 3 items / 3000 chars, per-session cache reset on compaction — merged (#11), active in the Claude hook. Codex parity is pending (its hook lives outside this repo)
 - [~] Latency budget: 5 s total hook deadline, keyword-only fallback when embeddings fail — merged (#11, #6). A separate ~1 s embedding timeout is not implemented
-- [ ] DNS rebinding protection back on, with `allowed_hosts` from config/Helm (currently disabled in `src/main.py`)
+- [x] DNS rebinding protection: `MCP_ALLOWED_HOSTS` (#20), chart 0.2.7 `mcp.dnsRebindingProtection`; on in the author's deployment
 - [~] Test suite: `make test` (unit) and `make test-db` (real PostgreSQL) — local only; CI does not run tests yet
-- [ ] Measure the injection policies with `scripts/bench/` (smoke run, then pilot) before claiming token or time savings
+- [~] Measure the injection policies with `scripts/bench/`: smoke run done 2026-10-17 (9/9 valid, harness fixes #21); pilot pending
 
 ### P1 — documentation
 - [ ] README = users/operators, AGENTS.md = agent rules + architecture, PLAN.md = roadmap, CHANGELOG = history; fold MVP.md in
@@ -146,8 +146,8 @@
 - [x] `plugin/.claude-plugin/plugin.json`: manifest with MCP server, hooks, skills, env vars
 - [x] `plugin/.mcp.json`: manual MCP config template
 - [x] `plugin/hooks/hooks.json`: UserPromptSubmit → search, PreCompact + Stop → save reminder
-- [x] `plugin/hooks/search-memory.py`: reads prompt from stdin, calls search_memory via MCP, injects `<memory>` block
-- [x] `plugin/hooks/save-context.py`: outputs reminder text to call add_memory before session ends
+- [x] `plugin/hooks/search-memory.py` (removed 2026-10-17, replaced by on_user_prompt.py): reads prompt from stdin, calls search_memory via MCP, injects `<memory>` block
+- [x] `plugin/hooks/save-context.py` (removed 2026-10-17, replaced by on_stop/on_pre_compact): outputs reminder text to call add_memory before session ends
 - [x] `plugin/skills/claude-memory/SKILL.md`: when to search, when/how to save, when to delete, type table
 - [x] `plugin/README.md`: install guide (env vars, claude mcp add, hooks setup, skill setup)
 - [x] Commit plugin/ directory to app-development repo

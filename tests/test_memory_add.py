@@ -108,3 +108,29 @@ def test_provenance_and_extraction_becomes_candidate(monkeypatch):
     assert a == {"source": "hook", "session_id": "s1", "project": "remnant"}
     assert b["source"] == "extraction" and b["state"] == "candidate"
     assert c["source"] == "agent" and "state" not in c
+
+
+def test_mem0_history_recording_is_disabled(monkeypatch):
+    closed = []
+
+    class FakeDB:                                # stands in for mem0's SQLiteManager
+        def close(self): closed.append(True)
+
+    class FakeMemory:
+        def __init__(self, config):
+            self.config, self.db = config, FakeDB()
+            class E:
+                def embed(self, text, memory_action=None): return [0.0]
+            self.embedding_model = E()
+
+        def reset(self):                         # like mem0 2.0.2: recreates the SQLite store
+            self.db = FakeDB()
+
+    monkeypatch.setattr(memory, "Memory", FakeMemory)
+    monkeypatch.setattr(memory, "_mem", None)
+    m = memory.get_memory()
+    assert isinstance(m.db, memory._NoHistory) and closed == [True]
+    assert m.config.history_db_path == ":memory:"
+    assert m.db.add_history("id", None, "x", "ADD") is None and m.db.get_last_messages("s") == []
+    m.reset()                                    # history must stay disabled after a reset
+    assert isinstance(m.db, memory._NoHistory) and closed == [True, True]
