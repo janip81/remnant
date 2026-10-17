@@ -447,10 +447,8 @@ def stats() -> dict:
 # ---------------------------------------------------------------------------
 
 def _build_config() -> MemoryConfig:
-    # history_db_path: mem0 records an add/update/delete history in SQLite. Remnant never
-    # reads it (its own lifecycle keeps superseded rows), and the default ~/.mem0/history.db
-    # sat in the container filesystem and vanished on every restart. In memory instead: no
-    # false durability, no disk writes; it is reset whenever the pod restarts.
+    # history_db_path: no file at ~/.mem0/history.db (it sat in the container filesystem
+    # and vanished on every restart). Recording itself is disabled in get_memory().
     return MemoryConfig(
         history_db_path=":memory:",
         vector_store=VectorStoreConfig(
@@ -511,6 +509,21 @@ def _cap_embedding_input(embedder) -> None:
         embedder.embed_batch = embed_batch
 
 
+class _NoHistory:
+    """Stand-in for mem0's SQLite history/messages store. Remnant never reads mem0's
+    history (its lifecycle keeps superseded rows in PostgreSQL), and an in-memory SQLite
+    would grow without bound: every add appends the full text. Writes are dropped;
+    reads return nothing (infer=True then gets no previous-message context)."""
+
+    def add_history(self, *a, **k): return None
+    def batch_add_history(self, *a, **k): return None
+    def save_messages(self, *a, **k): return None
+    def get_history(self, *a, **k): return []
+    def get_last_messages(self, *a, **k): return []
+    def reset(self): return None
+    def close(self): return None
+
+
 def get_memory() -> Memory:
     # Calls arrive from worker threads (asyncio.to_thread); build the client once.
     global _mem
@@ -518,6 +531,8 @@ def get_memory() -> Memory:
         with _mem_lock:
             if _mem is None:
                 m = Memory(config=_build_config())
+                old_db, m.db = m.db, _NoHistory()        # see _NoHistory
+                old_db.close()
                 _cap_embedding_input(m.embedding_model)
                 _mem = m
     return _mem
