@@ -693,8 +693,17 @@ def cmd_blind_export(a):
         (out / "answers" / f"{oid}.md").write_text(src.read_text() if src.exists() else "")
         key[oid] = {"run_id": r["run_id"], "scenario": r["scenario"], "arm": r["arm"], "turn": t["i"]}
         prompts = scen.get(r["scenario"], [])
-        # what the grader may see: the conversation so far, never arm or run identity
-        questions[oid] = {"conversation": prompts[: t["i"] + 1]} if prompts else {"conversation": None}
+        # what the grader may see: the conversation so far (earlier questions with this
+        # run's own earlier answers, then the question being graded) — never arm or run id
+        if prompts:
+            conv = []
+            for j in range(t["i"]):
+                prev = Path(a.workdir) / "runs" / r["run_id"] / f"answer-{j}.md"
+                conv += [{"role": "user", "text": prompts[j]},
+                         {"role": "assistant", "text": prev.read_text() if prev.exists() else ""}]
+            questions[oid] = {"conversation": conv + [{"role": "user", "text": prompts[t["i"]]}]}
+        else:
+            questions[oid] = {"conversation": None}
     (out / "questions.json").write_text(json.dumps(questions, indent=1))
     (out / "KEY-do-not-give-to-grader.json").write_text(json.dumps(key, indent=1))
     print(f"{len(items)} answers -> {out}/answers + questions.json (give the grader only these two)")

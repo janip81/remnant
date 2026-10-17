@@ -283,6 +283,24 @@ def test_blind_export_has_arm_free_questions(tmp_path):
         results, out_dir, seed, workdir, scenarios = str(res), str(tmp_path / "g"), 1, str(work), sc
     bench.cmd_blind_export(A)
     q = json.loads((tmp_path / "g" / "questions.json").read_text())
-    assert q == {"a0000": {"conversation": ["a"]}}
+    assert q == {"a0000": {"conversation": [{"role": "user", "text": "a"}]}}
     assert "C" not in json.dumps(q) and (tmp_path / "g" / "answers" / "a0000.md").read_text() == "answer text"
     assert json.loads((tmp_path / "g" / "KEY-do-not-give-to-grader.json").read_text())["a0000"]["arm"] == "C"
+
+
+def test_blind_export_includes_earlier_answers_of_the_same_run(tmp_path):
+    work = tmp_path / "w"
+    (work / "runs" / "r1").mkdir(parents=True)
+    (work / "runs" / "r1" / "answer-0.md").write_text("first answer")
+    (work / "runs" / "r1" / "answer-1.md").write_text("second answer")
+    res = tmp_path / "res.jsonl"
+    res.write_text(json.dumps({"run_id": "r1", "scenario": "s0", "arm": "B", "turns": [{"i": 0}, {"i": 1}]}) + "\n")
+
+    class A:
+        results, out_dir, seed, workdir, scenarios = str(res), str(tmp_path / "g"), 1, str(work), scen_file(tmp_path, {"1": ["x"]})
+    bench.cmd_blind_export(A)
+    q = json.loads((tmp_path / "g" / "questions.json").read_text())
+    second = next(v for v in q.values() if len(v["conversation"]) == 3)
+    assert second["conversation"] == [{"role": "user", "text": "a"}, {"role": "assistant", "text": "first answer"},
+                                      {"role": "user", "text": "b"}]
+    assert '"B"' not in json.dumps(q)
