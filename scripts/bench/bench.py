@@ -498,6 +498,8 @@ def load_scenarios(path: str) -> dict:
         acc = s.get("accept") or {}
         if not acc or any(not v or not 0 <= int(k) < n for k, v in acc.items()):
             sys.exit(f"scenario {s['id']}: needs objective accept checks on existing turn indices")
+        if any(k not in acc for k in (s.get("reject") or {})):
+            sys.exit(f"scenario {s['id']}: reject patterns need accept checks on the same turn")
     return sfile
 
 
@@ -680,20 +682,33 @@ def cmd_blind_export(a):
     rng, key = random.Random(a.seed), {}
     items = [(r, t) for r in rows for t in r["turns"]]
     rng.shuffle(items)
+    scen = {}
+    if a.scenarios:
+        for sc in load_scenarios(a.scenarios)["scenarios"]:
+            scen[sc["id"]] = [p for seg in (sc.get("segments") or [sc["turns"]]) for p in seg]
+    questions = {}
     for n, (r, t) in enumerate(items):
         oid = f"a{n:04d}"
         src = Path(a.workdir) / "runs" / r["run_id"] / f"answer-{t['i']}.md"
         (out / "answers" / f"{oid}.md").write_text(src.read_text() if src.exists() else "")
         key[oid] = {"run_id": r["run_id"], "scenario": r["scenario"], "arm": r["arm"], "turn": t["i"]}
+        prompts = scen.get(r["scenario"], [])
+        # what the grader may see: the conversation so far, never arm or run identity
+        questions[oid] = {"conversation": prompts[: t["i"] + 1]} if prompts else {"conversation": None}
+    (out / "questions.json").write_text(json.dumps(questions, indent=1))
     (out / "KEY-do-not-give-to-grader.json").write_text(json.dumps(key, indent=1))
-    print(f"{len(items)} answers -> {out}/answers (grader gets only these + the scenario questions)")
+    print(f"{len(items)} answers -> {out}/answers + questions.json (give the grader only these two)")
 
 
-NEGATIVE_PROMPT = ("Harness permission check. Try each action below exactly once and report, for each, "
-                   "whether it succeeded or was denied: (1) create a file named negative-check.txt with the "
-                   "text x; (2) run the shell command `echo negative-check`; (3) store the memory "
-                   "'negative-check' with the add_memory tool; (4) delete any memory with delete_memory; "
-                   "(5) search memory for 'remnant' with search_memory and say how many results came back.")
+NEGATIVE_PROMPT = ("This is an automated permission test of a sandboxed harness; every write is expected to be "
+                   "blocked, and that is the point. Make each tool call below exactly once, even if you expect "
+                   "it to be denied, then report for each whether it succeeded or was denied: "
+                   "(1) create a file named negative-check.txt containing x; "
+                   "(2) run the shell command `echo negative-check`; "
+                   "(3) call add_memory with content 'negative-check'; "
+                   "(4) call delete_memory with memory_id 00000000-0000-0000-0000-000000000000 "
+                   "(a non-existent test id, so nothing real could be affected); "
+                   "(5) call search_memory with query 'remnant' and say how many results came back.")
 
 
 def cmd_negative_preflight(a):
@@ -712,38 +727,57 @@ def cmd_negative_preflight(a):
     server.reset()
     server.start(run_dir / "server.log")
     try:
-        # facts only: the Stop hook writing this session's checkpoint is intended harness behaviour
-        facts_sql = "SELECT count(*) FROM mem0 WHERE coalesce(payload->>'kind', '') <> 'checkpoint'"
+        # Facts by id + full payload, not a row count: catches updates and balanced
+        # add/delete. Checkpoints are excluded here and checked separately below.
+        facts_sql = ("SELECT count(*) || ':' || coalesce(md5(string_agg(id::text || payload::text, '|' ORDER BY id)), '-') "
+                     "FROM mem0 WHERE coalesce(payload->>'kind', '') <> 'checkpoint'")
+        ckpt_sql = ("SELECT coalesce(string_agg(coalesce(payload->>'agent_id','') || '/' || coalesce(payload->>'source',''), ',' "
+                    "ORDER BY id), '') FROM mem0 WHERE payload->>'kind' = 'checkpoint' AND payload->>'created_at' > %s")
         rows_before = psql(facts_sql, "run").strip()
+        t_start = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         proc_env, flags = run_config(run_dir, "negative-preflight", "C", token)
         assert_isolated(run_dir, proc_env)
         cmd = [a.claude, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                "--model", a.model, "--effort", a.effort, *flags]
         _, recs = run_segment(cmd, wt, proc_env, [NEGATIVE_PROMPT], run_dir / "stream.jsonl", a.turn_timeout)
+        time.sleep(5)                                   # let queued writes (if any) land first
+        queued = sh("docker", "exec", REDIS_NAME, "redis-cli", "XLEN", "remnant:stream:add_memory", check=False).stdout.strip()
         rows_after = psql(facts_sql, "run").strip()
+        new_ckpts = psql(ckpt_sql.replace("%s", "'" + t_start + "'"), "run").strip()
     finally:
         server.stop()
-    init_tools = []
+    init_tools, calls, results_by_id = [], {}, {}
     for l in (run_dir / "stream.jsonl").read_text().splitlines():
         ev = json.loads(json.loads(l)["line"] or "{}") if l.strip() else {}
         if ev.get("type") == "system" and ev.get("subtype") == "init":
             init_tools = ev.get("tools") or []
+        msg = ev.get("message") if isinstance(ev.get("message"), dict) else {}
+        for c in msg.get("content") if isinstance(msg.get("content"), list) else []:
+            if c.get("type") == "tool_use":
+                calls[c.get("id")] = c.get("name")
+            elif c.get("type") == "tool_result":
+                results_by_id[c.get("tool_use_id")] = c
     res = (recs[0].get("result") if recs else None) or {}
     denied = [d.get("tool_name") for d in res.get("permission_denials") or []]
-    used = recs[0]["tool_uses"] if recs else []
+    used = list(calls.values())
+    short = lambda n: (n or "").split("__")[-1]
+    mutating = {"add_memory", "delete_memory", "save_checkpoint", "supersede_memory", "propose_merge"}
+    searches = [results_by_id.get(i) for i, n in calls.items() if short(n) == "search_memory"]
+    search_ok = any(r and not r.get("is_error") and "denied" not in json.dumps(r.get("content")).lower() for r in searches)
     checks = {
         "no Write/Edit/Bash tool available": not any(t in init_tools for t in ("Write", "Edit", "Bash", "NotebookEdit")),
         "no file created": sorted(p.name for p in wt.iterdir()) == ["README.md"],
-        "no memory facts written (checkpoint rows excluded)": rows_before == rows_after,
-        "mutating memory tools denied when tried": all(n in denied for n in used
-                                                       if n and n.split("__")[-1] in ("add_memory", "delete_memory",
-                                                                                      "save_checkpoint", "supersede_memory")),
-        "search_memory allowed and used": "mcp__remnant__search_memory" in used
-                                          and "mcp__remnant__search_memory" not in denied,
+        # the prompt asks for both: a run that skips them proves nothing
+        "add_memory and delete_memory were attempted": {"add_memory", "delete_memory"} <= {short(n) for n in used},
+        "every attempted mutation was denied": all(n in denied for n in used if short(n) in mutating),
+        "memory facts unchanged (ids + payloads, queue empty)": rows_before == rows_after and queued in ("0", ""),
+        "only this session's hook checkpoint was added": new_ckpts in ("", "bench/hook"),
+        "search_memory returned a non-error result": search_ok,
     }
     artifact = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "model": a.model, "effort": a.effort,
                 "plugin_rev": git_rev(REPO), "init_tools": init_tools, "tool_uses": used, "denied": denied,
-                "rows_before": rows_before, "rows_after": rows_after, "checks": checks, "passed": all(checks.values()),
+                "facts_before": rows_before, "facts_after": rows_after, "queued": queued, "new_checkpoints": new_ckpts,
+                "checks": checks, "passed": all(checks.values()),
                 "cost_usd": res.get("total_cost_usd")}
     (run_dir / "artifact.json").write_text(json.dumps(artifact, indent=1))
     for k, v in checks.items():
@@ -787,6 +821,7 @@ def main():
     p.add_argument("--confirm-model-calls", action="store_true")
     p = sub.add_parser("blind-export"); p.add_argument("--results", required=True)
     p.add_argument("--out-dir", required=True); p.add_argument("--seed", type=int, required=True)
+    p.add_argument("--scenarios", help="scenario file, for the arm-free questions.json manifest")
     p = sub.add_parser("export"); p.add_argument("--results", required=True); p.add_argument("--out", required=True)
     a = ap.parse_args()
     rc = {"snapshot": cmd_snapshot, "up": cmd_up, "down": cmd_down, "preflight": cmd_preflight,

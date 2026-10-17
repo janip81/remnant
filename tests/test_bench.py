@@ -261,3 +261,28 @@ def test_per_turn_costs_are_summed_and_mixed_fails_closed(tmp_path, monkeypatch)
 def test_reject_patterns_fail_contradicting_answers():
     assert bench.accept("uses Recreate because of the RWO volume", ["Recreate"], ["RollingUpdate"])
     assert not bench.accept("Recreate, or actually RollingUpdate", ["Recreate"], ["RollingUpdate"])
+
+
+def test_reject_only_turn_is_a_scenario_error(tmp_path):
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"repo": "/r", "repo_commit": "HEAD", "scenarios": [
+        {"id": "s0", "category": "identifier", "turns": ["a", "b"], "accept": {"1": ["x"]}, "reject": {"0": ["y"]}}]}))
+    with pytest.raises(SystemExit, match="reject patterns need accept"):
+        bench.load_scenarios(str(p))
+
+
+def test_blind_export_has_arm_free_questions(tmp_path):
+    work = tmp_path / "w"
+    (work / "runs" / "r1").mkdir(parents=True)
+    (work / "runs" / "r1" / "answer-0.md").write_text("answer text")
+    res = tmp_path / "res.jsonl"
+    res.write_text(json.dumps({"run_id": "r1", "scenario": "s0", "arm": "C", "turns": [{"i": 0}]}) + "\n")
+    sc = scen_file(tmp_path, {"1": ["x"]})
+
+    class A:
+        results, out_dir, seed, workdir, scenarios = str(res), str(tmp_path / "g"), 1, str(work), sc
+    bench.cmd_blind_export(A)
+    q = json.loads((tmp_path / "g" / "questions.json").read_text())
+    assert q == {"a0000": {"conversation": ["a"]}}
+    assert "C" not in json.dumps(q) and (tmp_path / "g" / "answers" / "a0000.md").read_text() == "answer text"
+    assert json.loads((tmp_path / "g" / "KEY-do-not-give-to-grader.json").read_text())["a0000"]["arm"] == "C"
