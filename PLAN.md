@@ -21,7 +21,7 @@
 
 ### P0 — correctness / security
 - [x] Blocking calls moved off the event loop (`asyncio.to_thread`) — merged (#4), deployed
-- [ ] Thread safety: create the mem0 `Memory` once at startup; a lock exists, startup init is still open
+- [x] Thread safety: `get_memory()` builds the mem0 client once under a lock (double-checked, published only when fully initialised). Kept lazy on purpose: eager init at startup would make the server fail to start while Ollama or the DB is down, whereas lazy init lets reads keep working
 - [x] Pinned MCP server deps (mcp 1.27.1, mem0ai 2.0.2) — merged (#4), deployed
 - [ ] mem0 history DB in `~/.mem0` inside the container is lost on restart: move it to a PVC, or disable it
 - [x] Redis Stream queue: consumer group, reclaim, 5 attempts then dead-letter stream, legacy list migration, `job_id` idempotency, worker started at app startup, queue metrics — merged (#5), deployed
