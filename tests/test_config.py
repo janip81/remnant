@@ -29,3 +29,15 @@ def test_remnant_name_wins(monkeypatch):
     monkeypatch.setenv("REMNANT_USER_ID", "new")
     monkeypatch.setenv("MEM0_USER_ID", "old")
     assert Settings(_env_file=None).mem0_user_id == "new"
+
+
+def test_mcp_dns_rebinding_protection_follows_allowed_hosts():
+    from config import Settings, mcp_transport_security
+    base = dict(bearer_token="x" * 32)
+    off = mcp_transport_security(Settings(**base))
+    assert off.enable_dns_rebinding_protection is False                     # unchanged default
+    on = mcp_transport_security(Settings(**base, mcp_allowed_hosts="remnant:8080, remnant-mcp.example.se",
+                                         mcp_allowed_origins="https://ui.example.se"))
+    assert on.enable_dns_rebinding_protection is True
+    assert on.allowed_hosts[:2] == ["remnant:8080", "remnant-mcp.example.se"]
+    assert "127.0.0.1:*" in on.allowed_hosts and on.allowed_origins == ["https://ui.example.se"]

@@ -7,10 +7,10 @@ from typing import Optional
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
+from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
 
 import memory as mem_store
-from config import settings
+from config import settings, mcp_transport_security
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ settings.require_safe_token()
 mcp = FastMCP(
     "claude-memory",
     stateless_http=True,
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    transport_security=mcp_transport_security(settings),
 )
 
 
@@ -196,6 +196,9 @@ async def delete_memory(memory_id: str) -> str:
 # to bypass Starlette's redirect_slashes (caused 307s on POST /mcp).
 _starlette_app = mcp.streamable_http_app()
 _mcp_handler = _starlette_app.router.routes[0].app
+# The SDK checks Host/Origin inside its transport, but main.py answers "initialize"
+# itself (stateless workaround below), so run the same check up front for all of /mcp.
+_mcp_security = TransportSecurityMiddleware(mcp.settings.transport_security)
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +637,11 @@ async def app(scope, receive, send):
         return
 
     # /mcp — MCP protocol (bearer auth required)
+    from starlette.requests import Request
+    rejected = await _mcp_security.validate_request(Request(scope), is_post=method == "POST")
+    if rejected:                                   # DNS rebinding protection (MCP_ALLOWED_HOSTS)
+        await rejected(scope, receive, send)
+        return
     if not _check_auth(headers):
         await _send_response(send, 401, [[b"content-type", b"text/plain"]], b"Unauthorized")
         return
