@@ -123,6 +123,7 @@ def test_scenarios_need_objective_checks(tmp_path):
 def test_schedule_is_reproducible_and_paired(tmp_path):
     class A:
         scenarios, repeats, seed = scen_file(tmp_path, {"1": ["x"]}), 2, 42
+        balance = "shuffle"
     plans = []
     for _ in range(2):
         A.out = str(tmp_path / f"plan{len(plans)}.json")
@@ -314,3 +315,22 @@ def test_reject_matches_after_a_negator_are_denials():
     # a negator in an earlier sentence does not protect a later affirmative claim
     assert not bench.accept("Not sure. It uses a dedicated Redis instance, omniroute:.", ["omniroute:"],
                             [r"dedicated redis instance"])
+
+
+def test_latin_square_balances_arm_positions(tmp_path):
+    import collections
+
+    class A:
+        scenarios, repeats, seed, balance = scen_file(tmp_path, {"1": ["x"]}), 3, 7, "latin"
+        out = str(tmp_path / "plan.json")
+    bench.cmd_schedule(A)
+    runs = json.loads(Path(A.out).read_text())["runs"]
+    assert len(runs) == 3 * 3 * 3
+    per_scenario = collections.defaultdict(collections.Counter)
+    for i in range(0, len(runs), 3):
+        block = runs[i:i + 3]
+        assert sorted(r["arm"] for r in block) == ["B", "B0", "C"]          # still paired blocks
+        for pos, r in enumerate(block):
+            per_scenario[r["scenario"]][(r["arm"], pos)] += 1
+    for counts in per_scenario.values():                                   # every arm once per position
+        assert len(counts) == 9 and set(counts.values()) == {1}
