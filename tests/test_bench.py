@@ -45,15 +45,21 @@ def test_crash_is_recorded_as_a_failed_turn(tmp_path, monkeypatch):
 
 
 def turns_from(recs):
-    return [{"usage": (r["result"] or {}).get("usage"), "cost_usd": (r["result"] or {}).get("total_cost_usd")}
-            for r in recs]
+    out = []
+    for r in recs:
+        res = r["result"] or {}
+        mu = res.get("modelUsage")
+        out.append({"usage": res.get("usage"), "cost_usd": res.get("total_cost_usd"),
+                    "model_usage_output": sum(v["outputTokens"] for v in mu.values()) if mu else None})
+    return out
 
 
 def test_usage_totals_and_unknown_stays_unknown(tmp_path, monkeypatch):
     _, recs = segment(tmp_path, monkeypatch)
     t = bench.run_totals(turns_from(recs))
     assert t["total_input_tokens"] == 2 * 1110 and t["output_tokens"] == 10      # thinking not added again
-    assert t["cost_usd"] == pytest.approx(0.02)
+    assert t["cost_usd"] == pytest.approx(0.02) and t["cost_semantics"] == "cumulative"   # last value, not 0.01+0.02
+    assert t["cost_usd_raw_sum"] == pytest.approx(0.03)
     _, recs = segment(tmp_path, monkeypatch, "nocost")
     t = bench.run_totals(turns_from(recs))
     assert t["cost_usd"] is None and t["cache_read_input_tokens"] is None and t["total_input_tokens"] is None
@@ -170,7 +176,7 @@ def test_cap_fails_closed(tmp_path, monkeypatch):
         ran.append(c)
         row = {"scenario": spec["scenario"], "repeat": spec["repeat"], "arm": spec["arm"], "cost_usd": c,
                "run_id": "r", "harness_valid": True, "cli_ok": True, "accepted": True, "hook_problems": []}
-        with open(a[-1], "a") as f:
+        with open(a[-2], "a") as f:           # (..., results, meta)
             f.write(json.dumps(row) + "\n")
         return row
 
@@ -183,6 +189,7 @@ def test_cap_fails_closed(tmp_path, monkeypatch):
     class A:
         claude, confirm_model_calls, plan_ = sys.executable, False, None
         workdir, python, model, turn_timeout = str(tmp_path / "w"), sys.executable, "m", 5
+        reserve_usd, effort, cache_regime = 0.0, "medium", "test"
     A.plan, A.results = str(plan), str(tmp_path / "res.jsonl")
     # worst case 1.0 declared: 0.5 runs (1.0 fits in 3), then worst=1 -> 0.5+1 fits -> 2.0 runs,
     # worst=2 -> 2.5+2 > 3 stops before the next run
@@ -228,3 +235,54 @@ def test_private_destinations(tmp_path):
         bench.private_file(f)
     with pytest.raises(SystemExit):
         bench.private_dir(ROOT / "bench-work")                     # in the repo and not ignored
+
+
+def test_cost_is_not_double_counted_across_resume(tmp_path, monkeypatch):
+    """Smoke 2026-10-17: after --resume total_cost_usd/modelUsage include the earlier
+    segment. Session cost = last cumulative value."""
+    _, seg0 = segment(tmp_path, monkeypatch, prompts=("first",))
+    monkeypatch.setenv("FAKE_PREV_COST", "0.01")
+    monkeypatch.setenv("FAKE_PREV_OUT", "5")
+    _, seg1 = segment(tmp_path, monkeypatch, prompts=("after resume",))
+    turns = turns_from(seg0 + seg1)
+    assert bench.cost_semantics(turns) == ["either", "cumulative"]
+    assert bench.run_cost(turns) == (pytest.approx(0.02), "cumulative")
+
+
+def test_per_turn_costs_are_summed_and_mixed_fails_closed(tmp_path, monkeypatch):
+    _, recs = segment(tmp_path, monkeypatch, "per-turn")
+    turns = turns_from(recs)
+    assert bench.cost_semantics(turns) == ["either", "per-turn"]
+    assert bench.run_cost(turns) == (pytest.approx(0.02), "per-turn")
+    mixed = [dict(turns[0]), {**turns[1], "model_usage_output": 999}]
+    assert bench.run_cost(mixed) == (None, "mixed/unknown")
+
+
+def test_reject_patterns_fail_contradicting_answers():
+    assert bench.accept("uses Recreate because of the RWO volume", ["Recreate"], ["RollingUpdate"])
+    assert not bench.accept("Recreate, or actually RollingUpdate", ["Recreate"], ["RollingUpdate"])
+
+
+def test_reject_only_turn_is_a_scenario_error(tmp_path):
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"repo": "/r", "repo_commit": "HEAD", "scenarios": [
+        {"id": "s0", "category": "identifier", "turns": ["a", "b"], "accept": {"1": ["x"]}, "reject": {"0": ["y"]}}]}))
+    with pytest.raises(SystemExit, match="reject patterns need accept"):
+        bench.load_scenarios(str(p))
+
+
+def test_blind_export_has_arm_free_questions(tmp_path):
+    work = tmp_path / "w"
+    (work / "runs" / "r1").mkdir(parents=True)
+    (work / "runs" / "r1" / "answer-0.md").write_text("answer text")
+    res = tmp_path / "res.jsonl"
+    res.write_text(json.dumps({"run_id": "r1", "scenario": "s0", "arm": "C", "turns": [{"i": 0}]}) + "\n")
+    sc = scen_file(tmp_path, {"1": ["x"]})
+
+    class A:
+        results, out_dir, seed, workdir, scenarios = str(res), str(tmp_path / "g"), 1, str(work), sc
+    bench.cmd_blind_export(A)
+    q = json.loads((tmp_path / "g" / "questions.json").read_text())
+    assert q == {"a0000": {"conversation": ["a"]}}
+    assert "C" not in json.dumps(q) and (tmp_path / "g" / "answers" / "a0000.md").read_text() == "answer text"
+    assert json.loads((tmp_path / "g" / "KEY-do-not-give-to-grader.json").read_text())["a0000"]["arm"] == "C"
