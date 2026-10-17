@@ -43,8 +43,10 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
-MEMORY_URL = os.environ.get("CLAUDE_MEMORY_URL", "http://claude-memory:8080")
-MEMORY_TOKEN = os.environ.get("CLAUDE_MEMORY_TOKEN", "")
+# REMNANT_* is the current name; CLAUDE_MEMORY_* (pre-rename) is still read so the
+# chart can switch names after this image is deployed.
+MEMORY_URL = os.environ.get("REMNANT_URL") or os.environ.get("CLAUDE_MEMORY_URL", "http://remnant:8080")
+MEMORY_TOKEN = os.environ.get("REMNANT_TOKEN") or os.environ.get("CLAUDE_MEMORY_TOKEN", "")
 TAGGING_MODE = os.environ.get("TAGGING_MODE", "keyword")  # keyword | llm | hybrid
 
 ARCHIVE_TABLE = "mem0_archive"

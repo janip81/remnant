@@ -77,3 +77,17 @@ def test_dedup_meta_view_skips_json_null_like_sql():
     for junk in ("x", ["x"], None):
         out = dedup_job._merge_tags_and_mark_reviewed({"data": "d", "tags": ["a"], "metadata": junk}, ["b"])
         assert out["tags"] == ["a", "b"] and out.get("metadata") == junk
+
+
+def test_memory_url_prefers_remnant_names(monkeypatch):
+    import importlib
+    monkeypatch.setenv("CLAUDE_MEMORY_URL", "http://old:1")
+    monkeypatch.setenv("CLAUDE_MEMORY_TOKEN", "old")
+    monkeypatch.delenv("REMNANT_URL", raising=False)
+    monkeypatch.delenv("REMNANT_TOKEN", raising=False)
+    m = importlib.reload(dedup_job)
+    assert (m.MEMORY_URL, m.MEMORY_TOKEN) == ("http://old:1", "old")           # old chart still works
+    monkeypatch.setenv("REMNANT_URL", "http://new:2")
+    monkeypatch.setenv("REMNANT_TOKEN", "new")
+    m = importlib.reload(dedup_job)
+    assert (m.MEMORY_URL, m.MEMORY_TOKEN) == ("http://new:2", "new")
