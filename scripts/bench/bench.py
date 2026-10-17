@@ -524,11 +524,24 @@ def cmd_schedule(a):
     blocks = [(s["id"], r) for s in sfile["scenarios"] for r in range(a.repeats)]
     rng.shuffle(blocks)
     plan = []
+    if a.balance == "latin":
+        # Latin square: within each scenario, repeat r uses the r-th cyclic rotation of a
+        # (seeded) arm order, so with repeats == len(ARMS) every arm takes every position
+        # exactly once per scenario. Provider prompt caching favours later positions
+        # (pilot 2026-10-17), so position must not be confounded with arm.
+        base = list(ARMS)
+        rng.shuffle(base)
+        rows = [base[i:] + base[:i] for i in range(len(base))]
+        offset = {s["id"]: rng.randrange(len(rows)) for s in sfile["scenarios"]}
     for sid, r in blocks:                      # paired: all arms of one scenario×repeat together
-        arms = list(ARMS)
-        rng.shuffle(arms)
+        if a.balance == "latin":
+            arms = rows[(offset[sid] + r) % len(rows)]
+        else:
+            arms = list(ARMS)
+            rng.shuffle(arms)
         plan += [{"scenario": sid, "repeat": r, "arm": arm, "block": f"{sid}-r{r}"} for arm in arms]
-    Path(a.out).write_text(json.dumps({"seed": a.seed, "scenarios": a.scenarios, "runs": plan}, indent=1))
+    Path(a.out).write_text(json.dumps({"seed": a.seed, "scenarios": a.scenarios, "balance": a.balance,
+                                       "runs": plan}, indent=1))
     print(f"{len(plan)} runs -> {a.out}")
 
 
@@ -838,6 +851,8 @@ def main():
     sub.add_parser("preflight")
     p = sub.add_parser("schedule"); p.add_argument("--scenarios", required=True); p.add_argument("--repeats", type=int, default=2)
     p.add_argument("--seed", type=int, required=True); p.add_argument("--out", required=True)
+    p.add_argument("--balance", choices=["shuffle", "latin"], default="shuffle",
+                   help="latin: each arm in each block position equally often (use repeats = 3)")
     p = sub.add_parser("execute"); p.add_argument("--plan", required=True); p.add_argument("--results", required=True)
     p.add_argument("--cap-usd", type=float, required=True); p.add_argument("--model", required=True)
     p.add_argument("--turn-timeout", type=int, default=600)
