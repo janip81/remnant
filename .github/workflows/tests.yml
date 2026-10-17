@@ -1,0 +1,51 @@
+name: Tests
+
+# Runs the full suite, including the real-PostgreSQL tests, on every PR and on
+# pushes to dev/main. Separate from the image build so a failing test is visible
+# before merge without blocking manual image builds.
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: remnant
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: remnant
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U remnant"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"     # same as Dockerfile.mcp
+          cache: pip
+          cache-dependency-path: |
+            requirements-mcp.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-mcp.txt -r requirements-dev.txt
+
+      - name: Run tests
+        env:
+          TEST_DATABASE_URL: postgresql://remnant:test@127.0.0.1:5432/remnant
+          MEM0_TELEMETRY: "false"
+        run: python -m pytest -q tests
