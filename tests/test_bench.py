@@ -304,3 +304,13 @@ def test_blind_export_includes_earlier_answers_of_the_same_run(tmp_path):
     assert second["conversation"] == [{"role": "user", "text": "a"}, {"role": "assistant", "text": "first answer"},
                                       {"role": "user", "text": "b"}]
     assert '"B"' not in json.dumps(q)
+
+
+def test_reject_matches_after_a_negator_are_denials():
+    assert bench.accept("It does not use a dedicated Redis instance; prefix omniroute:.", ["omniroute:"],
+                        [r"dedicated redis instance"])
+    assert not bench.accept("It uses a dedicated Redis instance; prefix omniroute:.", ["omniroute:"],
+                            [r"dedicated redis instance"])
+    # a negator in an earlier sentence does not protect a later affirmative claim
+    assert not bench.accept("Not sure. It uses a dedicated Redis instance, omniroute:.", ["omniroute:"],
+                            [r"dedicated redis instance"])

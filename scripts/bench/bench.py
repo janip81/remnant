@@ -344,11 +344,26 @@ def check_events(log: Path, run_id: str, segments: list[list[str]], policy: str 
     return sorted(set(problems), key=problems.index)
 
 
+_NEGATOR = re.compile(r"\b(not|n't|never|no|neither|nor|instead of|rather than|isn't|aren't|doesn't|don't)\b", re.I)
+
+
+def _negated(text: str, start: int, window: int = 30) -> bool:
+    """A negator shortly before `start`, within the same sentence."""
+    before = text[max(0, start - window):start]
+    before = re.split(r"[.;!?\n]", before)[-1]
+    return bool(_NEGATOR.search(before))
+
+
 def accept(answer: str, patterns: list[str], reject: list[str] | None = None) -> bool:
     """All accept patterns match and no reject pattern (a known wrong/contradicting
-    claim) does. Keyword checks are a floor; blinded grading judges usefulness."""
-    return (all(re.search(p, answer or "", re.I | re.S) for p in patterns)
-            and not any(re.search(p, answer or "", re.I | re.S) for p in reject or []))
+    claim) matches affirmatively; a reject match right after a negator ("not X",
+    "does not use a dedicated X") is a denial, not a claim. Keyword checks are a
+    reproducible floor: they can't parse every negation or value binding, so the
+    blinded grade is the primary quality measure and disagreements are reported."""
+    text = answer or ""
+    if not all(re.search(p, text, re.I | re.S) for p in patterns):
+        return False
+    return not any(not _negated(text, m.start()) for p in reject or [] for m in re.finditer(p, text, re.I | re.S))
 
 
 # Claude result usage: input_tokens, cache_creation_input_tokens and
