@@ -4,16 +4,19 @@ No mem0 or DB dependency; only httpx for the proxy.
 """
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import Response, FileResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 MCP_URL = os.environ.get("MCP_INTERNAL_URL", "http://claude-memory:8080")
 BEARER_TOKEN = os.environ.get("BEARER_TOKEN", "")
 UI_PORT = int(os.environ.get("UI_PORT", "8081"))
+# 127.0.0.1 when an auth proxy sidecar fronts the UI, so the pod IP cannot bypass it
+UI_HOST = os.environ.get("UI_HOST", "0.0.0.0")
 DIST = Path(__file__).parent / "dist"
 
 app = FastAPI(title="claude-memory-ui")
@@ -26,8 +29,20 @@ async def health():
     return {"status": "ok", "service": "claude-memory-ui"}
 
 
+def _cross_origin(request: Request) -> bool:
+    """True for a browser write coming from another origin. The proxy adds the bearer
+    token, and SameSite=Lax cookies are still sent from sibling subdomains (same site),
+    so a session cookie alone must not authorise writes."""
+    origin = request.headers.get("origin")
+    if origin:
+        return urlsplit(origin).netloc.lower() != request.headers.get("host", "").lower()
+    return request.headers.get("sec-fetch-site", "same-origin") not in ("same-origin", "none")
+
+
 @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy(path: str, request: Request) -> Response:
+    if request.method != "GET" and _cross_origin(request):
+        return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
     url = f"{MCP_URL}/api/{path}"
     qs = request.url.query
     if qs:
@@ -45,6 +60,10 @@ async def proxy(path: str, request: Request) -> Response:
             content=body,
             timeout=30,
         )
+    if resp.status_code == 401:
+        # The MCP bearer token is wrong: a server misconfiguration, not the user's session.
+        # Only the auth proxy may answer 401, which the SPA treats as "log in again".
+        return JSONResponse({"error": "UI backend could not authenticate to MCP"}, status_code=502)
     return Response(
         content=resp.content,
         status_code=resp.status_code,
@@ -73,4 +92,4 @@ else:
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=UI_PORT)
+    uvicorn.run(app, host=UI_HOST, port=UI_PORT)
