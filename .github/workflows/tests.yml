@@ -42,7 +42,7 @@ jobs:
             requirements-dev.txt
 
       - name: Install dependencies
-        run: pip install -r requirements-mcp.txt -r requirements-dev.txt
+        run: pip install -r requirements-mcp.txt -r requirements-ui.txt -r requirements-dev.txt
 
       - name: Run tests
         env:

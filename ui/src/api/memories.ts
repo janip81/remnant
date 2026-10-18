@@ -1,3 +1,5 @@
+import { apiFetch } from './http'
+
 export type MemoryCategory = 'project' | 'feedback' | 'reference' | 'user' | 'session' | 'incident' | ''
 
 export type MemoryState = 'active' | 'candidate' | 'superseded' | 'rejected'
@@ -36,8 +38,7 @@ export interface FetchParams {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, init)
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+  const res = await apiFetch(path, init)
   return res.json()
 }
 

@@ -4,11 +4,12 @@ No mem0 or DB dependency; only httpx for the proxy.
 """
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import Response, FileResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 MCP_URL = os.environ.get("MCP_INTERNAL_URL", "http://claude-memory:8080")
@@ -28,8 +29,20 @@ async def health():
     return {"status": "ok", "service": "claude-memory-ui"}
 
 
+def _cross_origin(request: Request) -> bool:
+    """True for a browser write coming from another origin. The proxy adds the bearer
+    token, and SameSite=Lax cookies are still sent from sibling subdomains (same site),
+    so a session cookie alone must not authorise writes."""
+    origin = request.headers.get("origin")
+    if origin:
+        return urlsplit(origin).netloc.lower() != request.headers.get("host", "").lower()
+    return request.headers.get("sec-fetch-site", "same-origin") not in ("same-origin", "none")
+
+
 @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy(path: str, request: Request) -> Response:
+    if request.method != "GET" and _cross_origin(request):
+        return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
     url = f"{MCP_URL}/api/{path}"
     qs = request.url.query
     if qs:
