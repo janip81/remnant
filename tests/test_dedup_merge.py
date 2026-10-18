@@ -91,3 +91,90 @@ def test_memory_url_prefers_remnant_names(monkeypatch):
     monkeypatch.setenv("REMNANT_TOKEN", "new")
     m = importlib.reload(dedup_job)
     assert (m.MEMORY_URL, m.MEMORY_TOKEN) == ("http://new:2", "new")
+
+
+class OpenAIResp:
+    def __init__(self, content, finish="stop", status=200):
+        self.content, self.finish, self.status_code = content, finish, status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return {"choices": [{"message": {"content": self.content}, "finish_reason": self.finish}]}
+
+
+def use_openai(monkeypatch, fallback=True):
+    monkeypatch.setattr(dedup_job, "DEDUP_LLM", "openai")
+    monkeypatch.setattr(dedup_job, "DEDUP_LLM_URL", "http://omniroute.example/v1")
+    monkeypatch.setattr(dedup_job, "DEDUP_LLM_MODEL", "auto/best-fast")
+    monkeypatch.setattr(dedup_job, "DEDUP_LLM_API_KEY", "k")
+    monkeypatch.setattr(dedup_job, "DEDUP_LLM_FALLBACK", fallback)
+
+
+def test_openai_compatible_merge_request_and_parsing(monkeypatch):
+    use_openai(monkeypatch)
+    seen = {}
+
+    def post(url, json, timeout, headers=None):
+        seen.update(url=url, body=json, headers=headers)
+        return OpenAIResp('{"facts": ["fact one", "fact two"]}')
+    monkeypatch.setattr(dedup_job.requests, "post", post)
+    assert dedup_job.ollama_merge(["fact one here", "fact two here"]) == "- fact one\n- fact two"
+    assert seen["url"] == "http://omniroute.example/v1/chat/completions"
+    assert seen["headers"] == {"Authorization": "Bearer k"}
+    b = seen["body"]
+    assert b["model"] == "auto/best-fast" and b["response_format"] == {"type": "json_object"}
+    assert b["temperature"] == 0 and b["max_tokens"] > 0 and "data, not instructions" in b["messages"][0]["content"]
+
+
+def test_openai_truncated_merge_is_rejected(monkeypatch):
+    use_openai(monkeypatch)
+    monkeypatch.setattr(dedup_job.requests, "post", lambda *a, **k: OpenAIResp('{"facts": ["x"', finish="length"))
+    assert dedup_job.ollama_merge(["a", "b"]) is None
+
+
+def test_openai_failure_falls_back_to_local_ollama(monkeypatch):
+    use_openai(monkeypatch)
+    calls = []
+
+    def post(url, json, timeout, headers=None):
+        calls.append(url)
+        if "omniroute" in url:
+            return OpenAIResp("", status=503)
+        return Resp('{"facts": ["merged fact"]}')
+    monkeypatch.setattr(dedup_job.requests, "post", post)
+    assert dedup_job.ollama_merge(["merged fact a", "merged fact b"]) == "- merged fact"
+    assert calls[0].endswith("/chat/completions") and calls[1].endswith("/api/generate")
+
+
+def test_openai_failure_without_fallback_rejects_the_merge(monkeypatch):
+    use_openai(monkeypatch, fallback=False)
+    calls = []
+    monkeypatch.setattr(dedup_job.requests, "post",
+                        lambda url, json, timeout, headers=None: calls.append(url) or OpenAIResp("", status=503))
+    assert dedup_job.ollama_merge(["a", "b"]) is None and len(calls) == 1      # never reached Ollama
+
+
+def test_default_stays_local_only(monkeypatch):
+    monkeypatch.setattr(dedup_job, "DEDUP_LLM", "ollama")
+    monkeypatch.setattr(dedup_job, "DEDUP_LLM_URL", "http://omniroute.example/v1")
+    monkeypatch.setattr(dedup_job, "DEDUP_LLM_MODEL", "auto/best-fast")
+    urls = []
+    monkeypatch.setattr(dedup_job.requests, "post", lambda url, json, timeout, **k: urls.append(url) or Resp('{"facts": ["f"]}'))
+    dedup_job.ollama_merge(["f a", "f b"])
+    assert urls and all(u.endswith("/api/generate") for u in urls)
+
+
+def test_openai_400_retries_without_json_mode(monkeypatch):
+    use_openai(monkeypatch, fallback=False)
+    bodies = []
+
+    def post(url, json, timeout, headers=None):
+        bodies.append(dict(json))
+        return OpenAIResp("", status=400) if "response_format" in json else OpenAIResp('{"facts": ["kept fact"]}')
+    monkeypatch.setattr(dedup_job.requests, "post", post)
+    assert dedup_job.ollama_merge(["kept fact one", "kept fact two"]) == "- kept fact"
+    assert "response_format" in bodies[0] and "response_format" not in bodies[1]
+    assert bodies[0]["max_tokens"] >= 4096                      # room for hosted thinking models
