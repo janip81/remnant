@@ -14,6 +14,8 @@ from fastapi.staticfiles import StaticFiles
 MCP_URL = os.environ.get("MCP_INTERNAL_URL", "http://claude-memory:8080")
 BEARER_TOKEN = os.environ.get("BEARER_TOKEN", "")
 UI_PORT = int(os.environ.get("UI_PORT", "8081"))
+# 127.0.0.1 when an auth proxy sidecar fronts the UI, so the pod IP cannot bypass it
+UI_HOST = os.environ.get("UI_HOST", "0.0.0.0")
 DIST = Path(__file__).parent / "dist"
 
 app = FastAPI(title="claude-memory-ui")
@@ -73,4 +75,4 @@ else:
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=UI_PORT)
+    uvicorn.run(app, host=UI_HOST, port=UI_PORT)
