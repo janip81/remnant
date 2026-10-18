@@ -50,7 +50,7 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
 DEDUP_LLM = os.environ.get("DEDUP_LLM", "ollama").strip().lower()
 DEDUP_LLM_URL = os.environ.get("DEDUP_LLM_URL", "").rstrip("/")
 DEDUP_LLM_MODEL = os.environ.get("DEDUP_LLM_MODEL", "")
-DEDUP_LLM_API_KEY = os.environ.get("DEDUP_LLM_API_KEY", "")
+DEDUP_LLM_API_KEY = os.environ.get("DEDUP_LLM_API_KEY", "").strip()
 DEDUP_LLM_FALLBACK = os.environ.get("DEDUP_LLM_FALLBACK", "true").strip().lower() != "false"
 # REMNANT_* is the current name; CLAUDE_MEMORY_* (pre-rename) is still read so the
 # chart can switch names after this image is deployed.
@@ -258,7 +258,20 @@ def ollama_is_reachable() -> bool:
 
 
 def openai_llm_configured() -> bool:
-    return DEDUP_LLM == "openai" and bool(DEDUP_LLM_URL and DEDUP_LLM_MODEL)
+    return (DEDUP_LLM == "openai" and bool(DEDUP_LLM_URL and DEDUP_LLM_MODEL)
+            and not any(c in DEDUP_LLM_API_KEY for c in "\r\n"))
+
+
+def _safe(e: Exception) -> str:
+    """Exception text for logs, never containing the API key (requests can echo headers)."""
+    text = f"{type(e).__name__}: {e}"
+    if DEDUP_LLM_API_KEY:
+        text = text.replace(DEDUP_LLM_API_KEY, "[REDACTED]")
+    return text[:300]
+
+
+class LLMUnavailable(RuntimeError):
+    pass
 
 
 def llm_is_reachable() -> bool:
@@ -271,14 +284,18 @@ def llm_is_reachable() -> bool:
                 return True
             log.error("DEDUP_LLM endpoint %s answered %s", DEDUP_LLM_URL, resp.status_code)
         except Exception as e:
-            log.error("DEDUP_LLM endpoint %s unreachable: %s", DEDUP_LLM_URL, e)
+            log.error("DEDUP_LLM endpoint %s unreachable: %s", DEDUP_LLM_URL, _safe(e))
         return DEDUP_LLM_FALLBACK and ollama_is_reachable()
     if DEDUP_LLM == "openai":
-        log.error("DEDUP_LLM=openai needs DEDUP_LLM_URL and DEDUP_LLM_MODEL; using local Ollama")
+        if not DEDUP_LLM_FALLBACK:
+            log.error("DEDUP_LLM=openai is incomplete (URL, model, or a key with a newline) and "
+                      "DEDUP_LLM_FALLBACK=false: no LLM phases")
+            return False
+        log.error("DEDUP_LLM=openai is incomplete (URL, model, or a key with a newline); using local Ollama")
     return ollama_is_reachable()
 
 
-def _ollama_generate(prompt: str, json_mode: bool, max_tokens: Optional[int], timeout: int) -> tuple[str, bool]:
+def _ollama_generate(prompt: str, json_mode: bool, max_tokens: Optional[int], timeout: float) -> tuple[str, bool]:
     body = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
     if json_mode:
         body["format"] = "json"
@@ -290,7 +307,7 @@ def _ollama_generate(prompt: str, json_mode: bool, max_tokens: Optional[int], ti
     return data.get("response", "") or "", data.get("done_reason") == "length"
 
 
-def _openai_generate(prompt: str, json_mode: bool, max_tokens: Optional[int], timeout: int) -> tuple[str, bool]:
+def _openai_generate(prompt: str, json_mode: bool, max_tokens: Optional[int], deadline: float) -> tuple[str, bool]:
     body = {"model": DEDUP_LLM_MODEL, "messages": [{"role": "user", "content": prompt}],
             "temperature": 0, "stream": False}
     if max_tokens:
@@ -300,28 +317,42 @@ def _openai_generate(prompt: str, json_mode: bool, max_tokens: Optional[int], ti
     if json_mode:
         body["response_format"] = {"type": "json_object"}
     headers = {"Authorization": f"Bearer {DEDUP_LLM_API_KEY}"}
-    resp = requests.post(f"{DEDUP_LLM_URL}/chat/completions", json=body, timeout=timeout, headers=headers)
+    resp = requests.post(f"{DEDUP_LLM_URL}/chat/completions", json=body, timeout=_remaining(deadline), headers=headers)
     if resp.status_code == 400 and json_mode:
         # some providers reject response_format; the prompt still demands JSON and the
         # caller parses it strictly
         body.pop("response_format")
-        resp = requests.post(f"{DEDUP_LLM_URL}/chat/completions", json=body, timeout=timeout, headers=headers)
+        resp = requests.post(f"{DEDUP_LLM_URL}/chat/completions", json=body, timeout=_remaining(deadline),
+                             headers=headers)
     resp.raise_for_status()
     choice = (resp.json().get("choices") or [{}])[0]
     return (choice.get("message") or {}).get("content") or "", choice.get("finish_reason") == "length"
 
 
+def _remaining(deadline: float) -> float:
+    left = deadline - time.monotonic()
+    if left < 5:
+        raise LLMUnavailable("LLM time budget used up")
+    return left
+
+
 def llm_generate(prompt: str, json_mode: bool = False, max_tokens: Optional[int] = None,
-                 timeout: int = 60) -> tuple[str, bool]:
-    """(text, truncated) from the configured LLM, falling back to local Ollama."""
+                 timeout: float = 60) -> tuple[str, bool]:
+    """(text, truncated) from the configured LLM, falling back to local Ollama.
+
+    `timeout` is one budget for the whole call: the hosted attempt, its JSON-mode
+    retry and the local fallback share it. Errors are logged without the API key."""
+    deadline = time.monotonic() + timeout
     if openai_llm_configured():
         try:
-            return _openai_generate(prompt, json_mode, max_tokens, timeout)
+            return _openai_generate(prompt, json_mode, max_tokens, deadline)
         except Exception as e:
             if not DEDUP_LLM_FALLBACK:
-                raise
-            log.warning("DEDUP_LLM call failed (%s); falling back to local Ollama", e)
-    return _ollama_generate(prompt, json_mode, max_tokens, timeout)
+                raise LLMUnavailable(_safe(e)) from None
+            log.warning("DEDUP_LLM call failed (%s); falling back to local Ollama", _safe(e))
+    elif DEDUP_LLM == "openai" and not DEDUP_LLM_FALLBACK:
+        raise LLMUnavailable("DEDUP_LLM=openai is incomplete and DEDUP_LLM_FALLBACK=false")
+    return _ollama_generate(prompt, json_mode, max_tokens, _remaining(deadline))
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +382,7 @@ def ollama_assign_tags(text: str, available_tags: list[str]) -> list[str]:
         valid = set(available_tags)
         return [t for t in candidates if isinstance(t, str) and t in valid]
     except Exception as e:
-        log.warning("ollama_assign_tags failed: %s", e)
+        log.warning("ollama_assign_tags failed: %s", _safe(e))
         return []
 
 
@@ -581,7 +612,7 @@ def ollama_merge(texts: list[str]) -> Optional[str]:
             return None
         facts = json.loads(raw or "{}").get("facts")
     except Exception as e:
-        log.warning("LLM merge failed: %s", e)
+        log.warning("LLM merge failed: %s", _safe(e))
         return None
     if not isinstance(facts, list):
         log.warning("Merge rejected: no facts list")
