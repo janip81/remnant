@@ -60,6 +60,10 @@ async def proxy(path: str, request: Request) -> Response:
             content=body,
             timeout=30,
         )
+    if resp.status_code == 401:
+        # The MCP bearer token is wrong: a server misconfiguration, not the user's session.
+        # Only the auth proxy may answer 401, which the SPA treats as "log in again".
+        return JSONResponse({"error": "UI backend could not authenticate to MCP"}, status_code=502)
     return Response(
         content=resp.content,
         status_code=resp.status_code,
