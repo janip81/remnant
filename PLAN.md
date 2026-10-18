@@ -26,7 +26,7 @@
 - [x] mem0 history DB: kept in memory (`history_db_path=":memory:"`); Remnant never reads it and keeps its own lifecycle history
 - [x] Redis Stream queue: consumer group, reclaim, 5 attempts then dead-letter stream, legacy list migration, `job_id` idempotency, worker started at app startup, queue metrics — merged (#5), deployed
 - [x] Refuse to start with an empty, placeholder or <16-char `BEARER_TOKEN`; constant-time compare — merged (#4), deployed
-- [ ] Web UI auth: the UI proxy injects the bearer token server-side, so anyone who can reach the UI has full access. Decide: gateway auth (e.g. oauth2-proxy), or no public UI route
+- [x] Web UI auth: oauth2-proxy sidecar (chart 0.2.9 `ui.oauth2Proxy`) + cross-origin write guard (#29); on in the author's deployment since 2026-10-18
 - [x] `REMNANT_USER_ID`/`REMNANT_AGENT_ID` accepted, `MEM0_*` kept — merged (#4), deployed
 - [x] Server-side secret redaction (`src/redact.py`) on add and update — merged (#4, #5), deployed
 - [x] One-off cleanup of stored memories containing secrets — done on the author's data, 2026-10

@@ -4,7 +4,7 @@ Known bugs, blockers, and tech debt. Add items here as they are discovered.
 
 | # | Description | Priority | Status | Notes |
 |---|-------------|----------|--------|-------|
-| 1 | Web UI has no authentication of its own: the UI proxy adds the bearer token server-side, so UI reachability equals full read/write/delete | P1 | open | Put gateway auth in front, or don't route the UI publicly |
+| 1 | Web UI has no authentication of its own: the UI proxy adds the bearer token server-side, so UI reachability equals full read/write/delete | P1 | **done** | Chart 0.2.9 `ui.oauth2Proxy` (OIDC sidecar, e-mail allowlist, UI on 127.0.0.1 via `UI_HOST`); the UI proxy rejects cross-origin writes (#29). On in the author's deployment since 2026-10-18 (Keycloak) |
 | 2 | DNS rebinding protection is disabled in the MCP transport settings | P1 | **done** | `MCP_ALLOWED_HOSTS` (#20); chart 0.2.7 `mcp.dnsRebindingProtection`; on in the author's deployment since 2026-10-17 |
 | 3 | mem0 history DB (`~/.mem0`) lives in the container filesystem and is lost when the container is replaced (rollout, rescheduling) | P2 | **done** | Remnant never reads it; now in-memory (`history_db_path=":memory:"`) |
 | 4 | CI builds images but runs no tests | P2 | open | Add `make test` (and a DB service for `make test-db`) to the workflow |
