@@ -478,6 +478,7 @@ def run_one(spec: dict, scen: dict, sfile: dict, a, server: Server, token: str, 
                           "cost_usd": res.get("total_cost_usd"), "cli_duration_ms": res.get("duration_ms"),
                           "num_turns": res.get("num_turns"), "tool_uses": rec["tool_uses"],
                           "permission_denials": len(res.get("permission_denials") or []),
+                          "error_text": (res.get("result") or "")[:200] if res.get("is_error") else None,
                           "accepted": accept(answer, checks, rejects) if checks else None})
             (run_dir / f"answer-{i}.md").write_text(answer)
         if len(recs) < len(prompts) or not session_id:
@@ -647,6 +648,7 @@ def cmd_execute(a):
     budget = a.cap_usd - a.reserve_usd                # reserve: retries, grading, interrupted runs
     server = Server(Path(a.workdir) / "server", token, a.python)
     last_end = None
+    cli_failures = 0
     try:
         for n, spec in enumerate(plan["runs"]):
             if (spec["scenario"], spec["repeat"], spec["arm"]) in done:
@@ -666,6 +668,13 @@ def cmd_execute(a):
                     "since_prev_run_end_s": round(time.monotonic() - last_end, 1) if last_end else None}
             row = run_one(spec, by_id[spec["scenario"]], sfile, a, server, token, results, meta)
             last_end = time.monotonic()
+            # Consecutive CLI failures usually mean an account-level problem (usage/session
+            # limit, auth), not the arm: stop instead of filling the plan with error rows.
+            cli_failures = 0 if row["cli_ok"] else cli_failures + 1
+            if cli_failures >= a.max_cli_failures:
+                print(f"stopping: {cli_failures} consecutive runs with CLI errors "
+                      f"(last: {(row['turns'] or [{}])[-1].get('error_text') or 'see stream.jsonl'})")
+                break
             print(f"{row['run_id']}: harness_valid={row['harness_valid']} cli_ok={row['cli_ok']} "
                   f"accepted={row['accepted']} cost={row['cost_usd']} problems={row['hook_problems']}")
             if row["cost_usd"] is None:
@@ -861,6 +870,8 @@ def main():
     p.add_argument("--max-run-usd", type=float, required=True,
                    help="declared worst-case cost of one run, used until a costlier run is observed")
     p.add_argument("--reserve-usd", type=float, default=0.0, help="part of the cap kept for retries/grading")
+    p.add_argument("--max-cli-failures", type=int, default=3,
+                   help="stop after this many consecutive runs with CLI errors (e.g. usage limits)")
     p.add_argument("--effort", required=True, choices=["low", "medium", "high", "xhigh", "max"])
     p.add_argument("--cache-regime", required=True,
                    help="predeclared provider-cache condition, e.g. warm-sequential (recorded per run)")

@@ -190,7 +190,7 @@ def test_cap_fails_closed(tmp_path, monkeypatch):
     class A:
         claude, confirm_model_calls, plan_ = sys.executable, False, None
         workdir, python, model, turn_timeout = str(tmp_path / "w"), sys.executable, "m", 5
-        reserve_usd, effort, cache_regime = 0.0, "medium", "test"
+        reserve_usd, effort, cache_regime, max_cli_failures = 0.0, "medium", "test", 3
     A.plan, A.results = str(plan), str(tmp_path / "res.jsonl")
     # worst case 1.0 declared: 0.5 runs (1.0 fits in 3), then worst=1 -> 0.5+1 fits -> 2.0 runs,
     # worst=2 -> 2.5+2 > 3 stops before the next run
@@ -334,3 +334,35 @@ def test_latin_square_balances_arm_positions(tmp_path):
             per_scenario[r["scenario"]][(r["arm"], pos)] += 1
     for counts in per_scenario.values():                                   # every arm once per position
         assert len(counts) == 9 and set(counts.values()) == {1}
+
+
+def test_execute_stops_after_consecutive_cli_errors(tmp_path, monkeypatch):
+    sfile = scen_file(tmp_path, {"1": ["x"]})
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps({"scenarios": sfile, "runs": [
+        {"scenario": f"s{i % 3}", "repeat": i // 3, "arm": "C", "block": f"b{i}"} for i in range(9)]}))
+    ran = []
+
+    def failing_run(spec, *a):
+        ran.append(spec)
+        row = {"scenario": spec["scenario"], "repeat": spec["repeat"], "arm": spec["arm"], "cost_usd": 0.0,
+               "run_id": "r", "harness_valid": True, "cli_ok": False, "accepted": False, "hook_problems": [],
+               "turns": [{"error_text": "You've hit your session limit"}]}
+        with open(a[-2], "a") as f:
+            f.write(json.dumps(row) + "\n")
+        return row
+
+    class Srv:
+        def __init__(self, *a): pass
+        def stop(self): pass
+    monkeypatch.setattr(bench, "run_one", failing_run)
+    monkeypatch.setattr(bench, "Server", Srv)
+
+    class A:
+        claude, confirm_model_calls = sys.executable, False
+        workdir, python, model, turn_timeout = str(tmp_path / "w"), sys.executable, "m", 5
+        reserve_usd, effort, cache_regime, max_cli_failures = 0.0, "medium", "test", 3
+        cap_usd, max_run_usd = 10.0, 0.5
+    A.plan, A.results = str(plan), str(tmp_path / "res.jsonl")
+    bench.cmd_execute(A)
+    assert len(ran) == 3                                   # stopped instead of running all 9
