@@ -345,9 +345,10 @@ def test_execute_stops_after_consecutive_cli_errors(tmp_path, monkeypatch):
 
     def failing_run(spec, *a):
         ran.append(spec)
-        row = {"scenario": spec["scenario"], "repeat": spec["repeat"], "arm": spec["arm"], "cost_usd": 0.0,
-               "run_id": "r", "harness_valid": True, "cli_ok": False, "accepted": False, "hook_problems": [],
-               "turns": [{"error_text": "You've hit your session limit"}]}
+        ok = len(ran) == 2                                 # failure, success, then 3 failures
+        row = {"scenario": spec["scenario"], "repeat": spec["repeat"], "arm": spec["arm"], "cost_usd": 0.2,
+               "run_id": "r", "harness_valid": True, "cli_ok": ok, "accepted": ok, "hook_problems": [],
+               "turns": [{"error_text": None if ok else "You've hit your session limit"}]}
         with open(a[-2], "a") as f:
             f.write(json.dumps(row) + "\n")
         return row
@@ -364,5 +365,9 @@ def test_execute_stops_after_consecutive_cli_errors(tmp_path, monkeypatch):
         reserve_usd, effort, cache_regime, max_cli_failures = 0.0, "medium", "test", 3
         cap_usd, max_run_usd = 10.0, 0.5
     A.plan, A.results = str(plan), str(tmp_path / "res.jsonl")
-    bench.cmd_execute(A)
-    assert len(ran) == 3                                   # stopped instead of running all 9
+    import io, contextlib
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        bench.cmd_execute(A)
+    assert len(ran) == 5                                   # the success reset the counter; then 3 failures
+    assert "spent $1.00" in out.getvalue()                 # the stopping run's cost is counted

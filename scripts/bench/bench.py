@@ -670,18 +670,19 @@ def cmd_execute(a):
             last_end = time.monotonic()
             # Consecutive CLI failures usually mean an account-level problem (usage/session
             # limit, auth), not the arm: stop instead of filling the plan with error rows.
-            cli_failures = 0 if row["cli_ok"] else cli_failures + 1
-            if cli_failures >= a.max_cli_failures:
-                print(f"stopping: {cli_failures} consecutive runs with CLI errors "
-                      f"(last: {(row['turns'] or [{}])[-1].get('error_text') or 'see stream.jsonl'})")
-                break
             print(f"{row['run_id']}: harness_valid={row['harness_valid']} cli_ok={row['cli_ok']} "
                   f"accepted={row['accepted']} cost={row['cost_usd']} problems={row['hook_problems']}")
             if row["cost_usd"] is None:
                 print("run cost unknown: stopping, the cap cannot be enforced (fail closed)")
                 break
-            spent += row["cost_usd"]
+            spent += row["cost_usd"]                   # counted before any stop below
             worst = max(worst, row["cost_usd"])
+            cli_failures = 0 if row["cli_ok"] else cli_failures + 1
+            if cli_failures >= a.max_cli_failures:
+                print(f"stopping: {cli_failures} consecutive runs with CLI errors "
+                      f"(last: {(row['turns'] or [{}])[-1].get('error_text') or 'see stream.jsonl'}); "
+                      "error rows stay in the results: move the file aside to rerun them")
+                break
     finally:
         server.stop()
     print(f"spent ${spent:.2f} of ${a.cap_usd:.2f}")
