@@ -48,4 +48,4 @@ jobs:
         env:
           TEST_DATABASE_URL: postgresql://remnant:test@127.0.0.1:5432/remnant
           MEM0_TELEMETRY: "false"
-        run: python -m pytest -q tests
+        run: python -m pytest -q tests plugin/codex
