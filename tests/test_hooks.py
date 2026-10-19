@@ -73,6 +73,10 @@ def test_review_boundary_cases(tmp_path, monkeypatch):
     assert not h.mentions("see other.main.py", "main.py")                  # dotted prefix
     assert h.mentions("node-a. Then restart", "node-a")                    # sentence full stop
     assert h.mentions("edit /etc/hosts first", "/etc/hosts")               # absolute path matches itself
+    assert h.mentions("runs from /opt/git/remnant-live/plugin", "remnant-live")  # path component
+    assert h.mentions("changed agent-tools/delegate.py", "delegate.py")    # last path component
+    assert not h.mentions("see /opt/remnant-live-old/x", "remnant-live")   # longer component
+    assert not h.mentions("/etc/hosts.allow", "/etc/hosts")                 # dotted continuation
     assert h.identifiers("check /etc/hosts and https://x.example.se/a?b=1") == \
         ["/etc/hosts", "https://x.example.se/a"]
     assert h.identifiers("ping 192.168.81.20 now") == ["192.168.81.20"]    # IPs kept

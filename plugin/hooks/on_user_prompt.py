@@ -46,9 +46,10 @@ _ID_CHARS = re.compile(r"[\d\-._/:]")
 _IPV4 = re.compile(r"\d{1,3}(\.\d{1,3}){3}")
 # Token boundaries: no identifier character before, and after it neither an
 # identifier character nor a '.' that continues one (node-a vs node-a.example.com).
-# A trailing '.' that ends a sentence is fine.
-_BEFORE = r"(?<![\w\-/.])"
-_AFTER = r"(?![\w\-/]|\.\w)"
+# A trailing '.' that ends a sentence is fine. '/' is a boundary, so a path
+# component counts: remnant-live matches .../remnant-live/plugin.
+_BEFORE = r"(?<![\w\-.])"
+_AFTER = r"(?![\w\-]|\.\w)"
 
 
 def identifiers(prompt: str) -> list[str]:
