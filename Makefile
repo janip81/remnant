@@ -56,7 +56,7 @@ run:
 PYTHON  ?= python3
 TEST_PG := remnant-test-pg
 test:
-	env -u TEST_DATABASE_URL $(PYTHON) -m pytest -q tests
+	env -u TEST_DATABASE_URL $(PYTHON) -m pytest -q tests plugin/codex
 
 # All tests incl. real-PostgreSQL ones, against a throwaway pgvector container.
 # One shell with a trap: the container and its volume are removed on success,
@@ -70,7 +70,7 @@ test-db:
 	ready=0; for i in $$(seq 1 60); do \
 	  if docker exec $(TEST_PG) pg_isready -U remnant -q 2>/dev/null; then ready=1; break; fi; sleep 1; done; \
 	[ $$ready = 1 ] || { echo "test database not ready after 60 s" >&2; exit 1; }; sleep 1; \
-	TEST_DATABASE_URL=postgresql://remnant:test@127.0.0.1:25499/remnant $(PYTHON) -m pytest -q tests
+	TEST_DATABASE_URL=postgresql://remnant:test@127.0.0.1:25499/remnant $(PYTHON) -m pytest -q tests plugin/codex
 
 lint:
 	@which ruff >/dev/null 2>&1 && ruff check src/ scripts/ plugin/ tests/ || echo "ruff not installed — skipping"
