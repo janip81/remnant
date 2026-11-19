@@ -471,7 +471,7 @@ def _build_config() -> MemoryConfig:
             provider="ollama",
             config={
                 "model": settings.ollama_embed_model,
-                "ollama_base_url": settings.ollama_base_url,
+                "ollama_base_url": settings.embed_base_url,
                 "embedding_dims": _EMBEDDING_DIMS,
             },
         ),
@@ -641,14 +641,24 @@ def _has_results(result) -> bool:
     return bool(result)
 
 
-def ollama_up(timeout: float = 3.0) -> bool:
-    """Cheap reachability check for the Ollama host (it may be a desktop that sleeps)."""
+def _reachable(base_url: str, timeout: float) -> bool:
     import urllib.request
     try:
-        with urllib.request.urlopen(f"{settings.ollama_base_url.rstrip('/')}/api/tags", timeout=timeout) as r:
+        with urllib.request.urlopen(f"{base_url.rstrip('/')}/api/tags", timeout=timeout) as r:
             return r.status == 200
     except Exception:
         return False
+
+
+def ollama_up(timeout: float = 3.0, llm: bool = False) -> bool:
+    """Cheap reachability check for what a job needs (the LLM host may be a desktop that sleeps).
+
+    Every write needs the embedding host; llm=True (infer=True writes) also needs the LLM host.
+    """
+    hosts = {settings.embed_base_url}
+    if llm:
+        hosts.add(settings.ollama_base_url)
+    return all(_reachable(h, timeout) for h in hosts)
 
 
 def job_written(job_id: str) -> bool:

@@ -134,3 +134,17 @@ def test_mem0_history_recording_is_disabled(monkeypatch):
     assert m.db.add_history("id", None, "x", "ADD") is None and m.db.get_last_messages("s") == []
     m.reset()                                    # history must stay disabled after a reset
     assert isinstance(m.db, memory._NoHistory) and closed == [True, True]
+
+
+def test_ollama_up_checks_only_the_hosts_a_job_needs(monkeypatch):
+    # remnant#34: embeddings may live on an always-on host, the LLM on one that sleeps.
+    import memory
+    monkeypatch.setattr(memory.settings, "ollama_base_url", "http://llm:11434")
+    monkeypatch.setattr(memory.settings, "ollama_embed_base_url", "http://embed:11434")
+    up = {"http://embed:11434"}
+    asked = []
+    monkeypatch.setattr(memory, "_reachable", lambda url, t: asked.append(url) or url in up)
+    assert memory.ollama_up() and asked == ["http://embed:11434"]
+    assert not memory.ollama_up(llm=True)
+    up.add("http://llm:11434")
+    assert memory.ollama_up(llm=True)

@@ -23,7 +23,16 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5:7b"
     ollama_embed_model: str = "nomic-embed-text"
+    # Optional separate Ollama for embeddings (writes and search). With MEM0_INFER=false, the
+    # default, writes and search need only this one, so an always-on CPU Ollama can serve them
+    # while the LLM (infer=True, dedup) stays on a GPU host that may sleep. Empty = OLLAMA_BASE_URL.
+    # Must serve the same model as before, or stored vectors stop matching new queries.
+    ollama_embed_base_url: str = ""
     redis_url: str = ""  # optional: enable async add_memory queue
+
+    @property
+    def embed_base_url(self) -> str:
+        return self.ollama_embed_base_url or self.ollama_base_url
 
     def require_safe_token(self) -> None:
         """Refuse to start with an empty, placeholder or trivially short bearer token."""

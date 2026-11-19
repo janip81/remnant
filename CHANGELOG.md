@@ -7,6 +7,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- `OLLAMA_EMBED_BASE_URL` (Helm `ollama.embedBaseUrl`): a separate Ollama for embeddings. Writes with `infer=false` and checkpoints only wait for this host; `infer=true` writes also wait for the LLM host (`OLLAMA_BASE_URL`). Empty keeps the old single-host behaviour (#34)
+
 ### Fixed
 - Queue metrics: `remnant_queue_depth` is now the stream length. Redis' consumer-group `lag` drifts once finished jobs are deleted, so depth could stay above 0 with an empty queue (#35)
 - `remnant_queue_worker_up` only counts worker loops that reached Redis; a loop that keeps failing no longer reports the worker as alive (#35)
