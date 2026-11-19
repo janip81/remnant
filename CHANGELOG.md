@@ -10,6 +10,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 - Queue metrics: `remnant_queue_depth` is now the stream length. Redis' consumer-group `lag` drifts once finished jobs are deleted, so depth could stay above 0 with an empty queue (#35)
 - `remnant_queue_worker_up` only counts worker loops that reached Redis; a loop that keeps failing no longer reports the worker as alive (#35)
+- Queue lag counts entries after the group's last delivered ID, so deleted-but-pending IDs can't hide unread jobs; XACK, XDEL and the attempts cleanup run in one transaction (#35)
 
 ---
 

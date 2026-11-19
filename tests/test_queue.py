@@ -267,8 +267,11 @@ def test_depth_is_stream_length_not_drifting_group_lag(env, monkeypatch):
 
 def test_heartbeat_not_refreshed_while_reads_keep_failing(monkeypatch):
     # remnant#35: a loop where every XREADGROUP fails must not keep reporting the worker alive.
+    reads = []
+
     class Failing:
         async def xreadgroup(self, *a, **kw):
+            reads.append(1)
             raise ConnectionError("redis read failed")
 
     async def no_claim(client, cursor):
@@ -297,5 +300,27 @@ def test_heartbeat_not_refreshed_while_reads_keep_failing(monkeypatch):
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(qw._run_worker())
-    assert len(loops) == 3
+    assert len(reads) == 3                               # three loops, each read failed
     assert qw._heartbeat == 100.0                        # only the start, no failed loop counted
+
+
+def test_lag_counts_unread_jobs_despite_deleted_pending_ids(env):
+    # A pending ID whose entry was deleted (until XAUTOCLAIM drops it) must not hide unread work.
+    client, _ = env
+    run(qw.enqueue("a", "a", False, "project", []))
+    (a_id, _f), = run(_deliver(client))
+    run(client.xdel(qw.STREAM, a_id))                    # deleted, never acked: ghost in the pending list
+    run(qw.enqueue("b", "a", False, "project", []))      # unread
+    m = run(qw.queue_metrics())
+    assert (m["depth"], m["lag"]) == (1, 1)
+
+
+def test_finish_acks_and_deletes_together(env):
+    client, _ = env
+    run(qw.enqueue("a", "a", False, "project", []))
+    (a_id, _f), = run(_deliver(client))
+    run(client.hset(qw.ATTEMPTS, a_id, 2))
+    run(qw._finish(client, a_id))
+    m = run(qw.queue_metrics())
+    assert (m["depth"], m["pending"], m["lag"]) == (0, 0, 0)
+    assert run(client.hget(qw.ATTEMPTS, a_id)) is None
