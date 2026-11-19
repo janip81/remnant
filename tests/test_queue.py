@@ -240,3 +240,87 @@ def test_old_jobs_without_provenance_still_work(env):
     (msg_id, fields), = run(_deliver(client))
     run(qw._process(client, msg_id, fields))
     assert mem.calls[0][1]["source"] == "agent"
+
+
+def test_depth_is_stream_length_not_drifting_group_lag(env, monkeypatch):
+    # remnant#35: finished jobs are XDELed and Redis' group "lag" drifts (seen stuck at 85
+    # with an empty stream). Depth must come from XLEN, which is exact.
+    client, _ = env
+    real = client.xinfo_groups
+
+    async def drifted(stream):
+        groups = await real(stream)
+        for g in groups:
+            g["lag"] = 85
+        return groups
+
+    monkeypatch.setattr(client, "xinfo_groups", drifted)
+    m = run(qw.queue_metrics())
+    assert (m["depth"], m["lag"], m["pending"], m["error"]) == (0, 0, 0, 0)
+
+    run(qw.enqueue("one", "a", False, "project", []))
+    run(qw.enqueue("two", "a", False, "project", []))
+    run(_deliver(client))                                # both delivered, not acked
+    m = run(qw.queue_metrics())
+    assert (m["depth"], m["lag"], m["pending"]) == (2, 0, 2)
+
+
+def test_heartbeat_not_refreshed_while_reads_keep_failing(monkeypatch):
+    # remnant#35: a loop where every XREADGROUP fails must not keep reporting the worker alive.
+    reads = []
+
+    class Failing:
+        async def xreadgroup(self, *a, **kw):
+            reads.append(1)
+            raise ConnectionError("redis read failed")
+
+    async def no_claim(client, cursor):
+        return cursor, []
+
+    async def get_client():
+        return Failing()
+
+    async def noop(*a, **kw):
+        return None
+
+    loops = []
+
+    async def stop_after_three(_delay):
+        loops.append(1)
+        if len(loops) >= 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(qw, "_get_client", get_client)
+    monkeypatch.setattr(qw, "_start", noop)
+    monkeypatch.setattr(qw, "_claim_stale", no_claim)
+    monkeypatch.setattr(qw.asyncio, "sleep", stop_after_three)
+    times = iter([100.0] + [200.0 + i for i in range(100)])
+    monkeypatch.setattr(qw, "time", types.SimpleNamespace(monotonic=lambda: next(times)))  # not the event loop's clock
+    monkeypatch.setattr(qw, "_heartbeat", 0.0)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(qw._run_worker())
+    assert len(reads) == 3                               # three loops, each read failed
+    assert qw._heartbeat == 100.0                        # only the start, no failed loop counted
+
+
+def test_lag_counts_unread_jobs_despite_deleted_pending_ids(env):
+    # A pending ID whose entry was deleted (until XAUTOCLAIM drops it) must not hide unread work.
+    client, _ = env
+    run(qw.enqueue("a", "a", False, "project", []))
+    (a_id, _f), = run(_deliver(client))
+    run(client.xdel(qw.STREAM, a_id))                    # deleted, never acked: ghost in the pending list
+    run(qw.enqueue("b", "a", False, "project", []))      # unread
+    m = run(qw.queue_metrics())
+    assert (m["depth"], m["lag"]) == (1, 1)
+
+
+def test_finish_acks_and_deletes_together(env):
+    client, _ = env
+    run(qw.enqueue("a", "a", False, "project", []))
+    (a_id, _f), = run(_deliver(client))
+    run(client.hset(qw.ATTEMPTS, a_id, 2))
+    run(qw._finish(client, a_id))
+    m = run(qw.queue_metrics())
+    assert (m["depth"], m["pending"], m["lag"]) == (0, 0, 0)
+    assert run(client.hget(qw.ATTEMPTS, a_id)) is None

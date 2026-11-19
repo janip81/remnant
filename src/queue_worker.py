@@ -50,6 +50,7 @@ CLAIM_IDLE_MS = int(os.environ.get("QUEUE_CLAIM_IDLE_SECONDS", "600")) * 1000
 MAX_ATTEMPTS = int(os.environ.get("QUEUE_MAX_ATTEMPTS", "5"))
 BLOCK_MS = 5000
 HEARTBEAT_STALE_S = 60
+LAG_SCAN_MAX = 10000      # metrics: count undelivered entries up to this many
 
 _client = None
 _worker_task: Optional[asyncio.Task] = None
@@ -106,6 +107,11 @@ async def _ensure_group(client) -> None:
             raise
 
 
+def _beat() -> None:
+    global _heartbeat
+    _heartbeat = time.monotonic()
+
+
 async def _migrate_legacy(client) -> int:
     """Move jobs from the old BLPOP list into the stream without a loss window.
 
@@ -133,6 +139,7 @@ async def _migrate_legacy(client) -> int:
             await client.xadd(STREAM, {"job": json.dumps(job)})
             moved += 1
         await client.lrem(LEGACY_STAGING, 1, raw)
+        _beat()                       # progress: a long drain is not a dead worker
 
 
 async def _process(client, msg_id: str, fields: dict) -> None:
@@ -205,9 +212,13 @@ def _has_results(result) -> bool:
 
 
 async def _finish(client, msg_id: str) -> None:
-    await client.xack(STREAM, GROUP, msg_id)
-    await client.xdel(STREAM, msg_id)   # keep only unfinished work in the stream
-    await client.hdel(ATTEMPTS, msg_id)
+    # One MULTI/EXEC: a crash can't leave an acked job in the stream, where it would
+    # count as depth forever without ever being read again.
+    async with client.pipeline(transaction=True) as pipe:
+        pipe.xack(STREAM, GROUP, msg_id)
+        pipe.xdel(STREAM, msg_id)   # keep only unfinished work in the stream
+        pipe.hdel(ATTEMPTS, msg_id)
+        await pipe.execute()
 
 
 async def _dead(client, msg_id: str, fields: dict, error: str) -> None:
@@ -252,7 +263,6 @@ async def _run_worker() -> None:
     last_migrate = loop.time()
     cursor = "0-0"
     while True:
-        _heartbeat = time.monotonic()
         try:
             # During a rolling update the previous version may still push to the
             # old list; keep draining it (two cheap calls per minute once empty).
@@ -268,6 +278,9 @@ async def _run_worker() -> None:
             for _stream, messages in resp or []:
                 for msg_id, fields in messages:
                     await _process(client, msg_id, fields)
+            # Only steps that reached Redis count as alive: a loop that keeps failing
+            # (e.g. XREADGROUP errors) must let worker_up drop to 0.
+            _beat()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -276,12 +289,16 @@ async def _run_worker() -> None:
 
 
 async def queue_metrics() -> dict:
-    """pending = delivered but not acked, lag = not yet delivered, dead = DLQ size.
+    """depth = unfinished jobs, pending = delivered but not acked, lag = not yet delivered,
+    dead = DLQ size.
 
+    Finished jobs are XDELed (atomically with XACK), so XLEN is exactly the unfinished work. The group's own
+    "lag" field is not used: Redis cannot keep it accurate once entries are deleted
+    and it drifts upwards for good (remnant#35).
     error=1 when the stream/group could not be read (backlog unknown, not zero).
     """
     client = await _get_client()
-    pending = lag = 0
+    pending = lag = depth = 0
     error = 0
     try:
         groups = await client.xinfo_groups(STREAM)
@@ -290,15 +307,16 @@ async def queue_metrics() -> dict:
             error = 1
         else:
             pending = int(g.get("pending") or 0)
-            if g.get("lag") is None:   # Redis cannot tell; fall back to the stream length
-                lag = max(await client.xlen(STREAM) - pending, 0)
-            else:
-                lag = int(g["lag"])
+            depth = int(await client.xlen(STREAM))
+            # Not depth - pending: the pending list can still hold IDs of deleted entries
+            # until XAUTOCLAIM drops them, which would hide unread jobs.
+            last = g.get("last-delivered-id") or "0-0"
+            lag = len(await client.xrange(STREAM, min="(" + last, max="+", count=LAG_SCAN_MAX))
     except Exception:
         error = 1
     try:
         dead = await client.xlen(DEAD)
     except Exception:
         dead, error = 0, 1
-    return {"pending": pending, "lag": lag, "dead": dead, "depth": pending + lag,
+    return {"pending": pending, "lag": lag, "dead": dead, "depth": depth,
             "worker_up": int(worker_alive()), "error": error}
