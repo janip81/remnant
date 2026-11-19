@@ -197,17 +197,24 @@ def _check_expiry(dedup_job, conn, merged):
         assert cur.fetchone()[0] == 1                     # hidden from search, never expired
 
 
+def _recent(minutes_ago: float = 60, tz_hours: int = 0) -> str:
+    """A capture time inside the checkpoint TTL: fixed dates expire and break these tests."""
+    import datetime as _dt
+    t = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=minutes_ago)
+    return t.astimezone(_dt.timezone(_dt.timedelta(hours=tz_hours))).isoformat()
+
+
 def test_stale_retry_does_not_replace_newer_capture(mem, monkeypatch):
     monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
-    mem.save_checkpoint("s", "newer", captured_at="2026-10-15T10:05:00+00:00")
-    mem.save_checkpoint("s", "older retry", captured_at="2026-10-15T10:00:00+00:00")
+    mem.save_checkpoint("s", "newer", captured_at=_recent(55))
+    mem.save_checkpoint("s", "older retry", captured_at=_recent(60))
     assert mem.get_checkpoint("s")["memory"] == "newer"
 
 
 def test_concurrent_saves_keep_exactly_the_newest(mem, monkeypatch):
     import threading
     monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
-    caps = [f"2026-10-15T10:0{i}:00+00:00" for i in range(6)]
+    caps = [_recent(60 - i) for i in range(6)]
     threads = [threading.Thread(target=mem.save_checkpoint, args=("c", f"state {i}"), kwargs={"captured_at": c})
                for i, c in enumerate(caps)]
     [t.start() for t in threads]; [t.join() for t in threads]
@@ -220,14 +227,14 @@ def test_concurrent_saves_keep_exactly_the_newest(mem, monkeypatch):
 
 def test_mixed_timezone_offsets_order_by_real_time(mem, monkeypatch):
     monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
-    mem.save_checkpoint("tz", "newer", captured_at="2026-10-15T09:30:00+00:00")      # 09:30 UTC
-    mem.save_checkpoint("tz", "older", captured_at="2026-10-15T10:00:00+01:00")      # 09:00 UTC
+    mem.save_checkpoint("tz", "newer", captured_at=_recent(30))                # UTC
+    mem.save_checkpoint("tz", "older", captured_at=_recent(60, tz_hours=1))    # +01:00: later wall clock, earlier instant
     assert mem.get_checkpoint("tz")["memory"] == "newer"
 
 
 def test_same_instant_tie_broken_by_capture_id_not_row_id(mem, monkeypatch):
     monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
-    t = "2026-10-15T10:00:00.123456+00:00"
+    t = _recent(60)
     mem.save_checkpoint("tie", "b-capture", captured_at=t, capture_id="bbbb")
     mem.save_checkpoint("tie", "a-capture", captured_at=t, capture_id="aaaa")
     mem.save_checkpoint("tie", "b-capture retry", captured_at=t, capture_id="bbbb")
