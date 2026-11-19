@@ -252,7 +252,6 @@ async def _run_worker() -> None:
     last_migrate = loop.time()
     cursor = "0-0"
     while True:
-        _heartbeat = time.monotonic()
         try:
             # During a rolling update the previous version may still push to the
             # old list; keep draining it (two cheap calls per minute once empty).
@@ -268,6 +267,9 @@ async def _run_worker() -> None:
             for _stream, messages in resp or []:
                 for msg_id, fields in messages:
                     await _process(client, msg_id, fields)
+            # Only a loop that reached Redis counts as alive: a loop that keeps failing
+            # (e.g. XREADGROUP errors) must let worker_up drop to 0.
+            _heartbeat = time.monotonic()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -276,12 +278,16 @@ async def _run_worker() -> None:
 
 
 async def queue_metrics() -> dict:
-    """pending = delivered but not acked, lag = not yet delivered, dead = DLQ size.
+    """depth = unfinished jobs, pending = delivered but not acked, lag = not yet delivered,
+    dead = DLQ size.
 
+    Finished jobs are XDELed, so XLEN is exactly the unfinished work. The group's own
+    "lag" field is not used: Redis cannot keep it accurate once entries are deleted
+    and it drifts upwards for good (remnant#35).
     error=1 when the stream/group could not be read (backlog unknown, not zero).
     """
     client = await _get_client()
-    pending = lag = 0
+    pending = lag = depth = 0
     error = 0
     try:
         groups = await client.xinfo_groups(STREAM)
@@ -290,15 +296,13 @@ async def queue_metrics() -> dict:
             error = 1
         else:
             pending = int(g.get("pending") or 0)
-            if g.get("lag") is None:   # Redis cannot tell; fall back to the stream length
-                lag = max(await client.xlen(STREAM) - pending, 0)
-            else:
-                lag = int(g["lag"])
+            depth = int(await client.xlen(STREAM))
+            lag = max(depth - pending, 0)
     except Exception:
         error = 1
     try:
         dead = await client.xlen(DEAD)
     except Exception:
         dead, error = 0, 1
-    return {"pending": pending, "lag": lag, "dead": dead, "depth": pending + lag,
+    return {"pending": pending, "lag": lag, "dead": dead, "depth": depth,
             "worker_up": int(worker_alive()), "error": error}

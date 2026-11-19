@@ -240,3 +240,62 @@ def test_old_jobs_without_provenance_still_work(env):
     (msg_id, fields), = run(_deliver(client))
     run(qw._process(client, msg_id, fields))
     assert mem.calls[0][1]["source"] == "agent"
+
+
+def test_depth_is_stream_length_not_drifting_group_lag(env, monkeypatch):
+    # remnant#35: finished jobs are XDELed and Redis' group "lag" drifts (seen stuck at 85
+    # with an empty stream). Depth must come from XLEN, which is exact.
+    client, _ = env
+    real = client.xinfo_groups
+
+    async def drifted(stream):
+        groups = await real(stream)
+        for g in groups:
+            g["lag"] = 85
+        return groups
+
+    monkeypatch.setattr(client, "xinfo_groups", drifted)
+    m = run(qw.queue_metrics())
+    assert (m["depth"], m["lag"], m["pending"], m["error"]) == (0, 0, 0, 0)
+
+    run(qw.enqueue("one", "a", False, "project", []))
+    run(qw.enqueue("two", "a", False, "project", []))
+    run(_deliver(client))                                # both delivered, not acked
+    m = run(qw.queue_metrics())
+    assert (m["depth"], m["lag"], m["pending"]) == (2, 0, 2)
+
+
+def test_heartbeat_not_refreshed_while_reads_keep_failing(monkeypatch):
+    # remnant#35: a loop where every XREADGROUP fails must not keep reporting the worker alive.
+    class Failing:
+        async def xreadgroup(self, *a, **kw):
+            raise ConnectionError("redis read failed")
+
+    async def no_claim(client, cursor):
+        return cursor, []
+
+    async def get_client():
+        return Failing()
+
+    async def noop(*a, **kw):
+        return None
+
+    loops = []
+
+    async def stop_after_three(_delay):
+        loops.append(1)
+        if len(loops) >= 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(qw, "_get_client", get_client)
+    monkeypatch.setattr(qw, "_start", noop)
+    monkeypatch.setattr(qw, "_claim_stale", no_claim)
+    monkeypatch.setattr(qw.asyncio, "sleep", stop_after_three)
+    times = iter([100.0] + [200.0 + i for i in range(100)])
+    monkeypatch.setattr(qw, "time", types.SimpleNamespace(monotonic=lambda: next(times)))  # not the event loop's clock
+    monkeypatch.setattr(qw, "_heartbeat", 0.0)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(qw._run_worker())
+    assert len(loops) == 3
+    assert qw._heartbeat == 100.0                        # only the start, no failed loop counted
