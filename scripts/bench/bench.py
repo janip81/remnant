@@ -136,6 +136,8 @@ class Server:
                 "DATABASE_URL": f"postgresql://remnant:{PG_PASS}@127.0.0.1:{PG_PORT}/run",
                 "REDIS_URL": f"redis://127.0.0.1:{REDIS_PORT}/0",
                 "OLLAMA_BASE_URL": os.environ.get("BENCH_OLLAMA_URL", "http://192.168.81.20:11434"),
+                # optional split host for embeddings (remnant#34); empty = OLLAMA_BASE_URL
+                "OLLAMA_EMBED_BASE_URL": os.environ.get("BENCH_OLLAMA_EMBED_URL", ""),
                 "OLLAMA_MODEL": "qwen2.5:7b", "OLLAMA_EMBED_MODEL": "nomic-embed-text",
                 "REMNANT_USER_ID": os.environ.get("BENCH_USER_ID", "jani"), "REMNANT_AGENT_ID": "bench",
                 "TAGGING_MODE": "rules"}
