@@ -163,7 +163,13 @@ async def _process_one(client, msg_id: str, fields: dict) -> None:
         return
     job_id = job.get("job_id", "")
     infer = job.get("infer", True)
-    if not await asyncio.to_thread(mem_store.ollama_up):
+    # checkpoints are stored as written (embedding only); other jobs need the LLM only for infer=True
+    needs_llm = bool(infer) and job.get("kind") != "checkpoint"
+
+    def deps_up() -> bool:
+        return mem_store.ollama_up(llm=needs_llm)
+
+    if not await asyncio.to_thread(deps_up):
         logger.warning("Ollama unreachable; job %s stays pending (retry in %ds)", job_id, CLAIM_IDLE_MS // 1000)
         return
     attempts = await client.hincrby(ATTEMPTS, msg_id, 1)
@@ -190,11 +196,11 @@ async def _process_one(client, msg_id: str, fields: dict) -> None:
                 session_id=job.get("session_id", ""),
                 project=job.get("project", ""),
             )
-            if infer and not _has_results(result) and not await asyncio.to_thread(mem_store.ollama_up):
+            if infer and not _has_results(result) and not await asyncio.to_thread(deps_up):
                 raise DependencyDown("empty infer result while Ollama is unreachable")
             logger.info("Processed queue job %s (attempt %d)", job_id, attempts)
     except Exception as e:
-        if isinstance(e, DependencyDown) or not await asyncio.to_thread(mem_store.ollama_up):
+        if isinstance(e, DependencyDown) or not await asyncio.to_thread(deps_up):
             await client.hincrby(ATTEMPTS, msg_id, -1)  # outage, not this job's fault
             logger.warning("Queue job %s hit an Ollama outage; stays pending", job_id)
             return

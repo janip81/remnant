@@ -41,3 +41,15 @@ def test_mcp_dns_rebinding_protection_follows_allowed_hosts():
     assert on.enable_dns_rebinding_protection is True
     assert on.allowed_hosts[:2] == ["remnant:8080", "remnant-mcp.example.se"]
     assert "127.0.0.1:*" in on.allowed_hosts and on.allowed_origins == ["https://ui.example.se"]
+
+
+def test_embed_url_defaults_to_ollama_base_url(monkeypatch):
+    monkeypatch.delenv("OLLAMA_EMBED_BASE_URL", raising=False)
+    s = Settings(_env_file=None, ollama_base_url="http://gpu-host:11434")
+    assert s.embed_base_url == "http://gpu-host:11434"
+
+
+def test_separate_embed_url(monkeypatch):
+    monkeypatch.setenv("OLLAMA_EMBED_BASE_URL", "http://ollama-embed:11434")
+    s = Settings(_env_file=None, ollama_base_url="http://gpu-host:11434")
+    assert (s.embed_base_url, s.ollama_base_url) == ("http://ollama-embed:11434", "http://gpu-host:11434")

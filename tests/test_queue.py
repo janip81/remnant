@@ -19,7 +19,9 @@ class FakeMemory(types.ModuleType):
     def __init__(self):
         super().__init__("memory")
         self.calls, self.written, self.fail_times = [], set(), 0
-        self.up = True                 # Ollama reachable
+        self.up = True                 # embedding Ollama reachable
+        self.llm_up = True             # LLM Ollama reachable (may be a separate, sleeping host)
+        self.up_checks = []
         self.infer_result = None       # override what add() returns for infer=True
 
     def add(self, content, **kw):
@@ -35,8 +37,9 @@ class FakeMemory(types.ModuleType):
     def job_written(self, job_id):
         return job_id in self.written
 
-    def ollama_up(self):
-        return self.up
+    def ollama_up(self, llm=False):
+        self.up_checks.append(llm)
+        return self.up and (self.llm_up or not llm)
 
 
 @pytest.fixture
@@ -324,3 +327,31 @@ def test_finish_acks_and_deletes_together(env):
     m = run(qw.queue_metrics())
     assert (m["depth"], m["pending"], m["lag"]) == (0, 0, 0)
     assert run(client.hget(qw.ATTEMPTS, a_id)) is None
+
+
+def test_plain_writes_and_checkpoints_do_not_wait_for_a_sleeping_llm_host(env):
+    # remnant#34: with a separate always-on embedding Ollama, infer=False writes and checkpoints
+    # go through while only the LLM host (e.g. a desktop GPU) is down.
+    client, mem = env
+    mem.llm_up = False
+    saved = []
+    mem.save_checkpoint = lambda *a: saved.append(a[0])
+    run(qw.enqueue("fact", "codex", False, "", []))
+    run(qw.enqueue("state", "claude", False, "session", [], kind="checkpoint", session_id="s-9"))
+    for mid, f in run(_deliver(client)):
+        run(qw._process(client, mid, f))
+    assert len(mem.calls) == 1 and saved == ["s-9"]
+    assert run(qw.queue_metrics())["depth"] == 0
+    assert mem.up_checks and not any(mem.up_checks)      # only the embedding host was required
+
+
+def test_infer_write_waits_for_the_llm_host(env):
+    client, mem = env
+    mem.llm_up = False
+    run(qw.enqueue("raw conversation", "codex", True, "", []))
+    for mid, f in run(_deliver(client)):
+        run(qw._process(client, mid, f))
+    assert mem.calls == [] and run(qw.queue_metrics())["pending"] == 1
+    mem.llm_up = True
+    _reclaim_and_process(client)
+    assert len(mem.calls) == 1 and run(qw.queue_metrics())["depth"] == 0
