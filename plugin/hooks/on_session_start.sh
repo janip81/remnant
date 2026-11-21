@@ -59,8 +59,11 @@ search_direct() {
     return
   fi
   local payload
-  payload=$(jq -cn --arg q "$query" --argjson l "$limit" \
-    '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search_memory","arguments":{"query":$q,"limit":$l}},"id":1}')
+  # REMNANT_SCOPE_PROJECT=1: only this project's memories plus unscoped ones (opt-in)
+  local scope=""
+  case "${REMNANT_SCOPE_PROJECT:-}" in 1|true|yes|TRUE|YES|True) scope="$PROJECT" ;; esac
+  payload=$(jq -cn --arg q "$query" --argjson l "$limit" --arg p "$scope" \
+    '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search_memory","arguments":({"query":$q,"limit":$l} + (if $p == "" then {} else {"project":$p} end))},"id":1}')
   local response
   response=$(curl -sf --max-time 10 \
     -X POST "${MEMORY_URL}/mcp" \

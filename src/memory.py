@@ -376,6 +376,13 @@ def _population(include_checkpoints: bool = False, states=("active",)) -> str:
     if not include_checkpoints:
         parts.append(_SEARCHABLE)
     return " AND ".join(parts)
+def normalize_project(project) -> str:
+    """Projects are stored and matched as a bare name. Some clients send their working
+    directory; a path becomes its last component, so "/src/app" and "app" are one project."""
+    p = str(project or "").strip().replace("\\", "/").rstrip("/")
+    return p.rsplit("/", 1)[-1] if p else ""
+
+
 def _project_filter(project: str = "", include_unscoped: bool = True) -> tuple[str, list]:
     """Optional project scope for search, as (" AND ...", params).
 
@@ -385,12 +392,19 @@ def _project_filter(project: str = "", include_unscoped: bool = True) -> tuple[s
     `project` is caller-supplied metadata, so this narrows results; it is not
     access control.
     """
-    project = (project or "").strip()
+    project = normalize_project(project)
     if not project:
         return "", []
     if include_unscoped:
-        return " AND (payload->>'project' = %s OR coalesce(payload->>'project', '') = '')", [project]
-    return " AND payload->>'project' = %s", [project]
+        return f" AND ({_STORED_PROJECT} = %s OR {_STORED_PROJECT} = '')", [project]
+    return f" AND {_STORED_PROJECT} = %s", [project]
+
+
+# The stored project normalised in SQL exactly like normalize_project(), so rows written
+# before normalisation (full paths, trailing slashes, backslashes) match their name.
+# Equality only: no LIKE, so '_' and '%' in names stay literal.
+_STORED_PROJECT = ("regexp_replace(rtrim(replace(btrim(coalesce(payload->>'project', '')), E'\\\\', '/'), '/'), "
+                   "'^.*/', '')")
 
 
 CHECKPOINT_TTL_DAYS = int(os.environ.get("CHECKPOINT_TTL_DAYS", "7"))
@@ -673,6 +687,7 @@ def add(content: str, agent_id: str = "", infer: Optional[bool] = None, category
     metadata: dict = {"source": source if source in VALID_SOURCES else "agent"}
     if session_id:
         metadata["session_id"] = session_id
+    project = normalize_project(project)
     if project:
         metadata["project"] = project
     if source == "extraction" and not state:
@@ -1040,7 +1055,8 @@ def save_checkpoint(session_id: str, content: str, agent_id: str = "", project: 
     capture_id = capture_id or str(_uuid.uuid4())   # stable tie-breaker, kept across retries
     get_memory().add(
         redact(content), user_id=settings.mem0_user_id, agent_id=_agent_id(agent_id), infer=False,
-        metadata={"kind": "checkpoint", "source": "hook", "session_id": session_id, "project": project,
+        metadata={"kind": "checkpoint", "source": "hook", "session_id": session_id,
+                  "project": normalize_project(project),
                   "category": "session", "captured_at": captured, "capture_id": capture_id,
                   "expires_at": expires})
     conn = _db_conn()
@@ -1210,7 +1226,7 @@ def _inherited_metadata(details: list[dict]) -> dict:
     cats = {d.get("category") for d in details if d.get("category")}
     if len(cats) == 1:
         meta["category"] = cats.pop()
-    projects = {d.get("project") for d in details if d.get("project")}
+    projects = {normalize_project(d.get("project")) for d in details if d.get("project")}
     if len(projects) == 1:
         meta["project"] = projects.pop()
     tags = sorted({t for d in details for t in (d.get("tags") or []) if isinstance(t, str)})

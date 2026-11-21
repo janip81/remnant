@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import time
+import pytest
 from pathlib import Path
 
 HOOK = Path(__file__).resolve().parents[1] / "plugin" / "hooks" / "on_pre_compact.py"
@@ -328,3 +329,19 @@ def test_stop_stores_checkpoint_and_candidates_only(tmp_path, monkeypatch):
 def test_no_session_id_stores_nothing(tmp_path, monkeypatch):
     assert _run_capture(tmp_path, monkeypatch, "") == []
     assert _run_capture(tmp_path, monkeypatch, "", source="pre-compaction") == []
+
+
+@pytest.mark.parametrize("scope,expected", [("", {}), ("1", {"project": "k8s-gitops"})])
+def test_prompt_hook_project_scope_is_opt_in(tmp_path, monkeypatch, capsys, scope, expected):
+    monkeypatch.setenv("REMNANT_SCOPE_PROJECT", scope)
+    h = load_prompt_hook(tmp_path, monkeypatch)
+    seen = []
+    log = tmp_path / "bench.jsonl"
+    monkeypatch.setenv("REMNANT_BENCH_LOG", str(log))
+    monkeypatch.setenv("REMNANT_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("REMNANT_TOKEN", "t")
+    monkeypatch.setattr(h, "search", lambda url, tok, q, limit=10, **kw: seen.append(kw) or [HIT])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(
+        {"prompt": "why is pg-main-rw refusing connections", "session_id": "s1", "cwd": "/x/k8s-gitops/"})))
+    h.main()
+    assert seen == [expected]
