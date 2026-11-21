@@ -191,10 +191,16 @@ OLLAMA_EMBED_MODEL=nomic-embed-text
 REDIS_URL=                  # optional; see below
 ```
 
-The nightly job then runs hash dedup and checkpoint expiry, and skips its LLM phases
-(semantic merge proposals) with a warning. To use them later without a local GPU,
-point `OLLAMA_BASE_URL` at a GPU host that may sleep, or set `DEDUP_LLM=openai` with an
-OpenAI-compatible endpoint. Note that memory text then leaves your network.
+`TAGGING_MODE=keyword` only turns off LLM tagging. The nightly job's semantic merge
+phase still asks an LLM whenever the configured endpoint (`OLLAMA_BASE_URL`, or
+`DEDUP_LLM_URL`) answers: the check tests the service, not whether the chat model is
+present. It is skipped, with a warning, only when the endpoint is unreachable. For
+deterministic maintenance without an LLM, run the job with `--phase1-only`: checkpoint
+expiry and exact-duplicate (hash) dedup, no LLM calls.
+
+To add merge proposals later without a local GPU, point `OLLAMA_BASE_URL` at a GPU host
+that may sleep, or set `DEDUP_LLM=openai` with an OpenAI-compatible endpoint. Memory
+text then leaves your network.
 
 Embeddings must keep coming from the same model: stored vectors are 768-dimensional
 `nomic-embed-text` vectors, and a different model makes new queries stop matching them.
