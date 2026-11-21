@@ -178,6 +178,38 @@ Proposals and Stop-hook extractions are candidates: review them in the UI (state
 "candidate", promote or reject); the Stats page and `/api/stats` (`review`) count how many
 were proposed, are pending, and were accepted or rejected.
 
+### Minimal deployment (no GPU)
+
+Only PostgreSQL with pgvector and an embedding model are required. `nomic-embed-text`
+is small and runs on CPU Ollama, so no GPU is needed:
+
+```dotenv
+MEM0_INFER=false            # default: store what agents write, no LLM extraction
+TAGGING_MODE=keyword        # tagging by keyword rules only
+OLLAMA_EMBED_BASE_URL=http://<cpu-ollama>:11434
+OLLAMA_EMBED_MODEL=nomic-embed-text
+REDIS_URL=                  # optional; see below
+```
+
+The nightly job then runs hash dedup and checkpoint expiry, and skips its LLM phases
+(semantic merge proposals) with a warning. To use them later without a local GPU,
+point `OLLAMA_BASE_URL` at a GPU host that may sleep, or set `DEDUP_LLM=openai` with an
+OpenAI-compatible endpoint. Note that memory text then leaves your network.
+
+Embeddings must keep coming from the same model: stored vectors are 768-dimensional
+`nomic-embed-text` vectors, and a different model makes new queries stop matching them.
+Changing the model means re-embedding every memory.
+
+While the embedding host is unreachable, writes cannot be stored:
+
+- without Redis, `add_memory` fails and returns the error to the agent;
+- with `REDIS_URL`, writes are queued and retried. `/metrics` shows the backlog
+  (`remnant_queue_depth`, `remnant_queue_pending`, `remnant_queue_dead`,
+  `remnant_queue_worker_up`), and [deploy/prometheus-rules.example.yaml](deploy/prometheus-rules.example.yaml)
+  has example alerts for a backlog, a stopped worker and dead letters.
+
+Search keeps working with keyword results only when the vector side is unavailable.
+
 ### Endpoints and authentication
 
 | Endpoint | Authentication | Why |

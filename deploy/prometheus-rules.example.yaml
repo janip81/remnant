@@ -1,0 +1,38 @@
+# Example Prometheus alerting rules for Remnant's write queue (REDIS_URL set).
+# Plain rule-file format: load it with rule_files, or copy the groups into a
+# prometheus-operator PrometheusRule's spec. Adjust thresholds to your write volume.
+# Without Redis there is no queue: writes fail immediately while the embedding host is down.
+groups:
+  - name: remnant-queue
+    rules:
+      - alert: RemnantQueueBacklog
+        # Writes are queued but not stored, typically because the embedding host is down.
+        expr: max(remnant_queue_depth) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Remnant has had unwritten memories queued for 15 minutes
+          description: Check that the embedding model (OLLAMA_EMBED_BASE_URL) is reachable.
+      - alert: RemnantQueueWorkerDown
+        expr: max(remnant_queue_worker_up) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: The Remnant queue worker has not run for 5 minutes
+      - alert: RemnantQueueDeadLetters
+        # Jobs that failed all retries; inspect and replay or discard them.
+        expr: max(remnant_queue_dead) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Remnant has writes in the dead-letter stream
+      - alert: RemnantQueueStateUnknown
+        expr: max(remnant_queue_metrics_error) == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Remnant cannot read its queue state (Redis unreachable?)
