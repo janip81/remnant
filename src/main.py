@@ -216,9 +216,13 @@ async def _send_response(send, status, headers, body):
     await send({"type": "http.response.body", "body": body})
 
 
-def _check_auth(headers: dict) -> bool:
+def _bearer_matches(headers: dict, token: str) -> bool:
     auth = headers.get(b"authorization", b"").decode()
-    return auth.startswith("Bearer ") and hmac.compare_digest(auth[7:].encode(), settings.bearer_token.encode())
+    return bool(token) and auth.startswith("Bearer ") and hmac.compare_digest(auth[7:].encode(), token.encode())
+
+
+def _check_auth(headers: dict) -> bool:
+    return _bearer_matches(headers, settings.bearer_token)
 
 
 def _get_agent_id(headers: dict) -> str:
@@ -354,25 +358,33 @@ async def app(scope, receive, send):
     method = scope.get("method", "GET")
     headers = dict(scope.get("headers", []))
 
-    # Health — no auth
+    # Unauthenticated by design (README "Endpoints and authentication"):
+    #   /health   static liveness answer for probes; reveals nothing about stored data
+    #   /metrics  aggregate counts for Prometheus; METRICS_TOKEN requires a scrape token,
+    #             METRICS_DETAIL=basic drops the per-agent and per-tag series
     if path == "/health":
         await _send_response(send, *_json_response({"status": "ok", "service": "claude-memory"}))
         return
 
-    # Prometheus metrics — no auth
     if path == "/metrics" and method == "GET":
+        if settings.metrics_token.strip() and not _bearer_matches(headers, settings.metrics_token.strip()):
+            await _send_response(send, 401, [[b"content-type", b"text/plain"]], b"Unauthorized")
+            return
         st = await asyncio.to_thread(mem_store.stats)
         categories, agents, tags = st["by_category"], st["by_agent"], st["by_tag"]
+        if settings.metrics_detail == "basic":
+            agents, tags = {}, {}
         lines = [
             "# HELP remnant_memories_total Total number of memories stored",
             "# TYPE remnant_memories_total gauge",
         ]
         for cat, count in sorted(categories.items()):
             lines.append(f'remnant_memories_total{{category="{cat}"}} {count}')
-        lines += [
-            "# HELP remnant_memories_by_agent Total memories per agent",
-            "# TYPE remnant_memories_by_agent gauge",
-        ]
+        if agents:
+            lines += [
+                "# HELP remnant_memories_by_agent Total memories per agent",
+                "# TYPE remnant_memories_by_agent gauge",
+            ]
         for agent, count in sorted(agents.items()):
             lines.append(f'remnant_memories_by_agent{{agent_id="{agent}"}} {count}')
         if tags:

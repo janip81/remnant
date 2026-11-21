@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     # Must serve the same model as before, or stored vectors stop matching new queries.
     ollama_embed_base_url: str = ""
     redis_url: str = ""  # optional: enable async add_memory queue
+    # /metrics is unauthenticated unless METRICS_TOKEN is set; then scrapers send
+    # "Authorization: Bearer <METRICS_TOKEN>". A separate token, so a scraper gets no
+    # access to /mcp or /api. METRICS_DETAIL=basic omits the per-agent and per-tag series.
+    metrics_token: str = ""
+    metrics_detail: str = "full"
 
     @property
     def embed_base_url(self) -> str:
@@ -44,6 +49,12 @@ class Settings(BaseSettings):
                 "BEARER_TOKEN is empty, a placeholder or shorter than 16 characters. "
                 "Generate one with: openssl rand -hex 32"
             )
+        metrics = self.metrics_token.strip()
+        if metrics and (len(metrics) < 16 or metrics == token):
+            raise SystemExit("METRICS_TOKEN must be at least 16 characters and differ from BEARER_TOKEN "
+                             "(a scraper must not hold the MCP token)")
+        if self.metrics_detail not in ("full", "basic"):
+            raise SystemExit("METRICS_DETAIL must be full or basic")
 
 
 settings = Settings()
