@@ -279,3 +279,52 @@ def test_precompact_flag_is_per_session(tmp_path):
     assert flags == ["precompact-sess-a"]
     assert not os.path.exists("/tmp/.claude-precompact-flag") or \
         os.path.getmtime("/tmp/.claude-precompact-flag") < time.time() - 5     # global flag no longer written
+
+
+def _run_capture(tmp_path, monkeypatch, session_id, source="session-end", extracted=("fact one",)):
+    """Run on_pre_compact.main() against a fake transcript; return the MCP tool calls."""
+    import io, json, sys
+    hook = load(tmp_path, monkeypatch)
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("\n".join(json.dumps(e) for e in [
+        {"type": "user", "message": {"role": "user", "content": "please deploy the chart to the staging cluster"}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Deployed the chart; the staging rollout finished cleanly."}]}},
+    ]) + "\n")
+    calls = []
+
+    class Resp:
+        def __init__(self, body): self.body = body.encode()
+        def read(self): return self.body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_urlopen(req, timeout=0):
+        body = json.loads(req.data)
+        if req.full_url.endswith("/api/generate"):
+            return Resp(json.dumps({"response": json.dumps(list(extracted))}))
+        calls.append(body["params"])
+        return Resp('data: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}]}}\n')
+
+    monkeypatch.setattr(hook.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setenv("REMNANT_URL", "http://remnant.test")
+    monkeypatch.setenv("REMNANT_TOKEN", "t" * 32)
+    monkeypatch.setattr(sys, "argv", ["on_pre_compact.py", f"--source={source}"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(
+        {"transcript_path": str(transcript), "session_id": session_id, "cwd": "/w/proj"})))
+    hook.main()
+    return calls
+
+
+def test_stop_stores_checkpoint_and_candidates_only(tmp_path, monkeypatch):
+    calls = _run_capture(tmp_path, monkeypatch, "s1")
+    names = [c["name"] for c in calls]
+    assert names == ["save_checkpoint", "add_memory"]
+    extracted = calls[1]["arguments"]
+    # the server stores source=extraction as state=candidate (test_memory_add)
+    assert extracted["source"] == "extraction" and extracted["content"] == "fact one"
+    assert not any(c["name"] == "add_memory" and c["arguments"].get("category") == "session" for c in calls)
+
+
+def test_no_session_id_stores_nothing(tmp_path, monkeypatch):
+    assert _run_capture(tmp_path, monkeypatch, "") == []
+    assert _run_capture(tmp_path, monkeypatch, "", source="pre-compaction") == []

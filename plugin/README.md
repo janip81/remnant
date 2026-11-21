@@ -56,7 +56,7 @@ registered (the plugin manifest loads it). `settings-template.json` carries the 
 | `SessionStart` | `on_session_start.sh` | On startup, reminds the agent to search memory. On resume or compact, restores this session's own checkpoint (by exact session id) and adds a broad related-memory search. |
 | `UserPromptSubmit` | `on_user_prompt.sh` → `on_user_prompt.py` | Injects a memory only if an identifier-like term from the prompt (hostname, file, version, IP ...) literally appears in it. At most 3 memories and 3000 characters, each at most once per session; unreviewed candidates are never injected. Most prompts get nothing. |
 | `PreCompact` | `on_pre_compact.sh` → `on_pre_compact.py` | Saves the session checkpoint synchronously before compaction. |
-| `Stop` | `on_stop.sh` | Captures the checkpoint (no reminder text: a Stop hook's stdout never reaches the model, #39), throttled to once per 15 minutes per session, and skipped right after that session compacted. |
+| `Stop` | `on_stop.sh` | Captures the checkpoint (no reminder text: a Stop hook's stdout never reaches the model, #39), throttled to once per 15 minutes per session, and skipped right after that session compacted. Learnings extracted by the local LLM are stored as review candidates, not active memories. Without a session id nothing is stored. |
 
 There are two optional hooks. `on_task_completed.sh` (TaskCompleted) is a learning
 reminder. `block_memory_write.sh` (PreToolUse, matcher `Write|Edit`) blocks writes to
