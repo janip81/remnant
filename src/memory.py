@@ -506,13 +506,24 @@ def stats() -> dict:
             cur.execute(f"SELECT t, count(*) FROM {_MEM_TABLE}, "
                         f"jsonb_array_elements_text(coalesce({_META_TAGS}, '[]'::jsonb)) AS t {where} GROUP BY 1", p)
             by_tag = dict(cur.fetchall())
+            # Review report: LLM output that waits for review (nightly merge proposals,
+            # Stop-hook extractions). accepted = promoted in review, even if superseded later.
+            cur.execute(f"SELECT payload->>'source', count(*), "
+                        f"count(*) FILTER (WHERE payload->>'state' = 'candidate'), "
+                        f"count(*) FILTER (WHERE payload->>'reviewed_at' IS NOT NULL "
+                        f"AND payload->>'state' <> 'rejected'), "
+                        f"count(*) FILTER (WHERE payload->>'state' = 'rejected') "
+                        f"FROM {_MEM_TABLE} {where} AND payload->>'source' IN ('merge', 'extraction') "
+                        f"GROUP BY 1", p)
+            review = {src: {"proposed": n, "pending": pending, "accepted": accepted, "rejected": rejected}
+                      for src, n, pending, accepted, rejected in cur.fetchall()}
     except psycopg2.errors.UndefinedTable:
         return {"total": 0, "first_added": None, "last_added": None,
-                "by_agent": {}, "by_category": {}, "by_tag": {}}
+                "by_agent": {}, "by_category": {}, "by_tag": {}, "review": {}}
     finally:
         conn.close()
     return {"total": total, "first_added": first, "last_added": last,
-            "by_agent": by_agent, "by_category": by_category, "by_tag": by_tag}
+            "by_agent": by_agent, "by_category": by_category, "by_tag": by_tag, "review": review}
 
 
 # ---------------------------------------------------------------------------
