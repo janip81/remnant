@@ -203,16 +203,30 @@ def test_valid_json_but_bad_job_is_quarantined(env, raw):
     assert run(client.xlen(qw.DEAD)) == 1 and run(client.llen(qw.LEGACY_STAGING)) == 0
 
 
-def test_worker_reported_alive_while_busy(monkeypatch):
-    class Running:
-        def done(self):
-            return False
-    monkeypatch.setattr(qw, "_worker_task", Running())
-    monkeypatch.setattr(qw, "_heartbeat", 0.0)           # last loop long ago
-    monkeypatch.setattr(qw, "_busy", True)               # but a slow add is running
-    assert qw.worker_alive()
-    monkeypatch.setattr(qw, "_busy", False)
-    assert not qw.worker_alive()
+class _Task:
+    def __init__(self, done=False):
+        self._done = done
+
+    def done(self):
+        return self._done
+
+
+@pytest.mark.parametrize("task,busy,heartbeat,now,alive", [
+    (_Task(), False, None, 10.0, False),        # never beaten: not alive, even right after boot (#59)
+    (_Task(), False, None, 1e6, False),
+    (_Task(), False, 95.0, 100.0, True),        # fresh heartbeat
+    (_Task(), False, 30.0, 100.0, False),       # stale (> HEARTBEAT_STALE_S)
+    (_Task(), True, None, 10.0, True),          # busy with a slow add: alive without a beat
+    (_Task(), True, 30.0, 100.0, True),         # busy and stale: still alive
+    (_Task(done=True), True, 95.0, 100.0, False),  # stopped task
+    (None, False, 95.0, 100.0, False),          # never started
+])
+def test_worker_alive_with_fake_clock(monkeypatch, task, busy, heartbeat, now, alive):
+    monkeypatch.setattr(qw, "_worker_task", task)
+    monkeypatch.setattr(qw, "_busy", busy)
+    monkeypatch.setattr(qw, "_heartbeat", heartbeat)
+    monkeypatch.setattr(qw, "time", types.SimpleNamespace(monotonic=lambda: now))
+    assert qw.worker_alive() is alive
 
 
 def test_checkpoint_job_routes_to_save_checkpoint(env):

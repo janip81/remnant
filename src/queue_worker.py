@@ -55,7 +55,7 @@ LAG_SCAN_MAX = 10000      # metrics: count undelivered entries up to this many
 _client = None
 _worker_task: Optional[asyncio.Task] = None
 _consumer = os.environ.get("HOSTNAME") or socket.gethostname()
-_heartbeat = 0.0          # monotonic time of the last worker loop iteration
+_heartbeat: Optional[float] = None  # monotonic time of the last loop iteration; None = none yet
 _busy = False             # a job is being processed (a single add can take minutes)
 
 
@@ -93,8 +93,15 @@ def ensure_worker() -> None:
 
 
 def worker_alive() -> bool:
-    return (_worker_task is not None and not _worker_task.done()
-            and (_busy or time.monotonic() - _heartbeat < HEARTBEAT_STALE_S))
+    """The worker task runs and is either processing a job or looped recently.
+
+    No heartbeat yet (None) is not alive. The monotonic clock's origin is arbitrary
+    (often host uptime), so a numeric "never" such as 0.0 could look recent (#59)."""
+    if _worker_task is None or _worker_task.done():
+        return False
+    if _busy:
+        return True
+    return _heartbeat is not None and time.monotonic() - _heartbeat < HEARTBEAT_STALE_S
 
 
 async def _ensure_group(client) -> None:
