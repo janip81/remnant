@@ -65,6 +65,10 @@ spec:
               value: {{ .Values.mem0.agentId | quote }}
             - name: MEM0_INFER
               value: {{ .Values.mem0.infer | quote }}
+            # /mcp accepts only these Host names (plus loopback): the in-cluster service
+            # (dedup job) and the gateway host. Source of truth: the helm-charts repo chart.
+            - name: MCP_ALLOWED_HOSTS
+              value: "{{ printf "%s:%v" (include "remnant.fullname" .) .Values.service.port }}{{ if and .Values.gatewayApi.enabled .Values.gatewayApi.host }},{{ .Values.gatewayApi.host }}{{ end }}"
           livenessProbe:
             httpGet:
               path: /health

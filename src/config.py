@@ -16,8 +16,10 @@ class Settings(BaseSettings):
     mem0_infer: bool = False
     app_port: int = 8080
     app_host: str = "0.0.0.0"   # the benchmark harness binds 127.0.0.1
-    # MCP DNS-rebinding protection: comma-separated Host header values that may reach
-    # /mcp (exact, or "host:*" for any port). Empty = protection off (logged at startup).
+    # MCP DNS-rebinding protection, on by default. MCP_ALLOWED_HOSTS: comma-separated Host
+    # header values that may reach /mcp besides loopback (exact, or "host:*" for any port).
+    # Unset = loopback only. MCP_DNS_REBINDING_PROTECTION=false is the explicit opt-out.
+    mcp_dns_rebinding_protection: bool = True
     mcp_allowed_hosts: str = ""
     mcp_allowed_origins: str = ""   # browser Origins allowed on /mcp (non-browser clients send none)
     ollama_base_url: str = "http://localhost:11434"
@@ -47,18 +49,26 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
-def mcp_transport_security(cfg: Settings):
-    """DNS-rebinding protection for /mcp: on when MCP_ALLOWED_HOSTS is set.
+LOOPBACK_HOSTS = ["localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*", "[::1]", "[::1]:*"]
 
-    Hosts match exactly or as "host:*" (any port). Loopback is always allowed (probes,
-    local tools, the benchmark harness). Empty = off, as before, with a warning."""
+
+def mcp_transport_security(cfg: Settings):
+    """DNS-rebinding protection for /mcp, on unless MCP_DNS_REBINDING_PROTECTION=false.
+
+    Loopback is always allowed (probes, local tools, the benchmark harness); MCP_ALLOWED_HOSTS
+    adds hosts that match exactly or as "host:*" (any port). Unset = loopback only, so a
+    server reached under another name rejects /mcp requests until that name is listed."""
     import logging
     from mcp.server.transport_security import TransportSecuritySettings
+    log = logging.getLogger(__name__)
+    if not cfg.mcp_dns_rebinding_protection:
+        log.warning("MCP_DNS_REBINDING_PROTECTION=false: DNS rebinding protection on /mcp is OFF")
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
     hosts = [h.strip() for h in cfg.mcp_allowed_hosts.split(",") if h.strip()]
     if not hosts:
-        logging.getLogger(__name__).warning("MCP_ALLOWED_HOSTS is not set: DNS rebinding protection on /mcp is OFF")
-        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        log.warning("MCP_ALLOWED_HOSTS is not set: /mcp accepts loopback Host headers only "
+                    "(set it to the names clients use to reach this server)")
     origins = [o.strip() for o in cfg.mcp_allowed_origins.split(",") if o.strip()]
     return TransportSecuritySettings(enable_dns_rebinding_protection=True,
-                                     allowed_hosts=hosts + ["localhost:*", "127.0.0.1:*", "[::1]:*"],
+                                     allowed_hosts=hosts + LOOPBACK_HOSTS,
                                      allowed_origins=origins)
