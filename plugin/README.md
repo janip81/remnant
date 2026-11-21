@@ -46,6 +46,11 @@ claude mcp add --scope user remnant python3 "$REMNANT_PLUGIN_DIR/mcp-stdio.py"
 
 ## What the hooks do
 
+[hooks/hooks.json](hooks/hooks.json) is the source of truth for which hooks are
+registered (the plugin manifest loads it). `settings-template.json` carries the same
+`hooks` block plus the environment, and this table lists the same events and scripts;
+`tests/test_hook_config.py` fails when they differ.
+
 | Hook | Script | Action |
 |------|--------|--------|
 | `SessionStart` | `on_session_start.sh` | On startup, reminds the agent to search memory. On resume or compact, restores this session's own checkpoint (by exact session id) and adds a broad related-memory search. |
