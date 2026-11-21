@@ -113,7 +113,15 @@ curl --fail http://localhost:8080/health
 | PostgreSQL | `localhost:5432` (published by the development Compose file) |
 
 The supplied Compose file publishes ports on the host. Restrict their exposure
-for your environment. The UI proxies API credentials server-side; do not expose
+for your environment.
+
+`/mcp` has DNS rebinding protection on by default and accepts loopback host names
+only (`localhost`, `127.0.0.1`, `[::1]`). If clients reach the server under another
+name (a LAN hostname, an ingress or gateway host, an in-cluster service such as
+`remnant:8080`), list those names in `MCP_ALLOWED_HOSTS` (comma-separated, exact or
+`host:*` for any port). Otherwise their `/mcp` requests are rejected. Turning the
+protection off takes an explicit `MCP_DNS_REBINDING_PROTECTION=false`; the server
+logs a warning at startup when it is off or when only loopback is allowed. The UI proxies API credentials server-side; do not expose
 it publicly without an authentication/access-control layer.
 
 Stop with `docker compose down`; data remains in the database volume. Adding

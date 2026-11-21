@@ -47,6 +47,9 @@ data:
   OLLAMA_EMBED_MODEL: "nomic-embed-text"
   TAGGING_MODE: "hybrid"                        # keyword | llm | hybrid
   REMNANT_USER_ID: "default"
+  # /mcp accepts only the Host names listed here (plus loopback); the dedup job uses remnant:8080.
+  # Add the name clients use, e.g. your ingress host. MCP_DNS_REBINDING_PROTECTION=false opts out.
+  MCP_ALLOWED_HOSTS: "remnant:8080,remnant-mcp.example.com"
 
 ---
 # ── PostgreSQL + pgvector ──────────────────────────────────────────────────────

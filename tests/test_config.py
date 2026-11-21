@@ -31,16 +31,40 @@ def test_remnant_name_wins(monkeypatch):
     assert Settings(_env_file=None).mem0_user_id == "new"
 
 
-def test_mcp_dns_rebinding_protection_follows_allowed_hosts():
+def test_mcp_dns_rebinding_protection_on_by_default_loopback_only(monkeypatch):
     from config import Settings, mcp_transport_security
-    base = dict(bearer_token="x" * 32)
-    off = mcp_transport_security(Settings(**base))
-    assert off.enable_dns_rebinding_protection is False                     # unchanged default
-    on = mcp_transport_security(Settings(**base, mcp_allowed_hosts="remnant:8080, remnant-mcp.example.se",
+    for var in ("MCP_ALLOWED_HOSTS", "MCP_DNS_REBINDING_PROTECTION", "MCP_ALLOWED_ORIGINS"):
+        monkeypatch.delenv(var, raising=False)
+    sec = mcp_transport_security(Settings(_env_file=None, bearer_token="x" * 32))
+    assert sec.enable_dns_rebinding_protection is True
+    assert set(sec.allowed_hosts) == {"localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*", "[::1]", "[::1]:*"}
+
+
+def test_mcp_dns_rebinding_protection_allowed_hosts_and_origins():
+    from config import Settings, mcp_transport_security
+    on = mcp_transport_security(Settings(_env_file=None, bearer_token="x" * 32,
+                                         mcp_allowed_hosts="remnant:8080, remnant-mcp.example.se",
                                          mcp_allowed_origins="https://ui.example.se"))
     assert on.enable_dns_rebinding_protection is True
     assert on.allowed_hosts[:2] == ["remnant:8080", "remnant-mcp.example.se"]
     assert "127.0.0.1:*" in on.allowed_hosts and on.allowed_origins == ["https://ui.example.se"]
+
+
+def test_mcp_dns_rebinding_protection_explicit_opt_out(monkeypatch):
+    from config import Settings, mcp_transport_security
+    monkeypatch.setenv("MCP_DNS_REBINDING_PROTECTION", "false")
+    off = mcp_transport_security(Settings(_env_file=None, bearer_token="x" * 32))
+    assert off.enable_dns_rebinding_protection is False
+
+
+@pytest.mark.parametrize("host,ok", [("localhost:8080", True), ("localhost", True), ("[::1]:8080", True),
+                                     ("remnant-mcp.example.se", True), ("evil.example:8080", False)])
+def test_mcp_host_validation(host, ok):
+    from config import Settings, mcp_transport_security
+    from mcp.server.transport_security import TransportSecurityMiddleware
+    sec = mcp_transport_security(Settings(_env_file=None, bearer_token="x" * 32,
+                                          mcp_allowed_hosts="remnant-mcp.example.se"))
+    assert TransportSecurityMiddleware(sec)._validate_host(host) is ok
 
 
 def test_embed_url_defaults_to_ollama_base_url(monkeypatch):
