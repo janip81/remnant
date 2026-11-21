@@ -1,4 +1,8 @@
-fastapi>=0.115.0
-uvicorn>=0.32.0
-httpx>=0.28.0
-aiofiles>=24.0.0
+# Pinned to the versions in the running UI image (2026-11-22). The UI runs in its own
+# image and CI job: these pins conflict with requirements-mcp.txt (starlette, uvicorn),
+# so the two sets are never installed together. Bump deliberately and test.
+fastapi==0.165.0
+starlette==1.10.0
+uvicorn==0.54.0
+httpx==0.28.1
+aiofiles==25.1.0
