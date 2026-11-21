@@ -178,6 +178,25 @@ Proposals and Stop-hook extractions are candidates: review them in the UI (state
 "candidate", promote or reject); the Stats page and `/api/stats` (`review`) count how many
 were proposed, are pending, and were accepted or rejected.
 
+### Endpoints and authentication
+
+| Endpoint | Authentication | Why |
+| --- | --- | --- |
+| `/mcp` | Bearer token (`BEARER_TOKEN`); allowed host names (`MCP_ALLOWED_HOSTS`) | Agent access to memory |
+| `/api/*` | Bearer token | UI backend, import/export, review, jobs |
+| `/health` | None | Liveness/readiness probes; a fixed answer that reveals nothing about stored data |
+| `/metrics` | None by default; `METRICS_TOKEN` to require one | Prometheus scraping |
+
+`/metrics` exposes aggregate counts: per category, and by default per agent id and per
+tag. Tag names and agent ids can be descriptive, so for a server reachable beyond a
+trusted network, do one or more of:
+
+- set `METRICS_TOKEN` (16+ characters, different from `BEARER_TOKEN`). Scrapers then
+  send `Authorization: Bearer <METRICS_TOKEN>`; that token opens nothing else.
+- set `METRICS_DETAIL=basic` to drop the per-agent and per-tag series.
+- route only `/mcp` (and the UI) through the public ingress, and scrape `/metrics`
+  in-cluster.
+
 - [deploy/manifest.yaml](deploy/manifest.yaml): plain Kubernetes deployment; review
   credentials, storage and network exposure before applying.
 - [Helm chart](https://github.com/janip81/helm-charts/tree/main/charts/remnant):
