@@ -20,50 +20,123 @@ logger = logging.getLogger(__name__)
 
 _EMBEDDING_DIMS = 768  # nomic-embed-text via Ollama
 
-# Seed rules — used to initialise tag_rules table on first deploy; runtime rules come from DB
-_TAG_RULES_SEED: dict[str, list[str]] = {
-    "prod-k8s": ["prod-k8s", "prod.k8s"],
-    "prod-mgmt": ["prod-mgmt"],
-    "dev-k8s": ["dev-k8s"],
-    "remnant": ["remnant", "claude-memory"],
-    "n8n": ["n8n"],
-    "frigate": ["frigate"],
-    "nextcloud": ["nextcloud"],
-    "ghost": ["ghost blog", "ghost cms"],
-    "matrix": ["matrix", "synapse", "element"],
-    "homeassistant": ["home assistant", "homeassistant", "ha-mcp", "hass"],
-    "minecraft": ["minecraft"],
-    "valheim": ["valheim"],
-    "firefly": ["firefly"],
-    "zigbee": ["zigbee", "zigbee2mqtt", "z2m"],
-    "velero": ["velero"],
-    "argocd": ["argocd", "argo cd"],
-    "keycloak": ["keycloak"],
-    "backup-operator": ["backup-operator", "backupoperator"],
-    "cnpg": ["cnpg", "cloudnativepg", "postgresql", "postgres"],
-    "cilium": ["cilium"],
-    "cert-manager": ["cert-manager", "certmanager"],
-    "capi": ["capi", "cluster api", "clusterapi"],
-    "upgrade": ["upgrade", "upgrading", "k8s upgrade", "kubernetes upgrade"],
-    "backup": ["backup", "velero", "restore"],
-    "etcd": ["etcd"],
-    "bgp": ["bgp", "bird", "bgppeers"],
-    "networking": ["networking", "network policy", "loadbalancer"],
-    "monitoring": ["prometheus", "grafana", "alertmanager", "monitoring", "servicemonitor"],
-    "helm": ["helm", "helmchart", "helm chart", "helmrelease"],
-    "storage": ["storage", "pvc", "persistentvolume", "nfs", "longhorn", "rook"],
-    "auth": ["auth", "keycloak", "oauth", "oidc", "sso"],
-    "opnsense": ["opnsense", "firewall"],
-    "hpe": ["hpe", "nimble", "simplivity"],
-    "worklog": ["worklog", "work log"],
-    "cycletrack": ["cycletrack", "cycle track"],
-    "gameledger": ["gameledger", "game ledger"],
-    "castlist": ["castlist", "cast list"],
-    "burst-power": ["burst-power", "burst power"],
-    "version-checker": ["version-checker", "versionchecker"],
-    "ansible": ["ansible"],
-    "blog": ["blog", "ghost"],
+# Seed rules: initialise the tag_rules table on first deploy; runtime rules come from the DB.
+# The built-in default is generic (tools and topics). Installation-specific rules (app and
+# cluster names) come from a JSON file {"tag": ["keyword", ...]} named by TAG_RULES_SEED_FILE,
+# e.g. deploy/tag-rules.example.json (#43).
+_TAG_RULES_DEFAULT: dict[str, list[str]] = {
+    "argocd": [
+        "argocd",
+        "argo cd"
+    ],
+    "keycloak": [
+        "keycloak"
+    ],
+    "cnpg": [
+        "cnpg",
+        "cloudnativepg",
+        "postgresql",
+        "postgres"
+    ],
+    "cilium": [
+        "cilium"
+    ],
+    "cert-manager": [
+        "cert-manager",
+        "certmanager"
+    ],
+    "capi": [
+        "capi",
+        "cluster api",
+        "clusterapi"
+    ],
+    "upgrade": [
+        "upgrade",
+        "upgrading",
+        "k8s upgrade",
+        "kubernetes upgrade"
+    ],
+    "backup": [
+        "backup",
+        "velero",
+        "restore"
+    ],
+    "etcd": [
+        "etcd"
+    ],
+    "bgp": [
+        "bgp",
+        "bird",
+        "bgppeers"
+    ],
+    "networking": [
+        "networking",
+        "network policy",
+        "loadbalancer"
+    ],
+    "monitoring": [
+        "prometheus",
+        "grafana",
+        "alertmanager",
+        "monitoring",
+        "servicemonitor"
+    ],
+    "helm": [
+        "helm",
+        "helmchart",
+        "helm chart",
+        "helmrelease"
+    ],
+    "storage": [
+        "storage",
+        "pvc",
+        "persistentvolume",
+        "nfs",
+        "longhorn",
+        "rook"
+    ],
+    "auth": [
+        "auth",
+        "keycloak",
+        "oauth",
+        "oidc",
+        "sso"
+    ],
+    "velero": [
+        "velero"
+    ],
+    "opnsense": [
+        "opnsense",
+        "firewall"
+    ],
+    "homeassistant": [
+        "home assistant",
+        "homeassistant",
+        "ha-mcp",
+        "hass"
+    ],
+    "zigbee": [
+        "zigbee",
+        "zigbee2mqtt",
+        "z2m"
+    ]
 }
+
+
+def _load_seed_rules() -> dict[str, list[str]]:
+    path = os.environ.get("TAG_RULES_SEED_FILE", "").strip()
+    if not path:
+        return dict(_TAG_RULES_DEFAULT)
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or not all(
+            isinstance(k, str) and isinstance(v, list) and all(isinstance(x, str) for x in v)
+            for k, v in data.items()):
+        raise ValueError("TAG_RULES_SEED_FILE must contain a JSON object of tag -> [keywords]")
+    return data
+
+
+_TAG_RULES_SEED: dict[str, list[str]] = _load_seed_rules()
 
 # ---------------------------------------------------------------------------
 # Tag rules — DB-backed with in-memory cache
