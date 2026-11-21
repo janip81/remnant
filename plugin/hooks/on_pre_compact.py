@@ -2,11 +2,13 @@
 """Capture session state via the mem0 MCP HTTP endpoint.
 
 Safety net for PreCompact and Stop hooks — reads the transcript JSONL,
-extracts structured session state, and stores it in mem0 directly.
+extracts structured session state, and saves it as the session's checkpoint
+(temporary, replaced per session, never part of default search).
 
 For session-end (Stop / /clear), also asks Ollama to extract discrete
-learnings from the conversation and saves each as a separate memory.
-This runs autonomously — no Claude response needed.
+learnings from the conversation. They are stored as review candidates
+(source=extraction), not as active memories. Without a session_id nothing is
+stored: a checkpoint needs one, and capture could not be throttled (#40).
 
 Used by:
   - PreCompact hook: Tags with "pre-compaction" (context about to be lost)
@@ -286,16 +288,17 @@ def mark_captured(session_id: str) -> None:
 def store_memory(memory_url: str, token: str, content: str, source: str,
                  session_id: str = "", project: str = "") -> bool:
     """Store session state as the session's replaceable checkpoint (one per session_id)."""
-    if session_id:
-        # PreCompact writes synchronously so SessionStart(compact) can read it back
-        call = {"name": "save_checkpoint",
-                "arguments": {"session_id": session_id, "content": content, "project": project,
-                              "captured_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
-                              "capture_id": str(uuid.uuid4()),
-                              "sync": source != "session-end"}}
-    else:  # older Claude Code without session_id: fall back to a plain memory
-        call = {"name": "add_memory", "arguments": {"content": content, "infer": False, "category": "session",
-                                                    "source": "hook", "project": project}}
+    if not session_id:
+        # No free-text session memory as a fallback: it would be active, searchable and
+        # unthrottled (#40). Checkpoints are keyed by session_id.
+        log.debug("No session_id; not storing session state")
+        return False
+    # PreCompact writes synchronously so SessionStart(compact) can read it back
+    call = {"name": "save_checkpoint",
+            "arguments": {"session_id": session_id, "content": content, "project": project,
+                          "captured_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                          "capture_id": str(uuid.uuid4()),
+                          "sync": source != "session-end"}}
     payload = {
         "jsonrpc": "2.0",
         "method": "tools/call",
@@ -372,6 +375,9 @@ def main():
         return
 
     session_id = str(hook_input.get("session_id") or "")
+    if not session_id:
+        log.debug("No session_id; skipping capture and extraction")
+        return
     project = os.path.basename(str(hook_input.get("cwd") or "").rstrip("/"))
     if not stop_capture_due(session_id, source):
         log.debug("Captured less than %ds ago; skipping", STOP_CAPTURE_INTERVAL)
@@ -394,8 +400,8 @@ def main():
     if store_memory(memory_url, token, content, source, session_id, project):
         mark_captured(session_id)
 
-    # For session-end (Stop / /clear): also extract discrete learnings via Ollama
-    # and save each as a separate memory. Runs autonomously — no Claude response needed.
+    # For session-end (Stop / /clear): also extract discrete learnings via Ollama and
+    # save each as a review candidate (the server stores source=extraction as candidate).
     if source == "session-end":
         conversation = build_conversation_text(lines)
         if conversation:
