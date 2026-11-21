@@ -567,6 +567,22 @@ def test_idempotency_key_atomic_and_bound_to_request(mem, monkeypatch):
     assert reuse["ok"] is False and "different request" in reuse["error"]
 
 
+def test_project_names_normalized_and_legacy_paths_matched(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    assert [mem.normalize_project(p) for p in ("/opt/src/app/", "app", " ", "C:\\w\\app")] == ["app", "app", "", "app"]
+    _insert("scoped zeta-7 by name", {"project": "my_app"})
+    _insert("scoped zeta-7 by legacy path", {"project": "/home/u/src/my_app"})
+    _insert("other zeta-7 project", {"project": "/home/u/src/myxapp"})
+    _insert("unscoped zeta-7 fact")
+    for project in ("my_app", "/elsewhere/my_app"):
+        only = texts(mem.keyword_search("zeta-7", 10, project=project, include_unscoped=False))
+        assert sorted(only) == ["scoped zeta-7 by legacy path", "scoped zeta-7 by name"]
+    withshared = texts(mem.keyword_search("zeta-7", 10, project="my_app"))
+    assert "unscoped zeta-7 fact" in withshared and "other zeta-7 project" not in withshared
+    mem.save_checkpoint("sess-norm", "state", project="/home/u/src/my_app/")
+    assert mem.get_checkpoint("sess-norm")["project"] == "my_app"
+
+
 def test_edit_keeps_tags_and_project(mem, monkeypatch):
     import uuid
     monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())

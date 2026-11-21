@@ -28,6 +28,14 @@ variables and have no built-in server default:
 Then copy the `hooks` block from [hooks/settings-template.json](hooks/settings-template.json)
 into the same file.
 
+Optional: `REMNANT_SCOPE_PROJECT=1` limits the hooks' automatic searches to the current
+project (the working directory's name) plus memories stored without a project. It is
+off by default: if you work on several projects from one directory, the directory does
+not say which project a prompt is about, and scoping would hide relevant memories. The
+server stores project names as a bare name (a path becomes its last component) and
+matches older rows stored as a path. Agents can always pass `project` to `search_memory`
+themselves.
+
 ## Add the MCP server
 
 You can connect directly over HTTP:

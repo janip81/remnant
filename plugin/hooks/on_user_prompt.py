@@ -37,6 +37,10 @@ MAX_ITEMS = int(os.environ.get("REMNANT_INJECT_MAX_ITEMS", "3"))
 MAX_CHARS = int(os.environ.get("REMNANT_INJECT_MAX_CHARS", "3000"))
 CANDIDATES = 10
 TIMEOUT = float(os.environ.get("REMNANT_INJECT_TIMEOUT", "5"))
+# Opt-in: limit hook searches to the current project (cwd basename) plus memories with
+# no project. Off by default: when one workspace serves several projects, the cwd does
+# not say which project a prompt is about, and scoping would hide relevant memories.
+SCOPE_PROJECT = os.environ.get("REMNANT_SCOPE_PROJECT", "").strip().lower() in ("1", "true", "yes")
 STATE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "remnant")
 
 # \w is Unicode-aware, so Swedish names (åäö-config) are identifiers too; a
@@ -149,10 +153,12 @@ class session_lock:
             os.close(self.fd)       # releases the lock
 
 
-def search(url: str, token: str, query: str, limit: int = CANDIDATES) -> list[dict]:
+def search(url: str, token: str, query: str, limit: int = CANDIDATES, project: str = "") -> list[dict]:
+    args = {"query": query, "limit": limit, "format": "json"}
+    if project:
+        args["project"] = project
     payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-               "params": {"name": "search_memory",
-                          "arguments": {"query": query, "limit": limit, "format": "json"}}}
+               "params": {"name": "search_memory", "arguments": args}}
     req = urllib.request.Request(f"{url.rstrip('/')}/mcp", data=json.dumps(payload).encode(), method="POST",
                                  headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json",
                                           "Accept": "application/json, text/event-stream"})
@@ -184,6 +190,13 @@ def render(chosen: list[dict], idents: list[str]) -> str:
     return f"<memory>\n{body}\n</memory>"
 
 
+def scope_kwargs(event: dict) -> dict:
+    """{"project": <cwd basename>} when REMNANT_SCOPE_PROJECT is on, else {}."""
+    cwd = str(event.get("cwd") or "").rstrip("/")
+    project = os.path.basename(cwd) if SCOPE_PROJECT and cwd else ""
+    return {"project": project} if project and project != "." else {}
+
+
 def main() -> None:
     t0 = time.monotonic()
     policy = bench_log.policy()
@@ -212,7 +225,8 @@ def main() -> None:
     if policy == "broad":
         t1 = time.monotonic()
         try:
-            hits = search(url, token, broad_query(prompt, str(event.get("cwd") or "")), limit=3)
+            hits = search(url, token, broad_query(prompt, str(event.get("cwd") or "")), limit=3,
+                          **scope_kwargs(event))
         except Exception:
             return done("search-failed")
         finally:
@@ -227,7 +241,7 @@ def main() -> None:
         return done("no-identifier")                 # nothing specific to look up
     t1 = time.monotonic()
     try:
-        hits = search(url, token, prompt[:900])
+        hits = search(url, token, prompt[:900], **scope_kwargs(event))
     except Exception:
         return done("search-failed")                 # never block or slow the prompt
     finally:
