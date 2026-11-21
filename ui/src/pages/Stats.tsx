@@ -121,6 +121,28 @@ export default function Stats() {
           </Section>
         </Grid>
 
+        {stats.review && Object.keys(stats.review).length > 0 && (
+          <Grid item xs={12}>
+            <Section title="Review proposals (LLM output)">
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                {Object.entries(stats.review).sort(([a], [b]) => a.localeCompare(b)).map(([source, r]) => (
+                  <Box key={source}>
+                    <Typography variant="body2" sx={{ fontFamily: 'monospace', mb: 0.5 }}>
+                      {source === 'merge' ? 'merge (nightly job)' : source === 'extraction' ? 'extraction (Stop hook)' : source}
+                    </Typography>
+                    <Box sx={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                      <StatBlock label="proposed" value={r.proposed} />
+                      <StatBlock label="pending review" value={r.pending} />
+                      <StatBlock label="accepted" value={r.accepted} />
+                      <StatBlock label="rejected" value={r.rejected} />
+                    </Box>
+                  </Box>
+                ))}
+              </Box>
+            </Section>
+          </Grid>
+        )}
+
         {stats.by_tag && Object.keys(stats.by_tag).length > 0 && (
           <Grid item xs={12}>
             <Section title={`Top Tags (${tagCount} total)`}>

@@ -27,6 +27,8 @@ export interface Stats {
   by_agent: Record<string, number>
   by_category: Record<string, number>
   by_tag: Record<string, number>
+  // LLM output awaiting review, by source ("merge" proposals, Stop "extraction")
+  review?: Record<string, { proposed: number; pending: number; accepted: number; rejected: number }>
 }
 
 export interface FetchParams {

@@ -523,6 +523,21 @@ def test_merge_proposal_review(mem, monkeypatch):
     assert _row(c).get("state") is None and _row(d).get("state") is None       # rejection changes nothing
 
 
+def test_stats_review_report(mem, monkeypatch):
+    monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
+    assert mem.stats()["review"] == {}
+    props = []
+    for i in range(3):
+        a, b = _new_active(mem, f"fact {i}a"), _new_active(mem, f"fact {i}b")
+        props.append(mem.supersede([a, b], f"fact {i} merged", "merge", as_candidate=True, source="merge"))
+    mem.review(props[0]["id"], "promote")
+    mem.review(props[1]["id"], "reject")
+    _insert("extracted learning", {"state": "candidate", "source": "extraction"})
+    review = mem.stats()["review"]
+    assert review["merge"] == {"proposed": 3, "pending": 1, "accepted": 1, "rejected": 1}
+    assert review["extraction"] == {"proposed": 1, "pending": 1, "accepted": 0, "rejected": 0}
+
+
 def test_edit_is_supersede_with_conflict_check(mem, monkeypatch):
     monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
     old = _new_active(mem, "ui text")

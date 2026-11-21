@@ -174,6 +174,9 @@ The maintenance job applies tagging rules, handles exact duplicates, proposes
 semantic merges for review, and expires checkpoints. Similarity alone does not
 establish equivalent facts. Semantic proposals preserve active originals until
 review; do not assume every explicit deletion is archived or reversible.
+Proposals and Stop-hook extractions are candidates: review them in the UI (state filter
+"candidate", promote or reject); the Stats page and `/api/stats` (`review`) count how many
+were proposed, are pending, and were accepted or rejected.
 
 - [deploy/manifest.yaml](deploy/manifest.yaml): plain Kubernetes deployment; review
   credentials, storage and network exposure before applying.
