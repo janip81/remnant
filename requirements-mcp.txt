@@ -4,9 +4,9 @@ mcp==1.27.1
 starlette==1.0.0
 uvicorn==0.46.0
 pydantic-settings==2.14.1
-python-dotenv>=1.0.0
+python-dotenv==1.2.4
 mem0ai==2.0.2
 psycopg2-binary==2.9.12
 ollama==0.6.2
-requests>=2.32.0
+requests==2.34.2
 redis[asyncio]==7.4.0

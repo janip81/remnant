@@ -148,6 +148,13 @@ behaviours for benchmarking (see [plugin/hooks/bench_log.py](plugin/hooks/bench_
 Use the tool schemas exposed by your running server for current arguments.
 Queued writes return an acknowledgement, not proof that persistence has completed.
 
+### Tag rules
+
+Keyword tag rules live in the `tag_rules` table and can be edited at runtime. On the first
+start against an empty table they are seeded from a generic built-in set (tools and topics), or
+from a JSON file `{"tag": ["keyword", ...]}` named by `TAG_RULES_SEED_FILE` for your own app and
+cluster names; see [deploy/tag-rules.example.json](deploy/tag-rules.example.json).
+
 ## Maintenance and deployment
 
 With `REDIS_URL` configured, writes use a Redis Stream and an in-process worker

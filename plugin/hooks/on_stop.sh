@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Hook: Stop
 #
-# Fires when Claude finishes responding. Reminds Claude to store any
-# unsaved learnings. Skips the transcript backup if a compaction just
+# Fires when Claude finishes responding. Saves a throttled session backup.
+# (No reminder text: a Stop hook's stdout with exit 0 never reaches the model, #39.)
+# Skips the transcript backup if a compaction just
 # happened (PreCompact already saved pre-compaction state — saving again
 # here would capture post-compaction content instead, which is worse).
 #
@@ -34,17 +35,6 @@ if [ -f "$FLAG" ]; then
   fi
 fi
 
-cat <<'EOF'
-Before finishing, check if there are important learnings from this interaction that should be persisted using the mem0 `add_memory` tool:
-
-1. Were any significant decisions made?
-2. Were any new patterns or strategies discovered?
-3. Did any approach fail?
-4. Did you learn anything about the user's preferences?
-5. Were there environment/setup discoveries?
-
-Only store genuinely useful learnings — skip if nothing notable happened.
-EOF
 
 if [ "$SKIP_BACKUP" = "false" ]; then
   echo "$INPUT" | python3 "$SCRIPT_DIR/on_pre_compact.py" --source=session-end 2>/dev/null &

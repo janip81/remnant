@@ -1,0 +1,5 @@
+{
+  "my-cluster": ["my-cluster", "my.cluster"],
+  "my-app": ["my-app", "myapp"],
+  "nextcloud": ["nextcloud"]
+}
