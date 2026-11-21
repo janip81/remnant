@@ -567,18 +567,29 @@ def test_idempotency_key_atomic_and_bound_to_request(mem, monkeypatch):
     assert reuse["ok"] is False and "different request" in reuse["error"]
 
 
+SCOPED = {"by name": "my_app", "by legacy path": "/home/u/src/my_app",
+          "by trailing slash": "/home/u/src/my_app/", "by backslashes": "C:\\src\\my_app\\"}
+OTHERS = {"other project": "/home/u/src/myxapp", "wildcard lookalike": "myXapp",
+          "percent lookalike": "my%app"}
+
+
 def test_project_names_normalized_and_legacy_paths_matched(mem, monkeypatch):
     monkeypatch.setattr(mem, "get_memory", lambda: FakeMem0ForDB())
-    assert [mem.normalize_project(p) for p in ("/opt/src/app/", "app", " ", "C:\\w\\app")] == ["app", "app", "", "app"]
-    _insert("scoped zeta-7 by name", {"project": "my_app"})
-    _insert("scoped zeta-7 by legacy path", {"project": "/home/u/src/my_app"})
-    _insert("other zeta-7 project", {"project": "/home/u/src/myxapp"})
-    _insert("unscoped zeta-7 fact")
-    for project in ("my_app", "/elsewhere/my_app"):
-        only = texts(mem.keyword_search("zeta-7", 10, project=project, include_unscoped=False))
-        assert sorted(only) == ["scoped zeta-7 by legacy path", "scoped zeta-7 by name"]
-    withshared = texts(mem.keyword_search("zeta-7", 10, project="my_app"))
-    assert "unscoped zeta-7 fact" in withshared and "other zeta-7 project" not in withshared
+    assert [mem.normalize_project(p) for p in ("/opt/src/app/", "app", " ", "C:\\w\\app\\")] == ["app", "app", "", "app"]
+    for label, project in {**SCOPED, **OTHERS}.items():
+        _insert(f"zeta-7 {label}", {"project": project})
+    _insert("zeta-7 unscoped")
+    want = sorted(f"zeta-7 {label}" for label in SCOPED)
+    # canonical name and every original stored form find all legacy variants, on both sides
+    for query in ["my_app", *SCOPED.values()]:
+        kw = texts(mem.keyword_search("zeta-7", 20, project=query, include_unscoped=False))
+        vec = [t for t in texts(mem.search("zeta-7", limit=50, project=query, include_unscoped=False))
+               if t.startswith("zeta-7")]
+        assert sorted(kw) == want and sorted(vec) == want, query
+    shared = texts(mem.keyword_search("zeta-7", 20, project="my_app"))
+    assert sorted(shared) == sorted(want + ["zeta-7 unscoped"])          # no lookalikes
+    assert sorted(texts(mem.keyword_search("zeta-7", 20, project="my%app", include_unscoped=False))) == \
+        ["zeta-7 percent lookalike"]                                       # '%' is literal
     mem.save_checkpoint("sess-norm", "state", project="/home/u/src/my_app/")
     assert mem.get_checkpoint("sess-norm")["project"] == "my_app"
 

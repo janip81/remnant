@@ -396,14 +396,15 @@ def _project_filter(project: str = "", include_unscoped: bool = True) -> tuple[s
     if not project:
         return "", []
     if include_unscoped:
-        return (" AND (" + _PROJECT_MATCH + " OR coalesce(payload->>'project', '') = '')",
-                [project, len(project) + 1, "/" + project])
-    return " AND " + _PROJECT_MATCH, [project, len(project) + 1, "/" + project]
+        return f" AND ({_STORED_PROJECT} = %s OR {_STORED_PROJECT} = '')", [project]
+    return f" AND {_STORED_PROJECT} = %s", [project]
 
 
-# A stored project equals the name, or is a legacy path ending in /<name> (rows written
-# before normalize_project). right() avoids LIKE, whose wildcards '_' and '%' occur in names.
-_PROJECT_MATCH = "(payload->>'project' = %s OR right(payload->>'project', %s) = %s)"
+# The stored project normalised in SQL exactly like normalize_project(), so rows written
+# before normalisation (full paths, trailing slashes, backslashes) match their name.
+# Equality only: no LIKE, so '_' and '%' in names stay literal.
+_STORED_PROJECT = ("regexp_replace(rtrim(replace(btrim(coalesce(payload->>'project', '')), E'\\\\', '/'), '/'), "
+                   "'^.*/', '')")
 
 
 CHECKPOINT_TTL_DAYS = int(os.environ.get("CHECKPOINT_TTL_DAYS", "7"))
